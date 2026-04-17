@@ -51,7 +51,7 @@ from .utils import (
     _check_pos_encoding_mode,
     check_shape_dtype_device,
     get_alibi_slopes,
-    _dequantize_int4_paged_kv_cache,
+    _dequantize_selected_int4_paged_kv_cache,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _unpack_paged_kv_cache,
@@ -2331,14 +2331,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+        paged_kv_indices = self._paged_kv_indices_buf
         if self._int4_kv_enabled:
             if k_scale is not None or v_scale is not None:
                 raise ValueError(
                     "k_scale and v_scale are not supported for INT4 paged KV cache."
                 )
-            k_cache, v_cache = _dequantize_int4_paged_kv_cache(
-                paged_kv_cache,
-                self._kv_layout,
+            _, k_cache, v_cache, paged_kv_indices = (
+                _dequantize_selected_int4_paged_kv_cache(
+                    paged_kv_cache,
+                    self._paged_kv_indices_buf,
+                    self._kv_layout,
+                )
             )
         else:
             k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
@@ -2503,7 +2507,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 v_cache,
                 self._qo_indptr_buf,
                 self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
+                paged_kv_indices,
                 self._paged_kv_last_page_len_buf,
                 out,
                 lse,

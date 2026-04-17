@@ -62,7 +62,7 @@ from .utils import (
     _check_pos_encoding_mode,
     check_shape_dtype_device,
     get_alibi_slopes,
-    _dequantize_int4_paged_kv_cache,
+    _dequantize_selected_int4_paged_kv_cache,
     _get_cache_alibi_slopes_buf,
     _get_range_buf,
     _unpack_paged_kv_cache,
@@ -1322,13 +1322,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+        paged_kv_indices = self._paged_kv_indices_buf
+        paged_kv_cache_for_run = paged_kv_cache
         if self._int4_kv_enabled:
             if k_scale is not None or v_scale is not None:
                 raise ValueError(
                     "k_scale and v_scale are not supported for INT4 paged KV cache."
                 )
-            k_cache, v_cache = _dequantize_int4_paged_kv_cache(
+            (
+                paged_kv_cache_for_run,
+                k_cache,
+                v_cache,
+                paged_kv_indices,
+            ) = _dequantize_selected_int4_paged_kv_cache(
                 paged_kv_cache,
+                self._paged_kv_indices_buf,
                 self._kv_layout,
             )
         else:
@@ -1442,7 +1450,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 v_cache,
                 self._qo_indptr_buf,
                 self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
+                paged_kv_indices,
                 self._paged_kv_last_page_len_buf,
                 out,
                 lse,
@@ -1491,7 +1499,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     rope_theta,
                     0,  # token_pos_in_items_len
                     self._workspace_size,
-                    paged_kv_cache,
+                    paged_kv_cache_for_run,
                     self._num_qo_heads,
                     self._num_kv_heads,
                     self._block_tables,
@@ -1522,7 +1530,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 k_cache,
                 v_cache,
                 self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
+                paged_kv_indices,
                 self._paged_kv_last_page_len_buf,
                 out,
                 lse,

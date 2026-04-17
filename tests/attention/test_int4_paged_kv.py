@@ -363,7 +363,7 @@ def test_batch_decode_with_paged_kv_cache_int4(
         batch_size, num_qo_heads, head_dim, dtype=torch.float16, device=device
     )
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
-    total_num_pages = num_pages_per_seq * batch_size
+    total_num_pages = num_pages_per_seq * batch_size * 2
     if kv_layout == "NHD":
         kv_data = torch.randn(
             total_num_pages,
@@ -391,7 +391,7 @@ def test_batch_decode_with_paged_kv_cache_int4(
         torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
         * num_pages_per_seq
     )
-    kv_indices = torch.arange(0, total_num_pages, device=device, dtype=torch.int32)
+    kv_indices = torch.arange(0, total_num_pages, 2, device=device, dtype=torch.int32)
     kv_last_page_len = torch.full(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device=device
     )
@@ -451,7 +451,7 @@ def test_batch_decode_with_paged_kv_cache_int4_rejects_scale():
         batch_size, num_qo_heads, head_dim, dtype=torch.float16, device=device
     )
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
-    total_num_pages = num_pages_per_seq * batch_size
+    total_num_pages = num_pages_per_seq * batch_size * 2
     kv_data = flashinfer.int4_quantize(
         torch.randn(
             total_num_pages,
@@ -467,7 +467,7 @@ def test_batch_decode_with_paged_kv_cache_int4_rejects_scale():
         torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
         * num_pages_per_seq
     )
-    kv_indices = torch.arange(0, total_num_pages, device=device, dtype=torch.int32)
+    kv_indices = torch.arange(0, total_num_pages, 2, device=device, dtype=torch.int32)
     kv_last_page_len = torch.full(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device=device
     )

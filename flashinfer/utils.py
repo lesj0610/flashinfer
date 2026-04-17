@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 import math
 from enum import Enum
-from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union, cast
 
 import torch
 import torch.version
@@ -930,6 +930,60 @@ def _dequantize_int4_paged_kv_cache(
         "Unrecognized int4 paged_kv_cache type {}, expect INT4Tensor or a tuple of INT4Tensor.".format(
             type(paged_kv_cache)
         )
+    )
+
+
+def _dequantize_selected_int4_paged_kv_cache(
+    paged_kv_cache: Union[INT4Tensor, Tuple[INT4Tensor, INT4Tensor]],
+    page_indices: torch.Tensor,
+    kv_layout: str,
+    dtype: torch.dtype = torch.float16,
+) -> Tuple[
+    Union[INT4Tensor, Tuple[INT4Tensor, INT4Tensor]],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    page_indices_i64 = page_indices.to(torch.int64)
+    unique_page_indices, remapped_indices = torch.unique(
+        page_indices_i64, sorted=False, return_inverse=True
+    )
+
+    def _select_pages(x: INT4Tensor) -> INT4Tensor:
+        original_shape = (unique_page_indices.numel(),) + x.original_shape[1:]
+        return INT4Tensor(
+            x.data.index_select(0, unique_page_indices),
+            x.scale.index_select(0, unique_page_indices),
+            group_size=x.group_size,
+            original_shape=original_shape,
+            scheme=x.scheme,
+        )
+
+    selected_paged_kv_cache: Union[INT4Tensor, Tuple[INT4Tensor, INT4Tensor]]
+    if isinstance(paged_kv_cache, tuple):
+        selected_paged_kv_cache = cast(
+            Tuple[INT4Tensor, INT4Tensor],
+            tuple(_select_pages(x) for x in paged_kv_cache),
+        )
+    elif isinstance(paged_kv_cache, INT4Tensor):
+        selected_paged_kv_cache = _select_pages(paged_kv_cache)
+    else:
+        raise KeyError(
+            "Unrecognized int4 paged_kv_cache type {}, expect INT4Tensor or a tuple of INT4Tensor.".format(
+                type(paged_kv_cache)
+            )
+        )
+
+    k_cache, v_cache = _dequantize_int4_paged_kv_cache(
+        selected_paged_kv_cache,
+        kv_layout,
+        dtype=dtype,
+    )
+    return (
+        selected_paged_kv_cache,
+        k_cache,
+        v_cache,
+        remapped_indices.to(page_indices.dtype),
     )
 
 
