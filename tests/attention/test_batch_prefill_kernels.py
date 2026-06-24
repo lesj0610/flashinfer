@@ -1233,6 +1233,7 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4(
     head_dim,
     causal,
     q_dtype,
+    pos_encoding_mode="NONE",
 ):
     """Test BatchPrefillWithPagedKVCacheWrapper with NVFP4 KV cache.
 
@@ -1301,7 +1302,7 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4(
         head_dim,
         page_size,
         causal=causal,
-        pos_encoding_mode="NONE",
+        pos_encoding_mode=pos_encoding_mode,
         logits_soft_cap=0.0,
         kv_data_type=torch.uint8,
         q_data_type=q_dtype,
@@ -1344,7 +1345,12 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4(
         )
 
         o_ref_i = flashinfer.prefill.single_prefill_with_kv_cache(
-            qi, ki, vi, causal=causal, pos_encoding_mode="NONE", logits_soft_cap=0.0
+            qi,
+            ki,
+            vi,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=0.0,
         )
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
 
@@ -1369,6 +1375,7 @@ def test_batch_prefill_with_ragged_kv_cache_nvfp4(
     head_dim,
     causal,
     q_dtype,
+    pos_encoding_mode="NONE",
 ):
     """Test BatchPrefillWithRaggedKVCacheWrapper with NVFP4 KV cache.
 
@@ -1418,7 +1425,7 @@ def test_batch_prefill_with_ragged_kv_cache_nvfp4(
         num_kv_heads,
         head_dim,
         causal=causal,
-        pos_encoding_mode="NONE",
+        pos_encoding_mode=pos_encoding_mode,
         logits_soft_cap=0.0,
         kv_data_type=torch.uint8,
         q_data_type=q_dtype,
@@ -1439,12 +1446,73 @@ def test_batch_prefill_with_ragged_kv_cache_nvfp4(
         vi = v_dq[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
 
         o_ref_i = flashinfer.prefill.single_prefill_with_kv_cache(
-            qi, ki, vi, causal=causal, pos_encoding_mode="NONE", logits_soft_cap=0.0
+            qi,
+            ki,
+            vi,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=0.0,
         )
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
 
         # NVFP4 is 4-bit; use relaxed tolerance
         torch.testing.assert_close(o_i, o_ref_i, rtol=1e-1, atol=1e-1)
+
+
+def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head():
+    test_batch_prefill_with_paged_kv_cache_nvfp4(
+        batch_size=1,
+        kv_len=128,
+        qo_len=64,
+        page_size=16,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        causal=False,
+        q_dtype=torch.float16,
+    )
+
+
+def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head():
+    test_batch_prefill_with_paged_kv_cache_nvfp4(
+        batch_size=1,
+        kv_len=128,
+        qo_len=64,
+        page_size=16,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        causal=False,
+        q_dtype=torch.float16,
+        pos_encoding_mode="ROPE_LLAMA",
+    )
+
+
+def test_batch_prefill_with_ragged_kv_cache_nvfp4_large_head():
+    test_batch_prefill_with_ragged_kv_cache_nvfp4(
+        batch_size=1,
+        kv_len=128,
+        qo_len=64,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        causal=False,
+        q_dtype=torch.float16,
+    )
+
+
+def test_batch_prefill_with_ragged_kv_cache_nvfp4_rope_large_head():
+    test_batch_prefill_with_ragged_kv_cache_nvfp4(
+        batch_size=1,
+        kv_len=128,
+        qo_len=64,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        causal=False,
+        q_dtype=torch.float16,
+        pos_encoding_mode="ROPE_LLAMA",
+    )
 
 
 if __name__ == "__main__":
