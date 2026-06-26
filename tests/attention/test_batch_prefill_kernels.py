@@ -360,6 +360,7 @@ def test_batch_prefill_with_paged_kv_cache_head_dim_512(
     lse_buffer = torch.empty_like(lse)
     wrapper.run(q, kv_data, out=o_buffer, lse=lse_buffer, return_lse=True)
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
     for i in range(batch_size):
         qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
@@ -892,6 +893,7 @@ def test_batch_prefill_with_ragged_kv_cache_head_dim_512(
     lse_buffer = torch.empty_like(lse)
     wrapper.run(q, k, v, out=o_buffer, lse=lse_buffer, return_lse=True)
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
     for i in range(batch_size):
         qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
@@ -1460,6 +1462,7 @@ def test_batch_prefill_with_ragged_kv_cache_nvfp4(
 
 
 def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head():
+    skip_if_head_dim_unsupported(512)
     test_batch_prefill_with_paged_kv_cache_nvfp4(
         batch_size=1,
         kv_len=128,
@@ -1474,6 +1477,7 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head():
 
 
 def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head():
+    skip_if_head_dim_unsupported(512)
     test_batch_prefill_with_paged_kv_cache_nvfp4(
         batch_size=1,
         kv_len=128,
@@ -1489,6 +1493,7 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head():
 
 
 def test_batch_prefill_with_ragged_kv_cache_nvfp4_large_head():
+    skip_if_head_dim_unsupported(512)
     test_batch_prefill_with_ragged_kv_cache_nvfp4(
         batch_size=1,
         kv_len=128,
@@ -1502,6 +1507,7 @@ def test_batch_prefill_with_ragged_kv_cache_nvfp4_large_head():
 
 
 def test_batch_prefill_with_ragged_kv_cache_nvfp4_rope_large_head():
+    skip_if_head_dim_unsupported(512)
     test_batch_prefill_with_ragged_kv_cache_nvfp4(
         batch_size=1,
         kv_len=128,
