@@ -319,6 +319,18 @@ struct BlockBatchPagedAttentionPersistent {
       // last kv tile
       __syncthreads();
       uint32_t packed_kv_bound = kv_indptr * block_size + kv_len;
+      const uint32_t k_sf_stride_page =
+          get_k_sf_stride_page(params, k_stride_page / NVFP4_SF_CONTAINERS);
+      const uint32_t k_sf_stride_h =
+          get_k_sf_stride_h(params, k_stride_h / NVFP4_SF_CONTAINERS);
+      const uint32_t k_sf_stride_n =
+          get_k_sf_stride_n(params, k_stride_n / NVFP4_SF_CONTAINERS);
+      const uint32_t v_sf_stride_page =
+          get_v_sf_stride_page(params, v_stride_page / NVFP4_SF_CONTAINERS);
+      const uint32_t v_sf_stride_h =
+          get_v_sf_stride_h(params, v_stride_h / NVFP4_SF_CONTAINERS);
+      const uint32_t v_sf_stride_n =
+          get_v_sf_stride_n(params, v_stride_n / NVFP4_SF_CONTAINERS);
 
       prefetch_offest<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
                                kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
@@ -328,16 +340,18 @@ struct BlockBatchPagedAttentionPersistent {
                                       kv_end, warp_idx, lane_idx);
       page_produce_kv_sf<false, KTraits>(
           smem_storage, maybe_k_cache_sf, block_iter_base + kv_tile_idx * CTA_TILE_KV,
-          packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
-          kv_indices, kv_start + kv_tile_idx * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
+          packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h, k_stride_n, k_sf_stride_page,
+          k_sf_stride_h, k_sf_stride_n, block_size, kv_indices,
+          kv_start + kv_tile_idx * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
       cp_async::commit_group();
       page_produce_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
                                      kv_start + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset,
                                      kv_end, warp_idx, lane_idx);
       page_produce_kv_sf<true, KTraits>(
           smem_storage, maybe_v_cache_sf, block_iter_base + kv_tile_idx * CTA_TILE_KV,
-          packed_kv_bound, kv_head_idx, v_stride_page, v_stride_h, v_stride_n, block_size,
-          kv_indices, kv_start + kv_tile_idx * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
+          packed_kv_bound, kv_head_idx, v_stride_page, v_stride_h, v_stride_n, v_sf_stride_page,
+          v_sf_stride_h, v_sf_stride_n, block_size, kv_indices,
+          kv_start + kv_tile_idx * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
       cp_async::commit_group();
 
       // loop with mask
@@ -377,8 +391,9 @@ struct BlockBatchPagedAttentionPersistent {
                                             thr_local_kv_offset, kv_end, warp_idx, lane_idx);
             page_produce_kv_sf<false, KTraits>(
                 smem_storage, maybe_k_cache_sf, block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
-                packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
-                kv_indices, kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
+                packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h, k_stride_n,
+                k_sf_stride_page, k_sf_stride_h, k_sf_stride_n, block_size, kv_indices,
+                kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
             cp_async::commit_group();
             cp_async::wait_group<1>();
 
@@ -395,8 +410,9 @@ struct BlockBatchPagedAttentionPersistent {
                                            thr_local_kv_offset, kv_end, warp_idx, lane_idx);
             page_produce_kv_sf<true, KTraits>(
                 smem_storage, maybe_v_cache_sf, block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
-                packed_kv_bound, kv_head_idx, v_stride_page, v_stride_h, v_stride_n, block_size,
-                kv_indices, kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
+                packed_kv_bound, kv_head_idx, v_stride_page, v_stride_h, v_stride_n,
+                v_sf_stride_page, v_sf_stride_h, v_sf_stride_n, block_size, kv_indices,
+                kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
             cp_async::commit_group();
           });
       cp_async::wait_group<0>();

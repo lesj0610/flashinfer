@@ -189,6 +189,31 @@ def _unpack_paged_kv_cache(
         )
 
 
+def _get_paged_kv_cache_scale_strides(
+    key_block_scales: Optional[torch.Tensor],
+    value_block_scales: Optional[torch.Tensor],
+    kv_layout: str,
+) -> Tuple[int, int, int, int, int, int]:
+    if key_block_scales is None or value_block_scales is None:
+        return (0, 0, 0, 0, 0, 0)
+    if kv_layout == "NHD":
+        k_stride_page, k_stride_n, k_stride_h = key_block_scales.stride()[:3]
+        v_stride_page, v_stride_n, v_stride_h = value_block_scales.stride()[:3]
+    elif kv_layout == "HND":
+        k_stride_page, k_stride_h, k_stride_n = key_block_scales.stride()[:3]
+        v_stride_page, v_stride_h, v_stride_n = value_block_scales.stride()[:3]
+    else:
+        raise KeyError("Invalid kv_layout {}".format(kv_layout))
+    return (
+        int(k_stride_page),
+        int(k_stride_h),
+        int(k_stride_n),
+        int(v_stride_page),
+        int(v_stride_h),
+        int(v_stride_n),
+    )
+
+
 def get_alibi_slopes(
     n_heads: int, device: Optional[torch.device] = None
 ) -> torch.Tensor:

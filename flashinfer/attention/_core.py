@@ -28,6 +28,7 @@ from ..utils import (
     PosEncodingMode,
     TensorLayout,
     _check_kv_layout,
+    _get_paged_kv_cache_scale_strides,
     _unpack_paged_kv_cache,
     determine_attention_backend,
 )
@@ -298,6 +299,16 @@ class BatchAttention:
             if kv_cache_sf is not None
             else (None, None)
         )
+        (
+            k_sf_stride_page,
+            k_sf_stride_h,
+            k_sf_stride_n,
+            v_sf_stride_page,
+            v_sf_stride_h,
+            v_sf_stride_n,
+        ) = _get_paged_kv_cache_scale_strides(
+            k_cache_sf, v_cache_sf, self._kv_layout
+        )
 
         self.module.run(
             self.float_workspace_buffer,
@@ -320,6 +331,12 @@ class BatchAttention:
             # ADDITIONAL_FUNC_PARAMS (maybe_k_cache_sf, maybe_v_cache_sf)
             k_cache_sf,
             v_cache_sf,
+            k_sf_stride_page,
+            k_sf_stride_h,
+            k_sf_stride_n,
+            v_sf_stride_page,
+            v_sf_stride_h,
+            v_sf_stride_n,
             # PROFILER_FUNC_PARAMS
             *profiler_args,
         )

@@ -50,6 +50,12 @@ DEFINE_HAS_MEMBER(token_pos_in_items_len)
 DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
 DEFINE_HAS_MEMBER(maybe_k_cache_sf)
 DEFINE_HAS_MEMBER(maybe_v_cache_sf)
+DEFINE_HAS_MEMBER(k_sf_stride_page)
+DEFINE_HAS_MEMBER(k_sf_stride_h)
+DEFINE_HAS_MEMBER(k_sf_stride_n)
+DEFINE_HAS_MEMBER(v_sf_stride_page)
+DEFINE_HAS_MEMBER(v_sf_stride_h)
+DEFINE_HAS_MEMBER(v_sf_stride_n)
 
 // Type trait to detect packed NVFP4 KV cache types (__nv_fp4x2_e2m1 stores 2 FP4 per byte).
 template <typename T>
@@ -68,6 +74,67 @@ using mma::MMAMode;
 constexpr uint32_t WARP_SIZE = 32;
 // Number of NVFP4 elements sharing one scale factor (UE4M3 byte).
 constexpr uint32_t NVFP4_SF_VEC_SIZE = 16;
+constexpr uint32_t NVFP4_SF_CONTAINERS = NVFP4_SF_VEC_SIZE / 2;
+
+template <typename Params>
+__device__ __forceinline__ uint32_t get_k_sf_stride_page(const Params& params,
+                                                         const uint32_t fallback) {
+  if constexpr (has_k_sf_stride_page_v<Params>) {
+    return params.k_sf_stride_page;
+  } else {
+    return fallback;
+  }
+}
+
+template <typename Params>
+__device__ __forceinline__ uint32_t get_k_sf_stride_h(const Params& params,
+                                                      const uint32_t fallback) {
+  if constexpr (has_k_sf_stride_h_v<Params>) {
+    return params.k_sf_stride_h;
+  } else {
+    return fallback;
+  }
+}
+
+template <typename Params>
+__device__ __forceinline__ uint32_t get_k_sf_stride_n(const Params& params,
+                                                      const uint32_t fallback) {
+  if constexpr (has_k_sf_stride_n_v<Params>) {
+    return params.k_sf_stride_n;
+  } else {
+    return fallback;
+  }
+}
+
+template <typename Params>
+__device__ __forceinline__ uint32_t get_v_sf_stride_page(const Params& params,
+                                                         const uint32_t fallback) {
+  if constexpr (has_v_sf_stride_page_v<Params>) {
+    return params.v_sf_stride_page;
+  } else {
+    return fallback;
+  }
+}
+
+template <typename Params>
+__device__ __forceinline__ uint32_t get_v_sf_stride_h(const Params& params,
+                                                      const uint32_t fallback) {
+  if constexpr (has_v_sf_stride_h_v<Params>) {
+    return params.v_sf_stride_h;
+  } else {
+    return fallback;
+  }
+}
+
+template <typename Params>
+__device__ __forceinline__ uint32_t get_v_sf_stride_n(const Params& params,
+                                                      const uint32_t fallback) {
+  if constexpr (has_v_sf_stride_n_v<Params>) {
+    return params.v_sf_stride_n;
+  } else {
+    return fallback;
+  }
+}
 
 constexpr uint32_t get_num_warps_q(const uint32_t cta_tile_q) {
   if (cta_tile_q == 32) {
@@ -601,8 +668,8 @@ __device__ __forceinline__ void page_produce_kv_on_the_fly(
  * SF bytes per iteration, advancing by NUM_WARPS * 128 bytes across iterations.
  * The SF smem layout is a plain flat byte array — no swizzle.
  *
- * SF strides are KV byte strides divided by SF_CONTAINERS (= NVFP4_SF_VEC_SIZE/2 = 8),
- * which is exact because all NVFP4-compatible head_dims are divisible by 16.
+ * SF strides are read from the scale tensor itself. Compact scale layouts can use
+ * KV byte strides divided by NVFP4_SF_CONTAINERS as the caller-side fallback.
  * No-op when KTraits::DTypeKV is not FP4.
  *
  * \tparam produce_v  true → fill v_sf_smem, false → fill k_sf_smem.
@@ -613,9 +680,9 @@ __device__ __forceinline__ void page_produce_kv_on_the_fly(
  * \param packed_page_iter_base  Packed page-iter for the start of this CTA tile.
  * \param packed_kv_bound     Upper bound for valid packed page-iters (last_indptr * page_size).
  * \param kv_head_idx         KV head index.
- * \param kv_stride_page      Byte stride per page in the KV tensor.
- * \param kv_stride_h         Byte stride per head in the KV tensor.
- * \param kv_stride_n         Byte stride per token in the KV tensor.
+ * \param sf_stride_page      Byte stride per page in the SF tensor.
+ * \param sf_stride_h         Byte stride per head in the SF tensor.
+ * \param sf_stride_n         Byte stride per token in the SF tensor.
  * \param page_size           Page size (fast divisor).
  * \param indices             Page index array.
  * \param kv_idx_base         First KV row index for this tile within the chunk.
@@ -627,7 +694,8 @@ template <bool produce_v, typename KTraits, typename SmemStorage, typename IdTyp
 __device__ __forceinline__ void page_produce_kv_sf(
     SmemStorage* smem_storage, uint8_t* sf_ptr, const uint32_t packed_page_iter_base,
     const uint32_t packed_kv_bound, const uint32_t kv_head_idx, const uint32_t kv_stride_page,
-    const uint32_t kv_stride_h, const uint32_t kv_stride_n, const uint_fastdiv& page_size,
+    const uint32_t kv_stride_h, const uint32_t kv_stride_n, const uint32_t sf_stride_page,
+    const uint32_t sf_stride_h, const uint32_t sf_stride_n, const uint_fastdiv& page_size,
     const IdType* indices, const uint32_t kv_idx_base, const uint32_t kv_len,
     const uint32_t warp_idx, const uint32_t lane_idx) {
   if constexpr (!is_fp4_type_v<typename KTraits::DTypeKV>) return;
@@ -636,8 +704,6 @@ __device__ __forceinline__ void page_produce_kv_sf(
   constexpr uint32_t SF_COLS = HEAD_DIM / NVFP4_SF_VEC_SIZE;  // SF bytes per KV row
   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
-  // DTypeKV containers per SF byte: NVFP4_SF_VEC_SIZE FP4 / 2 FP4-per-container.
-  constexpr uint32_t SF_CONTAINERS = NVFP4_SF_VEC_SIZE / 2;  // = 8
   constexpr uint32_t SF_TOTAL_BYTES = CTA_TILE_KV * SF_COLS;
   static_assert(SF_TOTAL_BYTES % 4 == 0, "SF smem size must be 4-byte aligned for 32-bit LDGSTS");
   // Each thread loads 4 SF bytes (32 bits) per iteration via LDGSTS.32.
@@ -658,16 +724,14 @@ __device__ __forceinline__ void page_produce_kv_sf(
     // For k < NUM_SF_ITERS-1, (flat_byte < SF_TOTAL_BYTES) is always true (optimized away).
     const bool in_bounds = (flat_byte < SF_TOTAL_BYTES) && (kv_idx_base + sf_smem_row < kv_len);
 
-    // SF strides are KV byte strides / SF_CONTAINERS (1 SF byte per SF_CONTAINERS KV containers).
     // packed_kv_bound guards indices[] access; returns offset 0 for out-of-range rows.
     uint32_t page_iter, entry_idx;
     const uint32_t packed_block_iter = packed_page_iter_base + sf_smem_row;
     page_size.divmod(packed_block_iter, page_iter, entry_idx);
     const size_t sf_gmem_offset =
         static_cast<size_t>(packed_block_iter < packed_kv_bound ? indices[page_iter] : 0) *
-            (kv_stride_page / SF_CONTAINERS) +
-        kv_head_idx * (kv_stride_h / SF_CONTAINERS) + entry_idx * (kv_stride_n / SF_CONTAINERS) +
-        sf_smem_col;
+            sf_stride_page +
+        kv_head_idx * sf_stride_h + entry_idx * sf_stride_n + sf_smem_col;
 
     // V SF must zero-fill out-of-bounds entries: compute_sfm_v reads SF for all CTA_TILE_KV rows
     // including padding, and 0 (softmax weight) * NaN (uninitialized SF) = NaN (IEEE 754).
@@ -3561,6 +3625,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
       uint32_t packed_page_iter_base =
           paged_kv.indptr[request_idx] * paged_kv.page_size + chunk_start;
+      const uint32_t k_sf_stride_page =
+          get_k_sf_stride_page(params, paged_kv.stride_page / NVFP4_SF_CONTAINERS);
+      const uint32_t k_sf_stride_h =
+          get_k_sf_stride_h(params, paged_kv.stride_h / NVFP4_SF_CONTAINERS);
+      const uint32_t k_sf_stride_n =
+          get_k_sf_stride_n(params, paged_kv.stride_n / NVFP4_SF_CONTAINERS);
+      const uint32_t v_sf_stride_page =
+          get_v_sf_stride_page(params, paged_kv.stride_page / NVFP4_SF_CONTAINERS);
+      const uint32_t v_sf_stride_h =
+          get_v_sf_stride_h(params, paged_kv.stride_h / NVFP4_SF_CONTAINERS);
+      const uint32_t v_sf_stride_n =
+          get_v_sf_stride_n(params, paged_kv.stride_n / NVFP4_SF_CONTAINERS);
       if constexpr (KTraits::USE_KV_SHARED_SMEM) {
         page_produce_kv_on_the_fly<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
                                                    paged_kv, packed_page_iter_base, last_indptr,
@@ -3587,6 +3663,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       page_produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, packed_page_iter_base,
                                          last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
                                          paged_kv.stride_page, paged_kv.stride_h, paged_kv.stride_n,
+                                         k_sf_stride_page, k_sf_stride_h, k_sf_stride_n,
                                          paged_kv.page_size, paged_kv.indices, 0, chunk_size,
                                          warp_idx, lane_idx);
       cp_async::commit_group();
@@ -3597,8 +3674,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, packed_page_iter_base,
                                           last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
                                           paged_kv.stride_page, paged_kv.stride_h,
-                                          paged_kv.stride_n, paged_kv.page_size, paged_kv.indices,
-                                          0, chunk_size, warp_idx, lane_idx);
+                                          paged_kv.stride_n, v_sf_stride_page, v_sf_stride_h,
+                                          v_sf_stride_n, paged_kv.page_size, paged_kv.indices, 0,
+                                          chunk_size, warp_idx, lane_idx);
         cp_async::commit_group();
       }
 
@@ -3796,8 +3874,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           page_produce_kv_sf<false, KTraits>(
               &smem_storage, maybe_k_cache_sf, packed_page_iter_base,
               last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, paged_kv.stride_page,
-              paged_kv.stride_h, paged_kv.stride_n, paged_kv.page_size, paged_kv.indices,
-              (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+              paged_kv.stride_h, paged_kv.stride_n, k_sf_stride_page, k_sf_stride_h,
+              k_sf_stride_n, paged_kv.page_size, paged_kv.indices, (iter + 1) * CTA_TILE_KV,
+              chunk_size, warp_idx, lane_idx);
           cp_async::commit_group();
           cp_async::wait_group<1>();
         }
@@ -3842,8 +3921,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           page_produce_kv_sf<true, KTraits>(
               &smem_storage, maybe_v_cache_sf, packed_page_iter_base,
               last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, paged_kv.stride_page,
-              paged_kv.stride_h, paged_kv.stride_n, paged_kv.page_size, paged_kv.indices,
-              (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+              paged_kv.stride_h, paged_kv.stride_n, v_sf_stride_page, v_sf_stride_h,
+              v_sf_stride_n, paged_kv.page_size, paged_kv.indices, (iter + 1) * CTA_TILE_KV,
+              chunk_size, warp_idx, lane_idx);
           cp_async::commit_group();
         }
       }

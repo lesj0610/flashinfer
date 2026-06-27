@@ -70,6 +70,7 @@ from .utils import (
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_range_buf,
+    _get_paged_kv_cache_scale_strides,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     determine_attention_backend,
@@ -1516,6 +1517,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
                 value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
+        (
+            k_sf_stride_page,
+            k_sf_stride_h,
+            k_sf_stride_n,
+            v_sf_stride_page,
+            v_sf_stride_h,
+            v_sf_stride_n,
+        ) = _get_paged_kv_cache_scale_strides(
+            key_block_scales, value_block_scales, self._kv_layout
+        )
+
         pos_encoding_mode = self._pos_encoding_mode
         window_left = self._window_left if window_left is None else window_left
         if self._backend not in ("trtllm-gen",):
@@ -1696,6 +1708,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         value_block_scales,
                         skip_softmax_threshold_scale_factor,
                         True,  # uses_shared_paged_kv_idx
+                        k_sf_stride_page,
+                        k_sf_stride_h,
+                        k_sf_stride_n,
+                        v_sf_stride_page,
+                        v_sf_stride_h,
+                        v_sf_stride_n,
                     ]
 
             self._cached_module.paged_run(*run_args)

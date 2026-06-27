@@ -1021,13 +1021,31 @@ def gen_batch_prefill_module(
             "uint8_t",
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
         additional_scalar_names = [
+            "k_sf_stride_page",
+            "k_sf_stride_h",
+            "k_sf_stride_n",
+            "v_sf_stride_page",
+            "v_sf_stride_h",
+            "v_sf_stride_n",
             "logits_soft_cap",
             "sm_scale",
             "rope_rcp_scale",
             "rope_rcp_theta",
             "token_pos_in_items_len",
         ]
-        additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
+        additional_scalar_dtypes = [
+            "uint32_t",
+            "uint32_t",
+            "uint32_t",
+            "uint32_t",
+            "uint32_t",
+            "uint32_t",
+            "double",
+            "double",
+            "double",
+            "double",
+            "int64_t",
+        ]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
@@ -1162,8 +1180,22 @@ def gen_batch_attention_module(
 
     additional_tensor_names: List[str] = ["maybe_k_cache_sf", "maybe_v_cache_sf"]
     additional_tensor_dtypes: List[str] = ["uint8_t", "uint8_t"]
-    additional_scalar_names: List[str] = []
-    additional_scalar_dtypes: List[str] = []
+    additional_scalar_names: List[str] = [
+        "k_sf_stride_page",
+        "k_sf_stride_h",
+        "k_sf_stride_n",
+        "v_sf_stride_page",
+        "v_sf_stride_h",
+        "v_sf_stride_n",
+    ]
+    additional_scalar_dtypes: List[str] = [
+        "uint32_t",
+        "uint32_t",
+        "uint32_t",
+        "uint32_t",
+        "uint32_t",
+        "uint32_t",
+    ]
     variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
     variant_decl = "#include<flashinfer/attention/variants.cuh>"
 

@@ -63,6 +63,7 @@ from .utils import (
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
+    _get_paged_kv_cache_scale_strides,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     determine_attention_backend,
@@ -678,6 +679,12 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        k_sf_stride_page: int = 0,
+        k_sf_stride_h: int = 0,
+        k_sf_stride_n: int = 0,
+        v_sf_stride_page: int = 0,
+        v_sf_stride_h: int = 0,
+        v_sf_stride_n: int = 0,
     ) -> None:
         if backend == "trtllm-gen":
             assert num_qo_heads is not None
@@ -744,6 +751,12 @@ def get_batch_prefill_module(backend, *args):
                 maybe_max_item_len_ptr,
                 key_block_scales,
                 value_block_scales,
+                k_sf_stride_page,
+                k_sf_stride_h,
+                k_sf_stride_n,
+                v_sf_stride_page,
+                v_sf_stride_h,
+                v_sf_stride_n,
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
@@ -857,6 +870,12 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        k_sf_stride_page: int = 0,
+        k_sf_stride_h: int = 0,
+        k_sf_stride_n: int = 0,
+        v_sf_stride_page: int = 0,
+        v_sf_stride_h: int = 0,
+        v_sf_stride_n: int = 0,
     ) -> None:
         pass
 
@@ -2448,6 +2467,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
                 value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
+        (
+            k_sf_stride_page,
+            k_sf_stride_h,
+            k_sf_stride_n,
+            v_sf_stride_page,
+            v_sf_stride_h,
+            v_sf_stride_n,
+        ) = _get_paged_kv_cache_scale_strides(
+            key_block_scales, value_block_scales, self._kv_layout
+        )
+
         if self._custom_mask_buf is not None:
             mask_mode = MaskMode.CUSTOM.value
         else:
@@ -2563,6 +2593,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     value_block_scales,
                     skip_softmax_threshold_scale_factor,
                     True,  # uses_shared_paged_kv_idx
+                    k_sf_stride_page,
+                    k_sf_stride_h,
+                    k_sf_stride_n,
+                    v_sf_stride_page,
+                    v_sf_stride_h,
+                    v_sf_stride_n,
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
