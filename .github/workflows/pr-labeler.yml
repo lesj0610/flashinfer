@@ -14,5 +14,5 @@ jobs:
     steps:
       - uses: actions/labeler@v5
         with:
-          repo-token: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          repo-token: ${{ secrets.FLASHINFER_BOT_TOKEN || github.token }}
           sync-labels: false  # Don't remove labels that were manually added
