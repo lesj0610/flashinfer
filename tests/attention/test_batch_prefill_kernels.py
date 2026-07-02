@@ -1646,6 +1646,21 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head():
     )
 
 
+def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head_bf16():
+    skip_if_head_dim_unsupported(512)
+    test_batch_prefill_with_paged_kv_cache_nvfp4(
+        batch_size=1,
+        kv_len=128,
+        qo_len=64,
+        page_size=16,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        causal=False,
+        q_dtype=torch.bfloat16,
+    )
+
+
 def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head():
     skip_if_head_dim_unsupported(512)
     test_batch_prefill_with_paged_kv_cache_nvfp4(
