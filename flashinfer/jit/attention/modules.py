@@ -1681,6 +1681,14 @@ def gen_customize_batch_prefill_module(
     fp8_enabled: bool = False,
 ) -> JitSpec:
     require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    if backend == "fa2" and "kv_logical_block_size" not in additional_scalar_names:
+        # How a route element is read: a page id when it matches the cache's own
+        # page size, a flat KV slot when it is smaller. The host derives the page
+        # size from the tensor, so the logical block has to arrive separately.
+        # Addressing is independent of the KV dtype, so every FA2 module carries
+        # it; 0 keeps the two equal, which is the plain paged contract.
+        additional_scalar_names = [*additional_scalar_names, "kv_logical_block_size"]
+        additional_scalar_dtypes = [*additional_scalar_dtypes, "int64_t"]
     if require_fp4_kv_cache:
         missing_sf_tensors = [
             name

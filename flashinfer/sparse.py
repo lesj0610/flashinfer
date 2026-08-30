@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -41,6 +41,65 @@ from .utils import (
     get_compute_capability,
     is_float8,
 )
+
+
+def _check_paged_cache(
+    tensors: Sequence[Tuple[str, torch.Tensor]],
+    kv_layout: str,
+    page_size: int,
+    num_kv_heads: int,
+    num_entries: int,
+) -> None:
+    """Validate the raw paged KV tensors against the planned geometry.
+
+    The kernel derives page and head geometry from the key tensor alone and
+    then applies the value tensor's own strides, so a value cache that is
+    shorter or shaped differently does not raise -- it reads past the end.
+    Every check here is one the kernel cannot make for itself.
+    """
+    page_axis, head_axis = (1, 2) if kv_layout == "NHD" else (2, 1)
+    reference = None
+    for name, tensor in tensors:
+        if tensor.dim() != 4:
+            raise ValueError(
+                f"a route over a raw paged cache needs a 4D {name} tensor "
+                f"(num_pages, ...), got {tensor.dim()}D"
+            )
+        if tensor.shape[page_axis] != page_size:
+            raise ValueError(
+                f"{name} cache has {tensor.shape[page_axis]} entries per page "
+                f"under {kv_layout}, but plan() was given "
+                f"kv_cache_page_size={page_size}"
+            )
+        if tensor.shape[head_axis] != num_kv_heads:
+            raise ValueError(
+                f"{name} cache has {tensor.shape[head_axis]} KV heads under "
+                f"{kv_layout}, but plan() was given num_kv_heads={num_kv_heads}"
+            )
+        if tensor.stride(-1) != 1:
+            raise ValueError(
+                f"{name} cache must be contiguous in its innermost dimension, "
+                f"got stride {tensor.stride(-1)}"
+            )
+        if tensor.shape[0] * page_size < num_entries:
+            raise ValueError(
+                f"{name} cache holds {tensor.shape[0] * page_size} KV entries, "
+                f"which the route can address past: plan() was given N="
+                f"{num_entries}"
+            )
+        if reference is None:
+            reference = (name, tensor)
+            continue
+        ref_name, ref = reference
+        if tensor.shape[0] != ref.shape[0]:
+            raise ValueError(
+                f"{name} cache has {tensor.shape[0]} pages but {ref_name} has "
+                f"{ref.shape[0]}; one route addresses both"
+            )
+        if tensor.device != ref.device:
+            raise ValueError(
+                f"{name} cache is on {tensor.device}, {ref_name} on {ref.device}"
+            )
 
 
 def _check_nvfp4_kv(
@@ -394,6 +453,7 @@ class BlockSparseAttentionWrapper:
         self,
         float_workspace_buffer: torch.Tensor,
         backend: str = "auto",
+        kv_layout: str = "NHD",
     ) -> None:
         r"""Constructs of :class:`BlockSparseAttentionWrapper`.
 
@@ -407,7 +467,14 @@ class BlockSparseAttentionWrapper:
             The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``cake``. Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
             device architecture and kernel availability.
+        kv_layout : str
+            Layout of the KV tensors passed to :meth:`run`, either ``NHD`` or
+            ``HND``. Only a route over a raw paged cache (see
+            ``kv_cache_page_size`` in :meth:`plan`) can be ``HND``; a flat KV
+            tensor has no page axis to order against the heads.
         """
+        if kv_layout not in ("NHD", "HND"):
+            raise ValueError(f"kv_layout must be NHD or HND, got {kv_layout!r}")
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._workspace_size = (
@@ -442,7 +509,8 @@ class BlockSparseAttentionWrapper:
                 device="cpu",
             )
         self._use_cuda_graph = False
-        self._kv_layout = "NHD"
+        self._kv_layout = kv_layout
+        self._kv_cache_page_size: Optional[int] = None
         self._qo_indptr: Optional[torch.Tensor] = None
         self._paged_kv_indptr_buf: Optional[torch.Tensor] = None
         self._paged_kv_indices_buf: Optional[torch.Tensor] = None
@@ -512,6 +580,7 @@ class BlockSparseAttentionWrapper:
         kv_block_lens: Optional[torch.Tensor] = None,
         q2k_indices: Optional[torch.Tensor] = None,
         q2k_num: Optional[torch.Tensor] = None,
+        kv_cache_page_size: Optional[int] = None,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -915,12 +984,36 @@ class BlockSparseAttentionWrapper:
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
+        if kv_cache_page_size is None and self._kv_layout == "HND":
+            raise ValueError(
+                "kv_layout='HND' only describes a raw paged cache; pass "
+                "kv_cache_page_size to plan() or construct the wrapper with "
+                "kv_layout='NHD'"
+            )
+        if kv_cache_page_size is not None:
+            if kv_cache_page_size < 1:
+                raise ValueError(
+                    f"kv_cache_page_size must be positive, got {kv_cache_page_size}"
+                )
+            if C != 1:
+                raise ValueError(
+                    "a route over a raw paged cache addresses one KV entry per "
+                    f"index, so C must be 1, got {C}"
+                )
+
         num_blocks_row = len(indptr) - 1
         qo_indptr_host = R * torch.arange(num_blocks_row + 1, dtype=torch.int32)
         qo_indptr_host[-1] = M
         qo_indptr = qo_indptr_host.to(indptr.device, non_blocking=non_blocking)
-        if indices.max().item() * C > N:
-            raise ValueError("indices out of bound")
+        if indices.numel():
+            # The kernel loads a route element into a uint32_t, so a negative
+            # index does not read low -- it reads far past the cache. The
+            # highest entry a route element covers is index * C + C - 1, which
+            # has to stay inside N.
+            if indices.min().item() < 0:
+                raise ValueError("indices must be non-negative")
+            if indices.max().item() * C + C > N:
+                raise ValueError("indices out of bound")
         last_block_len = torch.full(
             (num_blocks_row,), C, dtype=torch.int32, device=indptr.device
         )
@@ -964,6 +1057,8 @@ class BlockSparseAttentionWrapper:
         self.N = N
         self.R = R
         self.C = C
+        self._kv_cache_page_size = kv_cache_page_size
+        self._num_kv_heads = num_kv_heads
 
         kv_indptr_host = indptr.to("cpu")
 
@@ -973,12 +1068,16 @@ class BlockSparseAttentionWrapper:
         # A packed NVFP4 cache is only served by the tensor-core FA2 prefill
         # kernel: the decode path takes no block-scale tensors, so letting the
         # heuristic pick it would silently read the FP4 bytes as plain values.
+        # A route over a raw paged cache is likewise FA2-only -- the decode
+        # entry point has no logical block size, so it would read the route's
+        # slots as page ids and address out of bounds.
         nvfp4_kv = kv_data_type == torch.uint8
         if (
             R * (num_qo_heads // num_kv_heads) < 4
             and mask_mode != MaskMode.CUSTOM.value
             and q_data_type not in [torch.float8_e4m3fn, torch.float8_e5m2]
             and not nvfp4_kv
+            and kv_cache_page_size is None
         ):
             # If the operation is not compute-bound, we use the cuda-core implementation
             self._use_tensor_cores = False
@@ -1015,6 +1114,17 @@ class BlockSparseAttentionWrapper:
             # if the operation is compute-bound, we use the tensor-core implementation
             self._use_tensor_cores = True
 
+            if kv_cache_page_size is not None:
+                # Only the FA2 paged entry point divides a route element back
+                # into (page, entry); every other backend would read the slots
+                # as page ids and address past the cache.
+                if self._backend == "auto":
+                    self._backend = "fa2"
+                elif self._backend != "fa2":
+                    raise ValueError(
+                        "a route over a raw paged cache is only served by the "
+                        f"fa2 backend, got {self._backend!r}"
+                    )
             if self._backend == "auto":
                 self._backend = determine_attention_backend(
                     self.device,
@@ -1294,16 +1404,38 @@ class BlockSparseAttentionWrapper:
             if kv_cache_sf is not None
             else (None, None)
         )
-        k = k.reshape(-1, self.C, *k.shape[-2:])
-        v = v.reshape(-1, self.C, *v.shape[-2:])
-        if key_block_scales is not None:
-            # Scales follow the KV block structure, so give them the same
-            # (num_blocks, C, ...) shape the kernel expects for the data.
-            key_block_scales = key_block_scales.reshape(
-                -1, self.C, *key_block_scales.shape[-2:]
-            )
-            value_block_scales = value_block_scales.reshape(
-                -1, self.C, *value_block_scales.shape[-2:]
+        if self._kv_cache_page_size is None:
+            k = k.reshape(-1, self.C, *k.shape[-2:])
+            v = v.reshape(-1, self.C, *v.shape[-2:])
+            if key_block_scales is not None:
+                # Scales follow the KV block structure, so give them the same
+                # (num_blocks, C, ...) shape the kernel expects for the data.
+                key_block_scales = key_block_scales.reshape(
+                    -1, self.C, *key_block_scales.shape[-2:]
+                )
+                value_block_scales = value_block_scales.reshape(
+                    -1, self.C, *value_block_scales.shape[-2:]
+                )
+        else:
+            # The route names KV entries of a cache that still stores whole
+            # pages, so the tensors keep their paged shape and the kernel
+            # divides each index back into (page, entry). Reshaping to blocks
+            # here is what would force an HND cache through a copy.
+            _check_paged_cache(
+                [
+                    (name, tensor)
+                    for name, tensor in (
+                        ("key", k),
+                        ("value", v),
+                        ("key scale", key_block_scales),
+                        ("value scale", value_block_scales),
+                    )
+                    if tensor is not None
+                ],
+                self._kv_layout,
+                self._kv_cache_page_size,
+                self._num_kv_heads,
+                self.N,
             )
 
         if return_lse:
@@ -1333,6 +1465,8 @@ class BlockSparseAttentionWrapper:
             if scale_v is None:
                 scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
 
+        # The scalar only exists on an NVFP4 module, and only that module can
+        # read a route of physical slots.
         if self._use_tensor_cores:
             self._cached_module.paged_run(
                 self._float_workspace_buffer,
@@ -1369,6 +1503,10 @@ class BlockSparseAttentionWrapper:
                 self._workspace_size,  # workspace_size
                 key_block_scales=key_block_scales,
                 value_block_scales=value_block_scales,
+                # The cache may still store whole pages while this route
+                # addresses one KV entry per index; the kernel needs both sizes
+                # to resolve a slot. Ignored unless the two differ.
+                kv_logical_block_size=self.C,
             )
         else:
             self._cached_module.run(
