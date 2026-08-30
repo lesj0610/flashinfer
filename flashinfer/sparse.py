@@ -29,6 +29,7 @@ from .prefill import _compute_page_mask_indptr, get_batch_prefill_module
 from .quantization import segment_packbits
 from .utils import (
     MaskMode,
+    _unpack_paged_kv_cache,
     PosEncodingMode,
     TensorLayout,
     _check_pos_encoding_mode,
@@ -40,6 +41,68 @@ from .utils import (
     get_compute_capability,
     is_float8,
 )
+
+
+def _check_nvfp4_kv(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_cache_sf: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    kv_layout: str,
+    head_dim: int,
+) -> None:
+    """Validate the NVFP4 contract the C++ binding cannot recover from.
+
+    ``GetFP4ScaleStrides`` only checks rank and the innermost stride, and the
+    generated binding then casts the pointer to ``uint8_t*``. A scale tensor on
+    the wrong device or with too few scale groups therefore turns into an
+    illegal address or an out-of-bounds read inside the kernel.
+    """
+    if head_dim % 16:
+        raise ValueError(
+            "NVFP4 packs one E4M3 scale per 16 elements, so head_dim must be a "
+            f"multiple of 16, got {head_dim}"
+        )
+    if k.dtype != torch.uint8 or v.dtype != torch.uint8:
+        raise ValueError(
+            "NVFP4 attention requires packed uint8 key and value caches, got "
+            f"{k.dtype} and {v.dtype}"
+        )
+    if k.shape[-1] != head_dim // 2 or v.shape[-1] != head_dim // 2:
+        raise ValueError(
+            "packed NVFP4 key/value caches must have a last dimension of "
+            f"head_dim // 2 == {head_dim // 2}, got {k.shape[-1]} and "
+            f"{v.shape[-1]}"
+        )
+    # Compare the caller's tensors as given: _unpack_paged_kv_cache would
+    # expand rank and make a shape mismatch look like a rank mismatch.
+    if isinstance(kv_cache_sf, tuple):
+        k_sf, v_sf = kv_cache_sf
+    else:
+        k_sf, v_sf = kv_cache_sf.unbind(dim=1)
+    for name, data, sf in (("key", k, k_sf), ("value", v, v_sf)):
+        if sf.dtype not in (torch.uint8, torch.float8_e4m3fn):
+            raise ValueError(
+                f"NVFP4 {name} scales must be uint8 or float8_e4m3fn, got {sf.dtype}"
+            )
+        if sf.device != data.device:
+            raise ValueError(
+                f"NVFP4 {name} scales must live on {data.device}, got {sf.device}"
+            )
+        if sf.stride(-1) != 1:
+            raise ValueError(
+                f"NVFP4 {name} scales must be contiguous in their innermost "
+                f"dimension, got stride {sf.stride(-1)}"
+            )
+        if sf.shape[-1] != head_dim // 16:
+            raise ValueError(
+                f"NVFP4 {name} scales must carry head_dim // 16 == "
+                f"{head_dim // 16} groups, got {sf.shape[-1]}"
+            )
+        if sf.shape[:-1] != data.shape[:-1]:
+            raise ValueError(
+                f"NVFP4 {name} scales must match the cache in every dimension "
+                f"but the last, got {tuple(sf.shape)} against {tuple(data.shape)}"
+            )
 
 
 def _bsr_to_vsa_index(
@@ -907,10 +970,15 @@ class BlockSparseAttentionWrapper:
         # NOTE(Zihao): we haven't supported mask in cuda-core implementations but it should
         # be easy to add support for it if needed, leave it as a future work.
         # at this moment, when mask is provided, we use the tensor-core implementation
+        # A packed NVFP4 cache is only served by the tensor-core FA2 prefill
+        # kernel: the decode path takes no block-scale tensors, so letting the
+        # heuristic pick it would silently read the FP4 bytes as plain values.
+        nvfp4_kv = kv_data_type == torch.uint8
         if (
             R * (num_qo_heads // num_kv_heads) < 4
             and mask_mode != MaskMode.CUSTOM.value
             and q_data_type not in [torch.float8_e4m3fn, torch.float8_e5m2]
+            and not nvfp4_kv
         ):
             # If the operation is not compute-bound, we use the cuda-core implementation
             self._use_tensor_cores = False
@@ -1058,6 +1126,11 @@ class BlockSparseAttentionWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute block-sparse attention between Q/K/V tensors.
 
@@ -1072,6 +1145,17 @@ class BlockSparseAttentionWrapper:
         scale_q : Optional[torch.Tensor]
             The scale tensor for query, per-head quantization with shape: ``[num_qo_heads]``.
             Used with FP8 Quantization. If not provided, will be set to ``1.0``.
+        kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
+            Per-block scale factors for an NVFP4 KV cache, either a stacked tensor
+            split on dim 1 or a ``(k_scales, v_scales)`` pair. Required when ``k``
+            and ``v`` are packed ``uint8`` FP4 tensors whose last dimension is
+            ``head_dim // 2``. Only the innermost scale dimension has to be
+            contiguous; page/token/head strides are read from the tensors.
+        k_scale : Optional[float]
+            Global dequantization scale for the key cache. Defaults to ``1.0``.
+        v_scale : Optional[float]
+            Global dequantization scale for the value cache, applied to the
+            output after normalization. Defaults to ``1.0``.
         scale_k : Optional[torch.Tensor]
             The scale tensor for key, per-head quantization with shape: ``[num_kv_heads]``.
             Used with FP8 Quantization. If not provided, will be set to ``1.0``.
@@ -1189,8 +1273,38 @@ class BlockSparseAttentionWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        if (k.dtype == torch.uint8 or v.dtype == torch.uint8) and kv_cache_sf is None:
+            raise ValueError("kv_cache_sf must be provided for an NVFP4 KV cache.")
+        if kv_cache_sf is not None:
+            _check_nvfp4_kv(k, v, kv_cache_sf, self._kv_layout, q.size(-1))
+            for name, value in (("k_scale", k_scale), ("v_scale", v_scale)):
+                if value is None:
+                    continue
+                if not math.isfinite(value) or value <= 0.0:
+                    raise ValueError(
+                        f"NVFP4 {name} must be positive and finite, got {value}"
+                    )
+        if kv_cache_sf is not None:
+            # Global scales fold outside the dots: the key scale multiplies the
+            # logits through sm_scale, the value scale the normalized output.
+            if k_scale is not None:
+                sm_scale = sm_scale * k_scale
+        key_block_scales, value_block_scales = (
+            _unpack_paged_kv_cache(kv_cache_sf, self._kv_layout)
+            if kv_cache_sf is not None
+            else (None, None)
+        )
         k = k.reshape(-1, self.C, *k.shape[-2:])
         v = v.reshape(-1, self.C, *v.shape[-2:])
+        if key_block_scales is not None:
+            # Scales follow the KV block structure, so give them the same
+            # (num_blocks, C, ...) shape the kernel expects for the data.
+            key_block_scales = key_block_scales.reshape(
+                -1, self.C, *key_block_scales.shape[-2:]
+            )
+            value_block_scales = value_block_scales.reshape(
+                -1, self.C, *value_block_scales.shape[-2:]
+            )
 
         if return_lse:
             if lse is None:
@@ -1253,6 +1367,8 @@ class BlockSparseAttentionWrapper:
                 rope_theta,
                 0,  # token_pos_in_items_len
                 self._workspace_size,  # workspace_size
+                key_block_scales=key_block_scales,
+                value_block_scales=value_block_scales,
             )
         else:
             self._cached_module.run(
@@ -1277,6 +1393,11 @@ class BlockSparseAttentionWrapper:
                 rope_scale,
                 rope_theta,
             )
+
+        if v_scale is not None and v_scale != 1.0:
+            # Mirrors the paged wrapper: the value scale folds into the
+            # normalized output rather than the dots.
+            out *= v_scale
 
         return (out, lse) if return_lse else out
 
