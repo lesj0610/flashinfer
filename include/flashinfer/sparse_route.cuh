@@ -48,17 +48,16 @@ constexpr uint32_t kNarrowThreads = 256;
 // width of ~2 K, which is 4.6 to 9.1 wide blocks per SM.
 constexpr uint32_t kBlocksPerSMForWide = 7;
 
-inline uint32_t sm_count(cudaStream_t stream) {
-  static const int count = [] {
-    int device = 0, sms = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) return 0;
-    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
-      return 0;
-    }
-    return sms;
-  }();
-  (void)stream;
-  return static_cast<uint32_t>(count);
+// Blocks a launch needs before the wide shape stops leaving the device idle.
+// Derived per shape from the occupancy the driver reports, so it follows the
+// kernel's own register use rather than a number measured on one part.
+inline uint32_t sm_count() {
+  int device = 0, sms = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) return 0;
+  if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+    return 0;
+  }
+  return static_cast<uint32_t>(sms);
 }
 
 }  // namespace sparse_route
@@ -300,7 +299,9 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromLogicalKernel(
   const int32_t request = row_live ? static_cast<int32_t>(token_to_req[row]) : -1;
   const bool request_valid = request >= 0 && request < static_cast<int32_t>(num_requests);
   const IdType* row_table = request_valid ? block_table + request * stride_table_row : nullptr;
-  const IdType* row_logical = logical + row * stride_logical_row;
+  // Only a live row reads the logical route, so it needs to cover those rows and
+  // no more -- a short step can hand over its own tensor instead of padding one.
+  const IdType* row_logical = row_live ? logical + row * stride_logical_row : nullptr;
   IdType* row_route = out_route + row * width;
   uint8_t* row_mask = out_mask + row * mask_bytes_per_row;
 
@@ -313,7 +314,7 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromLogicalKernel(
 
     uint32_t slot = 0;
     bool valid = false;
-    if (in_row && row_table != nullptr) {
+    if (in_row && row_table != nullptr && row_logical != nullptr) {
       const int32_t token = static_cast<int32_t>(row_logical[col]);
       if (token >= 0) {
         uint32_t logical_page, entry;
@@ -355,8 +356,8 @@ cudaError_t QSARouteFromLogical(const IdType* logical, const IdType* token_to_re
                                 uint32_t width, uint32_t table_width, uint32_t page_size,
                                 uint32_t num_slots, uint32_t mask_bytes_per_row,
                                 cudaStream_t stream) {
-  if (rows == 0) return cudaSuccess;
-  const uint32_t sms = sparse_route::sm_count(stream);
+  if (rows == 0 || width == 0) return cudaSuccess;
+  const uint32_t sms = sparse_route::sm_count();
   const uint32_t wide_blocks = rows * ceil_div(width, sparse_route::kWideTile);
   const bool wide = sms == 0 || wide_blocks >= sms * sparse_route::kBlocksPerSMForWide;
   const uint32_t tile = wide ? sparse_route::kWideTile : sparse_route::kNarrowTile;
@@ -386,8 +387,8 @@ cudaError_t ExpandBlockRoute(const IdType* block_indices, const IdType* query_po
                              uint32_t stride_out_row, uint32_t stride_out_col, uint32_t rows,
                              uint32_t num_requests, uint32_t block_topk, uint32_t compress_ratio,
                              uint32_t output_width, cudaStream_t stream) {
-  if (rows == 0) return cudaSuccess;
-  const uint32_t sms = sparse_route::sm_count(stream);
+  if (rows == 0 || output_width == 0) return cudaSuccess;
+  const uint32_t sms = sparse_route::sm_count();
   const uint32_t wide_blocks = rows * ceil_div(output_width, sparse_route::kWideTile);
   const bool wide =
       sms == 0 || wide_blocks >= sms * sparse_route::kBlocksPerSMForWide;
@@ -451,9 +452,9 @@ cudaError_t QSARouteFromBlocks(const IdType* block_indices, const IdType* query_
                                uint32_t block_topk, uint32_t table_width, uint32_t page_size,
                                uint32_t num_slots, uint32_t mask_bytes_per_row, uint32_t compress_ratio,
                                cudaStream_t stream) {
-  if (rows == 0) return cudaSuccess;
   const uint32_t output_width = block_topk * compress_ratio + compress_ratio - 1;
-  const uint32_t sms = sparse_route::sm_count(stream);
+  if (rows == 0 || output_width == 0) return cudaSuccess;
+  const uint32_t sms = sparse_route::sm_count();
   const uint32_t wide_blocks = rows * ceil_div(output_width, sparse_route::kWideTile);
   const bool wide = sms == 0 || wide_blocks >= sms * sparse_route::kBlocksPerSMForWide;
   const uint32_t tile = wide ? sparse_route::kWideTile : sparse_route::kNarrowTile;

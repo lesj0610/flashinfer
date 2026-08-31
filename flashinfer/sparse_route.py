@@ -19,13 +19,18 @@ from typing import Optional
 
 import torch
 
-from .jit.sparse_route import gen_sparse_route_module
+from .jit.sparse_route import gen_sparse_route_module, gen_sparse_scores_module
 from .utils import register_custom_op, register_fake_op
 
 
 @functools.cache
 def get_sparse_route_module():
     return gen_sparse_route_module().build_and_load()
+
+
+@functools.cache
+def get_sparse_scores_module():
+    return gen_sparse_scores_module().build_and_load()
 
 
 @register_custom_op("flashinfer::expand_block_route", mutates_args=("out",))
@@ -334,7 +339,8 @@ def qsa_route_from_logical(
     Parameters
     ----------
     logical : torch.Tensor
-        Logical token route, ``-1`` padded, shape ``[>= rows, width]``.
+        Logical token route, shape ``[>= valid_rows, width]``. Rows past
+        ``valid_rows`` are never read.
     token_to_req : torch.Tensor
         Request each live row belongs to, at least ``valid_rows`` entries.
     block_table : torch.Tensor
@@ -367,3 +373,146 @@ def qsa_route_from_logical(
         page_size,
         num_slots,
     )
+
+
+@register_custom_op(
+    "flashinfer::sparse_paged_scores", mutates_args=("visible_blocks", "logits")
+)
+def _sparse_paged_scores(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    logits: torch.Tensor,
+    compress_ratio: int,
+    divisor: float,
+) -> None:
+    get_sparse_scores_module().sparse_paged_scores(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        visible_blocks,
+        logits,
+        compress_ratio,
+        divisor,
+    )
+
+
+@register_fake_op("flashinfer::sparse_paged_scores")
+def _sparse_paged_scores_fake(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    logits: torch.Tensor,
+    compress_ratio: int,
+    divisor: float,
+) -> None:
+    pass
+
+
+def sparse_paged_scores(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int,
+    divisor: float,
+    num_columns: Optional[int] = None,
+    logits: Optional[torch.Tensor] = None,
+    visible_blocks: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Score every visible KV entry of a paged cache against a multi-head query.
+
+    The logits a sparse-attention selector ranks by:
+
+    .. math::
+        \mathrm{score}(row, col) =
+            \frac{1}{d} \sum_h \max\bigl(0, K[col] \cdot Q[row, h]\bigr)
+
+    There is no softmax and no value aggregation -- this is the input to a top-k,
+    not an attention output.
+
+    Entries the query cannot see, and entries on a page the block table does not
+    map, come out as ``-inf`` so a top-k never selects them.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Queries, shape ``[rows, num_heads, head_dim]``, float16 or bfloat16.
+        ``head_dim`` must be 64, 128, 192 or 256 and ``num_heads`` at most 32.
+    k_cache : torch.Tensor
+        Paged keys, shape ``[num_pages, page_size, head_dim]``, same dtype as ``q``.
+    page_table : torch.Tensor
+        Logical page to physical page per request, shape ``[num_requests, table_width]``.
+        A negative entry marks an unmapped page.
+    token_to_req : torch.Tensor
+        Request each row belongs to, shape ``[rows]``. A negative entry empties the row.
+    query_positions : torch.Tensor
+        Position of each query inside its request, shape ``[rows]``.
+    sequence_lengths : torch.Tensor
+        KV length of each request, shape ``[num_requests]``.
+    compress_ratio : int
+        Tokens each cache entry stands for. A query sees only the entries whose
+        tokens are all behind it.
+    divisor : float
+        Scale applied to the summed score, typically ``sqrt(head_dim)``.
+    num_columns : Optional[int]
+        Entries to score. Defaults to what the page table can address.
+    logits : Optional[torch.Tensor]
+        Output scores, shape ``[rows, num_columns]``, float32. Allocated when omitted.
+        Columns past a row's visible count are left untouched.
+    visible_blocks : Optional[torch.Tensor]
+        Receives the visible entry count per row, shape ``[rows]``. Allocated when
+        omitted.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        The scores and the per-row visible count.
+    """
+    if q.ndim != 3:
+        raise ValueError(f"q must be [rows, heads, head_dim], got {q.ndim}D")
+    if k_cache.ndim != 3:
+        raise ValueError(
+            f"k_cache must be [pages, page_size, head_dim], got {k_cache.ndim}D"
+        )
+    if compress_ratio < 1:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    if divisor <= 0:
+        raise ValueError(f"divisor must be positive, got {divisor}")
+    rows = q.shape[0]
+    columns = (
+        page_table.shape[1] * k_cache.shape[1] if num_columns is None else num_columns
+    )
+    if logits is None:
+        logits = torch.empty((rows, columns), dtype=torch.float32, device=q.device)
+    if visible_blocks is None:
+        visible_blocks = torch.empty(
+            rows, dtype=page_table.dtype, device=q.device
+        )
+    if rows and columns:
+        _sparse_paged_scores(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            visible_blocks,
+            logits,
+            compress_ratio,
+            divisor,
+        )
+    return logits, visible_blocks

@@ -79,6 +79,11 @@ void qsa_route_from_blocks(TensorView block_indices, TensorView query_positions,
                            int64_t num_slots) {
   CHECK_DEVICE(block_indices, out_route);
   CHECK_DEVICE(block_table, out_route);
+  CHECK_DEVICE(query_positions, out_route);
+  CHECK_DEVICE(sequence_lengths, out_route);
+  CHECK_DEVICE(token_to_req, out_route);
+  CHECK_DEVICE(out_logical, out_route);
+  CHECK_DEVICE(out_mask, out_route);
   CHECK_DIM(2, block_indices);
   CHECK_DIM(2, block_table);
   CHECK_DIM(2, out_logical);
@@ -88,6 +93,9 @@ void qsa_route_from_blocks(TensorView block_indices, TensorView query_positions,
   CHECK_CONTIGUOUS(query_positions);
   CHECK_CONTIGUOUS(sequence_lengths);
   CHECK_CONTIGUOUS(token_to_req);
+  // The kernel walks the row of each of these with a stride of one element.
+  CHECK_LAST_DIM_CONTIGUOUS(out_logical);
+  CHECK_LAST_DIM_CONTIGUOUS(block_table);
 
   const int64_t rows = block_indices.size(0);
   const int64_t block_topk = block_indices.size(1);
@@ -105,9 +113,17 @@ void qsa_route_from_blocks(TensorView block_indices, TensorView query_positions,
   TVM_FFI_ICHECK_EQ(out_mask.dtype(), dl_uint8) << "mask must be uint8";
   TVM_FFI_ICHECK_EQ(query_positions.size(0), rows);
   TVM_FFI_ICHECK_EQ(token_to_req.size(0), rows);
+  // Every index tensor is read through one pointer type.
   TVM_FFI_ICHECK_EQ(out_logical.dtype(), block_indices.dtype());
   TVM_FFI_ICHECK_EQ(out_route.dtype(), block_indices.dtype());
   TVM_FFI_ICHECK_EQ(block_table.dtype(), block_indices.dtype());
+  TVM_FFI_ICHECK_EQ(query_positions.dtype(), block_indices.dtype());
+  TVM_FFI_ICHECK_EQ(sequence_lengths.dtype(), block_indices.dtype());
+  TVM_FFI_ICHECK_EQ(token_to_req.dtype(), block_indices.dtype());
+  // A row indexes both by the same request, so a shorter table would be read
+  // past its end.
+  TVM_FFI_ICHECK_EQ(block_table.size(0), sequence_lengths.size(0))
+      << "block table and sequence lengths must cover the same requests";
 
   const cudaStream_t stream = get_stream(out_route.device());
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(block_indices.dtype(), c_idtype, [&] {
@@ -141,19 +157,25 @@ void qsa_route_from_logical(TensorView logical, TensorView token_to_req, TensorV
                             int64_t page_size, int64_t num_slots) {
   CHECK_DEVICE(logical, out_route);
   CHECK_DEVICE(block_table, out_route);
+  CHECK_DEVICE(token_to_req, out_route);
+  CHECK_DEVICE(out_mask, out_route);
   CHECK_DIM(2, logical);
   CHECK_DIM(2, block_table);
   CHECK_DIM(2, out_route);
   CHECK_CONTIGUOUS(out_route);
   CHECK_CONTIGUOUS(out_mask);
   CHECK_CONTIGUOUS(token_to_req);
+  // The kernel walks the row of each of these with a stride of one element.
+  CHECK_LAST_DIM_CONTIGUOUS(logical);
+  CHECK_LAST_DIM_CONTIGUOUS(block_table);
 
   const int64_t rows = out_route.size(0);
   const int64_t width = out_route.size(1);
   const int64_t mask_bytes = (width + 7) / 8;
   TVM_FFI_ICHECK_GT(page_size, 0) << "page_size must be positive";
   TVM_FFI_ICHECK_GT(num_slots, 0) << "num_slots must be positive";
-  TVM_FFI_ICHECK_GE(logical.size(0), rows) << "logical route must cover every route row";
+  TVM_FFI_ICHECK_GE(logical.size(0), valid_rows)
+      << "logical route must cover every live row";
   TVM_FFI_ICHECK_EQ(logical.size(1), width) << "logical route width must match the route";
   TVM_FFI_ICHECK_GE(valid_rows, 0);
   TVM_FFI_ICHECK_LE(valid_rows, rows) << "valid_rows must not exceed the route rows";
