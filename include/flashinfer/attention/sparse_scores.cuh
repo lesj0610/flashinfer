@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+
 #include <sstream>
 
 #include "../cp_async.cuh"
@@ -50,12 +51,13 @@ constexpr uint32_t kMaxHeads = kTileN;
 // lands in while keeping every row aligned for the 16-byte loads that fill it.
 // The bank geometry this rests on has been the same since sm_70.
 constexpr uint32_t kSmemPad = 16 / sizeof(uint32_t) * 2;
-// Feature slice staged at a time. A head dimension at or below this is staged
-// whole, which lets one tile's keys land while the previous tile is multiplied.
-// Above it, two whole-head buffers would leave an SM room for a single block,
-// so the pipeline runs over slices of the head instead and the tiles go one at
-// a time.
-constexpr uint32_t kSliceK = 128;
+// Feature slice staged at a time when a block walks several column tiles. Two
+// buffers of a whole head dimension would be most of a block's shared memory,
+// and shared memory is what bounds how many blocks an SM holds. A block that
+// walks a single tile stages the whole head instead: it is launched precisely
+// because the device is not full, so the barrier per slice costs more than the
+// occupancy buys.
+constexpr uint32_t kMultiTileSliceK = 64;
 
 }  // namespace sparse_scores
 
@@ -81,7 +83,8 @@ constexpr uint32_t kSliceK = 128;
  * \tparam TILES_PER_BLOCK column tiles one block walks, to amortize staging the
  *   query across more columns when there are many rows to score
  */
-template <uint32_t HEAD_DIM, uint32_t TILES_PER_BLOCK, typename DType, typename IdType>
+template <uint32_t HEAD_DIM, uint32_t TILES_PER_BLOCK, uint32_t SLICE_K, typename DType,
+          typename IdType>
 __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKernel(
     const DType* __restrict__ q, const DType* __restrict__ k_cache,
     const IdType* __restrict__ page_table, const IdType* __restrict__ token_to_req,
@@ -93,16 +96,18 @@ __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKern
     uint_fastdiv page_size, uint_fastdiv compress_ratio, float divisor) {
   using namespace sparse_scores;
   constexpr uint32_t kSmemRow = HEAD_DIM + kSmemPad;
-  constexpr uint32_t kSliceRow = kSliceK + kSmemPad;
+  constexpr uint32_t kSliceRow = SLICE_K + kSmemPad;
 
   extern __shared__ uint8_t smem_raw[];
   // Query first: it is staged once and read by every column tile.
   DType* q_smem = reinterpret_cast<DType*>(smem_raw);
   DType* k_smem = q_smem + kTileN * kSmemRow;
   int32_t* pages_smem = reinterpret_cast<int32_t*>(k_smem + 2 * kBlockN * kSliceRow);
-  uint32_t* entries_smem = reinterpret_cast<uint32_t*>(pages_smem + 2 * kBlockN);
+  uint32_t* entries_smem = reinterpret_cast<uint32_t*>(pages_smem + TILES_PER_BLOCK * kBlockN);
 
-  const uint32_t row = blockIdx.y;
+  // Rows on x so that blocks scoring the same columns run together: rows of one
+  // request read the same keys, and consecutive blocks are what shares a cache.
+  const uint32_t row = blockIdx.x;
   if (row >= rows) return;
 
   const int32_t request = static_cast<int32_t>(token_to_req[row]);
@@ -119,11 +124,11 @@ __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKern
   compress_ratio.divmod(static_cast<uint32_t>(max(query_position + 1, 0)), q_blocks, ignored);
   compress_ratio.divmod(static_cast<uint32_t>(max(sequence_length, 0)), k_blocks, ignored);
   const uint32_t visible = min(min(q_blocks, k_blocks), num_columns);
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
+  if (blockIdx.y == 0 && threadIdx.x == 0) {
     visible_out[row] = static_cast<IdType>(min(q_blocks, k_blocks));
   }
 
-  const uint32_t first_column = blockIdx.x * (kBlockN * TILES_PER_BLOCK);
+  const uint32_t first_column = blockIdx.y * (kBlockN * TILES_PER_BLOCK);
   if (first_column >= visible) return;
 
   // Stage the query once: [head][feature], which is the byte layout the
@@ -136,7 +141,6 @@ __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKern
   }
   __syncthreads();
 
-  const int32_t* tile_pages = nullptr;
   const uint32_t warp = threadIdx.x / 32;
   const uint32_t lane = threadIdx.x % 32;
   // ldmatrix quadrant addresses, per the m8n8.x4 fragment layout: A is read as
@@ -147,113 +151,98 @@ __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKern
   const uint32_t b_row = (lane % 8) + 8 * (lane / 16);
   const uint32_t b_col = ((lane % 16) / 8) * 8;
 
+  // Bytes one thread stages at a time. A wider request per thread spreads a
+  // warp over more pages, and the pages are what the gather has to chase, so
+  // this stays at the narrower width.
   constexpr uint32_t kPerVec = 16 / sizeof(DType);
-  constexpr uint32_t kVecsPerColumn = HEAD_DIM / kPerVec;
+  constexpr uint32_t kSlices = ceil_div(HEAD_DIM, SLICE_K);
+  constexpr uint32_t kSteps = TILES_PER_BLOCK * kSlices;
 
-  // Resolve one tile's columns into pages, and issue its key loads. Both are
-  // split out so the next tile can be in flight while this one is multiplied.
-  auto resolve = [&](uint32_t block_column, uint32_t slot) {
+  // Resolve every column this block will score, once. Doing it per tile would
+  // put a barrier in the middle of the pipeline. Consecutive columns walk a page
+  // in order, so a thread divides once and then counts.
+  const uint32_t page_span = static_cast<uint32_t>(page_size);
+  for (uint32_t i = threadIdx.x; i < TILES_PER_BLOCK * kBlockN; i += kThreads) {
+    const uint32_t column = first_column + i;
     int32_t page = -1;
     uint32_t entry = 0;
-    if (threadIdx.x < kBlockN) {
-      const uint32_t column = block_column + threadIdx.x;
-      if (column < visible && request_valid) {
-        uint32_t logical_page;
-        page_size.divmod(column, logical_page, entry);
-        if (logical_page < table_width) {
-          const int32_t mapped =
-              static_cast<int32_t>(page_table[safe_request * stride_table_req + logical_page]);
-          if (mapped >= 0 && mapped < static_cast<int32_t>(num_pages)) page = mapped;
-        }
+    if (column < visible && request_valid) {
+      uint32_t logical_page;
+      page_size.divmod(column, logical_page, entry);
+      if (logical_page < table_width) {
+        const int32_t mapped =
+            static_cast<int32_t>(page_table[safe_request * stride_table_req + logical_page]);
+        if (mapped >= 0 && mapped < static_cast<int32_t>(num_pages)) page = mapped;
       }
-      pages_smem[slot * kBlockN + threadIdx.x] = page;
-      entries_smem[slot * kBlockN + threadIdx.x] = entry;
     }
-  };
+    pages_smem[i] = page;
+    entries_smem[i] = entry;
+  }
+  (void)page_span;
+  __syncthreads();
 
-  auto stage = [&](uint32_t slot, uint32_t k0) {
-    DType* dst_base = k_smem + slot * kBlockN * kSliceRow;
-    const uint32_t slice = min(kSliceK, HEAD_DIM - k0);
-    for (uint32_t i = threadIdx.x; i < kBlockN * (slice / kPerVec); i += kThreads) {
-      const uint32_t vecs = slice / kPerVec;
+  // One step stages one slice of one tile, so the pipeline runs unbroken across
+  // tile boundaries.
+  auto stage = [&](uint32_t step) {
+    const uint32_t tile = step / kSlices;
+    // Columns the row cannot see are never scored, so staging them reads the
+    // cache for nothing. The group is still committed so the waits stay paired.
+    if (first_column + tile * kBlockN >= visible) {
+      cp_async::commit_group();
+      return;
+    }
+    const uint32_t k0 = (step - tile * kSlices) * SLICE_K;
+    const uint32_t slice = min(SLICE_K, HEAD_DIM - k0);
+    DType* dst_base = k_smem + (step & 1) * kBlockN * kSliceRow;
+    const uint32_t vecs = slice / kPerVec;
+    for (uint32_t i = threadIdx.x; i < kBlockN * vecs; i += kThreads) {
       const uint32_t c = i / vecs;
       const uint32_t v = i - c * vecs;
-      const int32_t page = pages_smem[(HEAD_DIM <= kSliceK ? slot : 0u) * kBlockN + c];
+      const int32_t page = pages_smem[tile * kBlockN + c];
       // A column with no page contributes nothing; zero-filling keeps the mma
       // clean and the -inf below keeps it unselectable.
       const DType* src = page >= 0 ? k_cache + static_cast<int64_t>(page) * stride_cache_page +
-                                         entries_smem[(HEAD_DIM <= kSliceK ? slot : 0u) * kBlockN +
-                                                      c] *
-                                             stride_cache_entry +
+                                         entries_smem[tile * kBlockN + c] * stride_cache_entry +
                                          k0 + v * kPerVec
                                    : nullptr;
-      cp_async::pred_load<128, cp_async::PrefetchMode::kNoPrefetch,
+      cp_async::pred_load<128, cp_async::PrefetchMode::kPrefetch,
                           cp_async::SharedMemFillMode::kFillZero>(
           dst_base + c * kSliceRow + v * kPerVec, src, page >= 0);
     }
     cp_async::commit_group();
   };
 
-  for (uint32_t t = 0; t < TILES_PER_BLOCK; ++t) {
-    const uint32_t block_column = first_column + t * kBlockN;
-    if (block_column >= visible) break;
-
-    float acc[8];
+  float acc[8];
 #pragma unroll
-    for (uint32_t i = 0; i < 8; ++i) acc[i] = 0.f;
+  for (uint32_t i = 0; i < 8; ++i) acc[i] = 0.f;
 
-    if constexpr (HEAD_DIM <= kSliceK) {
-      // One slot holds a whole tile, so the next tile's keys land during this
-      // tile's mma.
-      const uint32_t slot = t & 1;
-      const bool has_next =
-          t + 1 < TILES_PER_BLOCK && first_column + (t + 1) * kBlockN < visible;
-      if (t == 0) {
-        resolve(block_column, 0);
-        __syncthreads();
-        stage(0, 0);
-      }
-      if (has_next) resolve(first_column + (t + 1) * kBlockN, slot ^ 1);
-      cp_async::wait_group<0>();
-      __syncthreads();
-      if (has_next) stage(slot ^ 1, 0);
+  stage(0);
+  for (uint32_t step = 0; step < kSteps; ++step) {
+    const uint32_t tile = step / kSlices;
+    const uint32_t slice_idx = step - tile * kSlices;
+    const uint32_t block_column = first_column + tile * kBlockN;
+    if (block_column >= visible) break;
+    const uint32_t k0 = slice_idx * SLICE_K;
 
-      const DType* tile_keys = k_smem + slot * kBlockN * kSliceRow;
-      for (uint32_t k0 = 0; k0 < HEAD_DIM; k0 += kTileK) {
+    cp_async::wait_group<0>();
+    __syncthreads();
+    if (step + 1 < kSteps) stage(step + 1);
+
+    {
+      const DType* slice_keys = k_smem + (step & 1) * kBlockN * kSliceRow;
+      const uint32_t slice = min(SLICE_K, HEAD_DIM - k0);
+      for (uint32_t kk = 0; kk < slice; kk += kTileK) {
         uint32_t a_frag[4], b_frag[4];
-        mma::ldmatrix_m8n8x4(a_frag, tile_keys + (warp * kTileM + a_row) * kSliceRow + k0 + a_col);
-        mma::ldmatrix_m8n8x4(b_frag, q_smem + b_row * kSmemRow + k0 + b_col);
+        mma::ldmatrix_m8n8x4(a_frag,
+                             slice_keys + (warp * kTileM + a_row) * kSliceRow + kk + a_col);
+        mma::ldmatrix_m8n8x4(b_frag, q_smem + b_row * kSmemRow + k0 + kk + b_col);
         mma::mma_sync_m16n16k16_row_col_f16f16f32<DType>(acc, a_frag, b_frag);
       }
-      tile_pages = pages_smem + slot * kBlockN;
-    } else {
-      // A slot holds one slice of the head, and the pipeline runs inside the
-      // tile.
-      __syncthreads();
-      resolve(block_column, 0);
-      __syncthreads();
-      stage(0, 0);
-      for (uint32_t k0 = 0, slice_idx = 0; k0 < HEAD_DIM; k0 += kSliceK, ++slice_idx) {
-        const uint32_t slot = slice_idx & 1;
-        const bool has_next = k0 + kSliceK < HEAD_DIM;
-        cp_async::wait_group<0>();
-        __syncthreads();
-        if (has_next) stage(slot ^ 1, k0 + kSliceK);
-
-        const DType* slice_keys = k_smem + slot * kBlockN * kSliceRow;
-        const uint32_t slice = min(kSliceK, HEAD_DIM - k0);
-        for (uint32_t kk = 0; kk < slice; kk += kTileK) {
-          uint32_t a_frag[4], b_frag[4];
-          mma::ldmatrix_m8n8x4(a_frag,
-                               slice_keys + (warp * kTileM + a_row) * kSliceRow + kk + a_col);
-          mma::ldmatrix_m8n8x4(b_frag, q_smem + b_row * kSmemRow + k0 + kk + b_col);
-          mma::mma_sync_m16n16k16_row_col_f16f16f32<DType>(acc, a_frag, b_frag);
-        }
-        // The slice after next reuses this slot.
-        __syncthreads();
-      }
-      tile_pages = pages_smem;
     }
+
+    if (slice_idx + 1 < kSlices) continue;
+
+    const int32_t* tile_pages = pages_smem + tile * kBlockN;
 
     // C fragment: with g = lane >> 2 and u = lane & 3, this thread holds
     // (g, 2u) (g, 2u+1) (g+8, 2u) (g+8, 2u+1) (g, 8+2u) (g, 9+2u)
@@ -282,8 +271,8 @@ __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKern
             tile_pages[warp * kTileM + g + 8] >= 0 ? s1 / divisor : -INFINITY;
       }
     }
-    // The tile after next reuses this slot.
-    __syncthreads();
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) acc[i] = 0.f;
   }
 }
 
@@ -303,9 +292,13 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
   if (HEAD_DIM % kTileK != 0) return cudaErrorInvalidValue;
 
   constexpr uint32_t kSmemRow = HEAD_DIM + kSmemPad;
-  constexpr uint32_t kSliceRow = kSliceK + kSmemPad;
-  const size_t smem_size = (kTileN * kSmemRow + 2 * kBlockN * kSliceRow) * sizeof(DType) +
-                           2 * kBlockN * (sizeof(int32_t) + sizeof(uint32_t));
+  // Keys are two slice-sized buffers; only the resolved page metadata grows
+  // with the tiles a block walks.
+  auto smem_for = [](uint32_t tiles, uint32_t slice_k) {
+    return (kTileN * kSmemRow + 2 * kBlockN * (slice_k + kSmemPad)) * sizeof(DType) +
+           tiles * kBlockN * (sizeof(int32_t) + sizeof(uint32_t));
+  };
+  constexpr uint32_t kSingleTileSliceK = HEAD_DIM;
 
   // Few rows leave the device idle unless every column tile is its own block;
   // many rows are better off amortizing the query staging across tiles. The
@@ -316,9 +309,10 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
       &max_smem_per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
-  if (smem_size > static_cast<size_t>(max_smem_per_block_optin)) {
+  const size_t largest = max(smem_for(8, kMultiTileSliceK), smem_for(1, kSingleTileSliceK));
+  if (largest > static_cast<size_t>(max_smem_per_block_optin)) {
     std::ostringstream err_msg;
-    err_msg << "Required shared memory (" << smem_size << " bytes) for head_dim=" << HEAD_DIM
+    err_msg << "Required shared memory (" << largest << " bytes) for head_dim=" << HEAD_DIM
             << " exceeds this GPU's per-block limit (" << max_smem_per_block_optin
             << " bytes); this configuration is not supported on this architecture.";
     FLASHINFER_ERROR(err_msg.str());
@@ -329,10 +323,12 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
   // query, so a block walks several tiles instead.
   auto launch = [&](auto tiles_tag) -> cudaError_t {
     constexpr uint32_t TILES = decltype(tiles_tag)::value;
-    auto kernel = SparsePagedScoresKernel<HEAD_DIM, TILES, DType, IdType>;
+    constexpr uint32_t SLICE_K = TILES == 1 ? kSingleTileSliceK : kMultiTileSliceK;
+    const size_t smem_size = smem_for(TILES, SLICE_K);
+    auto kernel = SparsePagedScoresKernel<HEAD_DIM, TILES, SLICE_K, DType, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    const dim3 grid(ceil_div(num_columns, kBlockN * TILES), rows);
+    const dim3 grid(rows, ceil_div(num_columns, kBlockN * TILES));
     kernel<<<grid, kThreads, smem_size, stream>>>(
         q, k_cache, page_table, token_to_req, query_positions, sequence_lengths, visible_out,
         logits, stride_q_row, stride_q_head, stride_cache_page, stride_cache_entry,
@@ -343,7 +339,8 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
 
   int blocks_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &blocks_per_sm, SparsePagedScoresKernel<HEAD_DIM, 1, DType, IdType>, kThreads, smem_size));
+      &blocks_per_sm, SparsePagedScoresKernel<HEAD_DIM, 1, kSingleTileSliceK, DType, IdType>,
+      kThreads, smem_for(1, kSingleTileSliceK)));
   const uint32_t narrow_blocks = rows * ceil_div(num_columns, kBlockN);
   if (blocks_per_sm == 0 ||
       narrow_blocks <= static_cast<uint32_t>(num_sms) * static_cast<uint32_t>(blocks_per_sm)) {
