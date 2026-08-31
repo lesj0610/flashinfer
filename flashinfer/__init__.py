@@ -287,6 +287,7 @@ from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse_route import expand_block_route as expand_block_route
 from .sparse_route import qsa_route_from_blocks as qsa_route_from_blocks
 from .sparse_route import qsa_route_from_logical as qsa_route_from_logical
+from .sparse_route import sparse_paged_scores as sparse_paged_scores
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
 )

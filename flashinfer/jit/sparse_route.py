@@ -18,6 +18,19 @@ from . import env as jit_env
 from .core import JitSpec, gen_jit_spec
 
 
+def gen_sparse_scores_module() -> JitSpec:
+    # The scorer's mma path is sm_80 and newer; the caller checks the device
+    # before asking for this module.
+    return gen_jit_spec(
+        "sparse_scores",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_scores.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_scores_jit_binding.cu",
+        ],
+        extra_cuda_cflags=["-DENABLE_BF16"],
+    )
+
+
 def gen_sparse_route_module() -> JitSpec:
     return gen_jit_spec(
         "sparse_route",

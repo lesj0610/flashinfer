@@ -28,8 +28,19 @@ def get_sparse_route_module():
     return gen_sparse_route_module().build_and_load()
 
 
+# The scorer multiplies with m16n8k16, which arrived with sm_80.
+_SPARSE_SCORES_MIN_CAPABILITY = (8, 0)
+
+
 @functools.cache
 def get_sparse_scores_module():
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) < _SPARSE_SCORES_MIN_CAPABILITY:
+        raise RuntimeError(
+            "sparse_paged_scores needs compute capability "
+            f"{_SPARSE_SCORES_MIN_CAPABILITY[0]}.{_SPARSE_SCORES_MIN_CAPABILITY[1]} "
+            f"or newer for its tensor-core path, got {major}.{minor}"
+        )
     return gen_sparse_scores_module().build_and_load()
 
 
@@ -451,7 +462,7 @@ def sparse_paged_scores(
     ----------
     q : torch.Tensor
         Queries, shape ``[rows, num_heads, head_dim]``, float16 or bfloat16.
-        ``head_dim`` must be 64, 128, 192 or 256 and ``num_heads`` at most 32.
+        ``head_dim`` must be 64, 128, 192 or 256 and ``num_heads`` at most 16.
     k_cache : torch.Tensor
         Paged keys, shape ``[num_pages, page_size, head_dim]``, same dtype as ``q``.
     page_table : torch.Tensor
@@ -492,6 +503,10 @@ def sparse_paged_scores(
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
     if divisor <= 0:
         raise ValueError(f"divisor must be positive, got {divisor}")
+    if q.shape[1] > 16:
+        raise ValueError(
+            f"sparse_paged_scores handles at most 16 query heads, got {q.shape[1]}"
+        )
     rows = q.shape[0]
     columns = (
         page_table.shape[1] * k_cache.shape[1] if num_columns is None else num_columns
@@ -499,9 +514,10 @@ def sparse_paged_scores(
     if logits is None:
         logits = torch.empty((rows, columns), dtype=torch.float32, device=q.device)
     if visible_blocks is None:
-        visible_blocks = torch.empty(
-            rows, dtype=page_table.dtype, device=q.device
-        )
+        visible_blocks = torch.empty(rows, dtype=page_table.dtype, device=q.device)
+    if rows and not columns:
+        # No column to score, but the caller still reads the visible counts.
+        visible_blocks.zero_()
     if rows and columns:
         _sparse_paged_scores(
             q,

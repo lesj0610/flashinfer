@@ -52,6 +52,7 @@ void expand_block_route(TensorView block_indices, TensorView query_positions,
   TVM_FFI_ICHECK_EQ(token_to_req.dtype(), block_indices.dtype());
   TVM_FFI_ICHECK_EQ(out.dtype(), block_indices.dtype());
 
+  ffi::CUDADeviceGuard device_guard(out.device().device_id);
   const cudaStream_t stream = get_stream(out.device());
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(block_indices.dtype(), c_idtype, [&] {
     cudaError_t status = ExpandBlockRoute<c_idtype>(
@@ -125,6 +126,7 @@ void qsa_route_from_blocks(TensorView block_indices, TensorView query_positions,
   TVM_FFI_ICHECK_EQ(block_table.size(0), sequence_lengths.size(0))
       << "block table and sequence lengths must cover the same requests";
 
+  ffi::CUDADeviceGuard device_guard(out_route.device().device_id);
   const cudaStream_t stream = get_stream(out_route.device());
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(block_indices.dtype(), c_idtype, [&] {
     cudaError_t status = QSARouteFromBlocks<c_idtype>(
@@ -187,6 +189,7 @@ void qsa_route_from_logical(TensorView logical, TensorView token_to_req, TensorV
   TVM_FFI_ICHECK_EQ(block_table.dtype(), logical.dtype());
   TVM_FFI_ICHECK_EQ(token_to_req.dtype(), logical.dtype());
 
+  ffi::CUDADeviceGuard device_guard(out_route.device().device_id);
   const cudaStream_t stream = get_stream(out_route.device());
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(logical.dtype(), c_idtype, [&] {
     cudaError_t status = QSARouteFromLogical<c_idtype>(
