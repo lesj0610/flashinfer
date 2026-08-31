@@ -36,12 +36,16 @@ namespace sparse_scores {
 constexpr uint32_t kTileM = 16;
 constexpr uint32_t kTileN = 16;
 constexpr uint32_t kTileK = 16;
-// Warps per block, and therefore columns per block. Each warp owns its own
-// column tile and its own slice of the key staging buffer; more warps hide the
-// gather behind another warp's mma and share the one staged query.
-constexpr uint32_t kWarps = 4;
-constexpr uint32_t kBlockN = kWarps * kTileM;
-constexpr uint32_t kThreads = kWarps * 32;
+// Columns a block scores at once. The two shapes below cover the same width
+// with different thread counts.
+constexpr uint32_t kBlockN = 64;
+// Staging is what bounds this kernel, and how much of it is in flight is set
+// by how many copies a thread issues before the wait -- fewer threads over the
+// same tile means more per thread. A launch that does not fill the device
+// takes the deeper shape; one that does trades depth for resident warps, since
+// there the latency is already covered by other blocks.
+constexpr uint32_t kDeepWarps = 2;
+constexpr uint32_t kWideWarps = 4;
 // Query heads a block handles. More than this needs a second n-tile, which the
 // caller currently never asks for.
 constexpr uint32_t kMaxHeads = kTileN;
@@ -83,9 +87,9 @@ constexpr uint32_t kMultiTileSliceK = 64;
  * \tparam TILES_PER_BLOCK column tiles one block walks, to amortize staging the
  *   query across more columns when there are many rows to score
  */
-template <uint32_t HEAD_DIM, uint32_t TILES_PER_BLOCK, uint32_t SLICE_K, typename DType,
-          typename IdType>
-__global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKernel(
+template <uint32_t HEAD_DIM, uint32_t TILES_PER_BLOCK, uint32_t SLICE_K, uint32_t WARPS,
+          typename DType, typename IdType>
+__global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
     const DType* __restrict__ q, const DType* __restrict__ k_cache,
     const IdType* __restrict__ page_table, const IdType* __restrict__ token_to_req,
     const IdType* __restrict__ query_positions, const IdType* __restrict__ sequence_lengths,
@@ -95,6 +99,9 @@ __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKern
     uint32_t num_pages, uint32_t num_requests, uint32_t table_width, uint32_t num_heads,
     uint_fastdiv page_size, uint_fastdiv compress_ratio, float divisor) {
   using namespace sparse_scores;
+  constexpr uint32_t kThreads = WARPS * 32;
+  // Tiles a warp owns so the block still covers kBlockN columns.
+  constexpr uint32_t kTilesPerWarp = kBlockN / (WARPS * kTileM);
   constexpr uint32_t kSmemRow = HEAD_DIM + kSmemPad;
   constexpr uint32_t kSliceRow = SLICE_K + kSmemPad;
 
@@ -134,10 +141,33 @@ __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKern
   // Stage the query once: [head][feature], which is the byte layout the
   // row-col mma wants for its column-major B operand.
   const uint32_t heads = min(num_heads, kMaxHeads);
-  for (uint32_t i = threadIdx.x; i < kTileN * HEAD_DIM; i += kThreads) {
-    const uint32_t h = i / HEAD_DIM;
-    const uint32_t d = i - h * HEAD_DIM;
-    q_smem[h * kSmemRow + d] = h < heads ? q[row * stride_q_row + h * stride_q_head + d] : DType(0);
+  // Sixteen bytes at a time: element-wise this is the same bytes but eight
+  // times the load instructions, and instruction count is what this kernel is
+  // short of. The head is a multiple of the vector width and both the query
+  // rows and the staged rows start aligned.
+  constexpr uint32_t kQVec = 16 / sizeof(DType);
+  const bool q_vectorizable =
+      HEAD_DIM % kQVec == 0 && stride_q_head % kQVec == 0 && stride_q_row % kQVec == 0;
+  if (q_vectorizable) {
+    constexpr uint32_t kQVecsPerHead = HEAD_DIM / kQVec;
+    for (uint32_t i = threadIdx.x; i < kTileN * kQVecsPerHead; i += kThreads) {
+      const uint32_t h = i / kQVecsPerHead;
+      const uint32_t d = (i - h * kQVecsPerHead) * kQVec;
+      float4* dst = reinterpret_cast<float4*>(q_smem + h * kSmemRow + d);
+      if (h < heads) {
+        *dst = *reinterpret_cast<const float4*>(
+            q + row * stride_q_row + h * stride_q_head + d);
+      } else {
+        *dst = make_float4(0.f, 0.f, 0.f, 0.f);
+      }
+    }
+  } else {
+    for (uint32_t i = threadIdx.x; i < kTileN * HEAD_DIM; i += kThreads) {
+      const uint32_t h = i / HEAD_DIM;
+      const uint32_t d = i - h * HEAD_DIM;
+      q_smem[h * kSmemRow + d] =
+          h < heads ? q[row * stride_q_row + h * stride_q_head + d] : DType(0);
+    }
   }
   __syncthreads();
 
@@ -156,6 +186,10 @@ __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKern
   // this stays at the narrower width.
   constexpr uint32_t kPerVec = 16 / sizeof(DType);
   constexpr uint32_t kSlices = ceil_div(HEAD_DIM, SLICE_K);
+  // Whether every slice is full. When it is, the multiply below has a
+  // compile-time trip count and unrolls; leaving the bound as a runtime min()
+  // costs that, which is most of the instruction issue in this kernel.
+  constexpr bool kEvenSlices = HEAD_DIM % SLICE_K == 0;
   constexpr uint32_t kSteps = TILES_PER_BLOCK * kSlices;
 
   // Resolve every column this block will score, once. Doing it per tile would
@@ -192,9 +226,11 @@ __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKern
       return;
     }
     const uint32_t k0 = (step - tile * kSlices) * SLICE_K;
-    const uint32_t slice = min(SLICE_K, HEAD_DIM - k0);
     DType* dst_base = k_smem + (step & 1) * kBlockN * kSliceRow;
-    const uint32_t vecs = slice / kPerVec;
+    constexpr uint32_t kEvenVecs = SLICE_K / kPerVec;
+    const uint32_t vecs =
+        kEvenSlices ? kEvenVecs : min(SLICE_K, HEAD_DIM - k0) / kPerVec;
+#pragma unroll 4
     for (uint32_t i = threadIdx.x; i < kBlockN * vecs; i += kThreads) {
       const uint32_t c = i / vecs;
       const uint32_t v = i - c * vecs;
@@ -205,16 +241,19 @@ __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKern
                                          entries_smem[tile * kBlockN + c] * stride_cache_entry +
                                          k0 + v * kPerVec
                                    : nullptr;
-      cp_async::pred_load<128, cp_async::PrefetchMode::kPrefetch,
+      cp_async::pred_load<128, cp_async::PrefetchMode::kNoPrefetch,
                           cp_async::SharedMemFillMode::kFillZero>(
           dst_base + c * kSliceRow + v * kPerVec, src, page >= 0);
     }
     cp_async::commit_group();
   };
 
-  float acc[8];
+  float acc[kTilesPerWarp][8];
 #pragma unroll
-  for (uint32_t i = 0; i < 8; ++i) acc[i] = 0.f;
+  for (uint32_t m = 0; m < kTilesPerWarp; ++m) {
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) acc[m][i] = 0.f;
+  }
 
   stage(0);
   for (uint32_t step = 0; step < kSteps; ++step) {
@@ -230,13 +269,36 @@ __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKern
 
     {
       const DType* slice_keys = k_smem + (step & 1) * kBlockN * kSliceRow;
-      const uint32_t slice = min(SLICE_K, HEAD_DIM - k0);
-      for (uint32_t kk = 0; kk < slice; kk += kTileK) {
-        uint32_t a_frag[4], b_frag[4];
-        mma::ldmatrix_m8n8x4(a_frag,
-                             slice_keys + (warp * kTileM + a_row) * kSliceRow + kk + a_col);
-        mma::ldmatrix_m8n8x4(b_frag, q_smem + b_row * kSmemRow + k0 + kk + b_col);
-        mma::mma_sync_m16n16k16_row_col_f16f16f32<DType>(acc, a_frag, b_frag);
+      // Split on the compile-time case so the multiply has a constant trip
+      // count there: a runtime bound stops the unroll, and the issue rate of
+      // this loop is what the kernel spends its time on.
+      if constexpr (kEvenSlices) {
+#pragma unroll
+        for (uint32_t kk = 0; kk < SLICE_K; kk += kTileK) {
+          // One query fragment feeds every tile this warp owns.
+          uint32_t b_frag[4];
+          mma::ldmatrix_m8n8x4(b_frag, q_smem + b_row * kSmemRow + k0 + kk + b_col);
+#pragma unroll
+          for (uint32_t m = 0; m < kTilesPerWarp; ++m) {
+            uint32_t a_frag[4];
+            const uint32_t tile_row = (warp * kTilesPerWarp + m) * kTileM + a_row;
+            mma::ldmatrix_m8n8x4(a_frag, slice_keys + tile_row * kSliceRow + kk + a_col);
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DType>(acc[m], a_frag, b_frag);
+          }
+        }
+      } else {
+        const uint32_t slice = min(SLICE_K, HEAD_DIM - k0);
+        for (uint32_t kk = 0; kk < slice; kk += kTileK) {
+          uint32_t b_frag[4];
+          mma::ldmatrix_m8n8x4(b_frag, q_smem + b_row * kSmemRow + k0 + kk + b_col);
+#pragma unroll
+          for (uint32_t m = 0; m < kTilesPerWarp; ++m) {
+            uint32_t a_frag[4];
+            const uint32_t tile_row = (warp * kTilesPerWarp + m) * kTileM + a_row;
+            mma::ldmatrix_m8n8x4(a_frag, slice_keys + tile_row * kSliceRow + kk + a_col);
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DType>(acc[m], a_frag, b_frag);
+          }
+        }
       }
     }
 
@@ -249,30 +311,38 @@ __global__ void __launch_bounds__(sparse_scores::kThreads) SparsePagedScoresKern
     // (g+8, 8+2u) (g+8, 9+2u) -- two columns of the tile and four heads each.
     const uint32_t g = lane >> 2;
     const uint32_t u = lane & 3;
-    float s0 = fmaxf(acc[0], 0.f) + fmaxf(acc[1], 0.f) + fmaxf(acc[4], 0.f) + fmaxf(acc[5], 0.f);
-    float s1 = fmaxf(acc[2], 0.f) + fmaxf(acc[3], 0.f) + fmaxf(acc[6], 0.f) + fmaxf(acc[7], 0.f);
-    // The four lanes sharing a row hold the remaining heads.
-    s0 += __shfl_xor_sync(0xffffffffu, s0, 1);
-    s0 += __shfl_xor_sync(0xffffffffu, s0, 2);
-    s1 += __shfl_xor_sync(0xffffffffu, s1, 1);
-    s1 += __shfl_xor_sync(0xffffffffu, s1, 2);
+#pragma unroll
+    for (uint32_t m = 0; m < kTilesPerWarp; ++m) {
+      const float* a = acc[m];
+      float s0 = fmaxf(a[0], 0.f) + fmaxf(a[1], 0.f) + fmaxf(a[4], 0.f) + fmaxf(a[5], 0.f);
+      float s1 = fmaxf(a[2], 0.f) + fmaxf(a[3], 0.f) + fmaxf(a[6], 0.f) + fmaxf(a[7], 0.f);
+      // The four lanes sharing a row hold the remaining heads.
+      s0 += __shfl_xor_sync(0xffffffffu, s0, 1);
+      s0 += __shfl_xor_sync(0xffffffffu, s0, 2);
+      s1 += __shfl_xor_sync(0xffffffffu, s1, 1);
+      s1 += __shfl_xor_sync(0xffffffffu, s1, 2);
 
-    // A column on an unmapped page staged as zeros, which would score 0; it has
-    // to be unselectable instead.
-    if (u == 0) {
-      const uint32_t c0 = block_column + warp * kTileM + g;
-      const uint32_t c1 = block_column + warp * kTileM + g + 8;
-      if (c0 < visible) {
-        logits[row * stride_logits_row + c0] =
-            tile_pages[warp * kTileM + g] >= 0 ? s0 / divisor : -INFINITY;
-      }
-      if (c1 < visible) {
-        logits[row * stride_logits_row + c1] =
-            tile_pages[warp * kTileM + g + 8] >= 0 ? s1 / divisor : -INFINITY;
+      // A column on an unmapped page staged as zeros, which would score 0; it
+      // has to be unselectable instead.
+      if (u == 0) {
+        const uint32_t base = (warp * kTilesPerWarp + m) * kTileM;
+        const uint32_t c0 = block_column + base + g;
+        const uint32_t c1 = block_column + base + g + 8;
+        if (c0 < visible) {
+          logits[row * stride_logits_row + c0] =
+              tile_pages[base + g] >= 0 ? s0 / divisor : -INFINITY;
+        }
+        if (c1 < visible) {
+          logits[row * stride_logits_row + c1] =
+              tile_pages[base + g + 8] >= 0 ? s1 / divisor : -INFINITY;
+        }
       }
     }
 #pragma unroll
-    for (uint32_t i = 0; i < 8; ++i) acc[i] = 0.f;
+    for (uint32_t m = 0; m < kTilesPerWarp; ++m) {
+#pragma unroll
+      for (uint32_t i = 0; i < 8; ++i) acc[m][i] = 0.f;
+    }
   }
 }
 
@@ -324,12 +394,16 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
   auto launch = [&](auto tiles_tag) -> cudaError_t {
     constexpr uint32_t TILES = decltype(tiles_tag)::value;
     constexpr uint32_t SLICE_K = TILES == 1 ? kSingleTileSliceK : kMultiTileSliceK;
+    // A single-tile launch runs because the device is not full, so it takes the
+    // deeper staging; a multi-tile one keeps more warps resident instead.
+    constexpr uint32_t WARPS = TILES == 1 ? kDeepWarps : kWideWarps;
+    constexpr uint32_t THREADS = WARPS * 32;
     const size_t smem_size = smem_for(TILES, SLICE_K);
-    auto kernel = SparsePagedScoresKernel<HEAD_DIM, TILES, SLICE_K, DType, IdType>;
+    auto kernel = SparsePagedScoresKernel<HEAD_DIM, TILES, SLICE_K, WARPS, DType, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     const dim3 grid(rows, ceil_div(num_columns, kBlockN * TILES));
-    kernel<<<grid, kThreads, smem_size, stream>>>(
+    kernel<<<grid, THREADS, smem_size, stream>>>(
         q, k_cache, page_table, token_to_req, query_positions, sequence_lengths, visible_out,
         logits, stride_q_row, stride_q_head, stride_cache_page, stride_cache_entry,
         stride_table_req, stride_logits_row, rows, num_columns, num_pages, num_requests,
@@ -339,8 +413,9 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
 
   int blocks_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &blocks_per_sm, SparsePagedScoresKernel<HEAD_DIM, 1, kSingleTileSliceK, DType, IdType>,
-      kThreads, smem_for(1, kSingleTileSliceK)));
+      &blocks_per_sm,
+      SparsePagedScoresKernel<HEAD_DIM, 1, kSingleTileSliceK, kDeepWarps, DType, IdType>,
+      kDeepWarps * 32, smem_for(1, kSingleTileSliceK)));
   const uint32_t narrow_blocks = rows * ceil_div(num_columns, kBlockN);
   if (blocks_per_sm == 0 ||
       narrow_blocks <= static_cast<uint32_t>(num_sms) * static_cast<uint32_t>(blocks_per_sm)) {
