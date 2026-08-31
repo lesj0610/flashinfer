@@ -1387,18 +1387,18 @@ class BlockSparseAttentionWrapper:
             raise ValueError("kv_cache_sf must be provided for an NVFP4 KV cache.")
         if kv_cache_sf is not None:
             _check_nvfp4_kv(k, v, kv_cache_sf, self._kv_layout, q.size(-1))
-            for name, value in (("k_scale", k_scale), ("v_scale", v_scale)):
-                if value is None:
-                    continue
-                if not math.isfinite(value) or value <= 0.0:
-                    raise ValueError(
-                        f"NVFP4 {name} must be positive and finite, got {value}"
-                    )
-        if kv_cache_sf is not None:
-            # Global scales fold outside the dots: the key scale multiplies the
-            # logits through sm_scale, the value scale the normalized output.
-            if k_scale is not None:
-                sm_scale = sm_scale * k_scale
+        for name, value in (("k_scale", k_scale), ("v_scale", v_scale)):
+            if value is None:
+                continue
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive and finite, got {value}")
+        # Global scales fold outside the dots: the key scale multiplies the
+        # logits through sm_scale, the value scale the normalized output. This
+        # is how a packed NVFP4 cache carries its scale, and it is also the only
+        # way an FP8 cache can on FA2 -- the per-head scale tensors reach the
+        # FA3 entry point alone.
+        if k_scale is not None and k_scale != 1.0:
+            sm_scale = sm_scale * k_scale
         key_block_scales, value_block_scales = (
             _unpack_paged_kv_cache(kv_cache_sf, self._kv_layout)
             if kv_cache_sf is not None
@@ -1460,6 +1460,11 @@ class BlockSparseAttentionWrapper:
 
             if scale_q is None:
                 scale_q = torch.ones(q.shape[1], dtype=torch.float32, device=q.device)
+        if is_float8(q) or is_float8(k):
+            # An FP8 cache carries its dequantization scale per KV head. The
+            # query does not have to be FP8 for that to apply: reading an FP8
+            # cache with a higher-precision query is the common paged case, and
+            # leaving these unset there drops the scale entirely.
             if scale_k is None:
                 scale_k = torch.ones(k.shape[1], dtype=torch.float32, device=q.device)
             if scale_v is None:
