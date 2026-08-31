@@ -39,7 +39,7 @@ from ..utils import (
     pos_encoding_mode_literal,
     write_if_different,
 )
-from .utils import _is_nvfp4_kv_dtype, generate_additional_params
+from .utils import generate_additional_params
 from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
 
@@ -1254,21 +1254,20 @@ def _fa2_head_dim_nvcc_flags(
     head_dim_vo: int,
     dtype_kv: torch.dtype,
     *,
-    allow_nvfp4_sm8_large_head: bool = False,
+    allow_quantized_sm8_large_head: bool = False,
 ) -> Optional[List[str]]:
     """Return arch flags for FA2 large-head modules.
 
-    For 16-bit KV, head_dim > 256 uses the Ampere+ large-head path. NVFP4 KV
-    can opt into the same arch set only for validated FA2 prefill read paths.
-    Other one-byte large-head modules remain restricted to SM100+ until those
-    variants are validated separately.
+    For 16-bit KV, head_dim > 256 uses the Ampere+ large-head path. A one-byte
+    KV cache is read as raw bytes and rebuilt before the dots, which that path
+    does just as well, so the read paths validated for it opt into the same arch
+    set. The rest stay on SM100+ until they are validated too.
     """
     if head_dim_qk > 256 or head_dim_vo > 256:
-        if dtype_kv.itemsize == 1:
-            if not (allow_nvfp4_sm8_large_head and _is_nvfp4_kv_dtype(dtype_kv)):
-                return current_compilation_context.get_nvcc_flags_list(
-                    supported_major_versions=[10, 11, 12]
-                )
+        if dtype_kv.itemsize == 1 and not allow_quantized_sm8_large_head:
+            return current_compilation_context.get_nvcc_flags_list(
+                supported_major_versions=[10, 11, 12]
+            )
         return current_compilation_context.get_nvcc_flags_list(
             supported_major_versions=[8, 9, 10, 11, 12]
         )
@@ -1282,7 +1281,7 @@ def _fa2_prefill_head_dim_nvcc_flags(
         head_dim_qk,
         head_dim_vo,
         dtype_kv,
-        allow_nvfp4_sm8_large_head=True,
+        allow_quantized_sm8_large_head=True,
     )
 
 

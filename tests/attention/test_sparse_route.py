@@ -21,6 +21,11 @@ import flashinfer
 
 DEV = "cuda:0"
 
+requires_cuda_sm80 = pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 8,
+    reason="the FA2 large-head path starts at sm_80",
+)
+
 
 def _expand_reference(
     block_indices, query_positions, sequence_lengths, token_to_req, compress_ratio
@@ -266,3 +271,77 @@ def test_route_ops_reject_bad_arguments():
     # a ratio the dispatch has no kernel for
     with pytest.raises(Exception, match="compress_ratio"):
         flashinfer.expand_block_route(blocks, positions, lengths, token_to_req, 3)
+
+
+@requires_cuda_sm80
+@pytest.mark.parametrize("head_dim", [256, 512])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_paged_route_reads_a_wide_quantized_head(head_dim, kv_dtype):
+    """A one-byte cache of any supported width reads on this architecture.
+
+    The FA2 large-head path rebuilds a quantized cache from raw bytes before
+    the dots, which does not depend on the architecture the bytes were written
+    for. This pins that down for the widths the read paths claim.
+    """
+    num_qo_heads, num_kv_heads, page_size = 8, 1, 64
+    rows, width, pages = 4, 64, 8
+    g = torch.Generator(device=DEV).manual_seed(head_dim)
+
+    keys = (
+        torch.randn(
+            pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=DEV,
+            generator=g,
+        )
+        * 0.3
+    )
+    values = torch.randn_like(keys) * 0.3
+    scale = 0.5
+    if kv_dtype == torch.float8_e4m3fn:
+        keys = (keys.float() / scale).to(kv_dtype)
+        values = (values.float() / scale).to(kv_dtype)
+        run_kwargs = {"k_scale": scale, "v_scale": scale}
+        # The reference reads the same bytes, dequantized ahead of time.
+        ref_keys = (keys.float() * scale).to(torch.bfloat16)
+        ref_values = (values.float() * scale).to(torch.bfloat16)
+    else:
+        run_kwargs = {}
+        ref_keys, ref_values = keys, values
+
+    query = torch.randn(
+        rows, num_qo_heads, head_dim, dtype=torch.bfloat16, device=DEV, generator=g
+    )
+    route = torch.randint(
+        0, pages * page_size, (rows, width), dtype=torch.int32, device=DEV, generator=g
+    )
+    indptr = torch.arange(0, (rows + 1) * width, width, dtype=torch.int32, device=DEV)
+    mask = torch.ones(rows * width, 1, 1, dtype=torch.bool, device=DEV)
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=DEV)
+
+    def run(k, v, dtype, **kwargs):
+        wrapper = flashinfer.BlockSparseAttentionWrapper(workspace, kv_layout="HND")
+        wrapper.plan(
+            indptr,
+            route.reshape(-1).contiguous(),
+            rows,
+            pages * page_size,
+            1,
+            1,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            mask=mask,
+            q_data_type=torch.bfloat16,
+            kv_data_type=dtype,
+            o_data_type=torch.bfloat16,
+            kv_cache_page_size=page_size,
+        )
+        return wrapper.run(query, k, v, **kwargs)
+
+    out = run(keys, values, kv_dtype, **run_kwargs)
+    expected = run(ref_keys, ref_values, torch.bfloat16)
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
