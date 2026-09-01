@@ -659,12 +659,12 @@ class BlockSparseAttentionWrapper:
         kv_block_lens: Optional[torch.Tensor] = None,
         q2k_indices: Optional[torch.Tensor] = None,
         q2k_num: Optional[torch.Tensor] = None,
-        kv_cache_page_size: Optional[int] = None,
         kv_splits: Optional[Union[int, str]] = None,
         use_clc: Optional[bool] = None,
         q_scale: Optional[torch.Tensor] = None,
         k_scale: Optional[torch.Tensor] = None,
         v_scale: Optional[torch.Tensor] = None,
+        kv_cache_page_size: Optional[int] = None,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -757,12 +757,6 @@ class BlockSparseAttentionWrapper:
             Number of valid entries in each direct selection row, contiguous
             int32 with shape ``(num_qo_heads, MB)``. When omitted, every direct
             row uses the full ``topk`` dimension.
-        kv_cache_page_size : int, optional
-            Page size of a paged KV cache passed to :meth:`run` as raw pages,
-            rather than as the gathered blocks the wrapper otherwise expects.
-            Read by the FA2 planner, so it is only supported for the ``auto``,
-            ``fa2`` and ``fa3`` backends and must be ``None`` for the
-            block-sparse ones, which plan without it.
         kv_splits : Optional[Union[int, str]]
             Number of KV splits for the split-KV combine path, or ``"auto"`` to pick a
             split count from the sparsity heuristics. Only supported for the
@@ -787,6 +781,12 @@ class BlockSparseAttentionWrapper:
         v_scale : torch.Tensor, optional
             Sage FP8 quantization scale for ``v``, shape ``(num_qo_heads, head_dim)``,
             float32. See ``q_scale``.
+        kv_cache_page_size : int, optional
+            Page size of a paged KV cache passed to :meth:`run` as raw pages,
+            rather than as the gathered blocks the wrapper otherwise expects.
+            Read by the FA2 planner, so it is only supported for the ``auto``,
+            ``fa2`` and ``fa3`` backends and must be ``None`` for the
+            block-sparse ones, which plan without it.
 
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
