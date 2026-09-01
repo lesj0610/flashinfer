@@ -143,11 +143,13 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
   const uint32_t heads = min(num_heads, kMaxHeads);
   // Sixteen bytes at a time: element-wise this is the same bytes but eight
   // times the load instructions, and instruction count is what this kernel is
-  // short of. The head is a multiple of the vector width and both the query
-  // rows and the staged rows start aligned.
+  // short of. Every address it will form has to be aligned to that, which the
+  // strides alone do not settle -- a view onto the middle of a tensor has
+  // whatever strides it started with and a base that is not.
   constexpr uint32_t kQVec = 16 / sizeof(DType);
-  const bool q_vectorizable =
-      HEAD_DIM % kQVec == 0 && stride_q_head % kQVec == 0 && stride_q_row % kQVec == 0;
+  const bool q_vectorizable = HEAD_DIM % kQVec == 0 && stride_q_head % kQVec == 0 &&
+                              stride_q_row % kQVec == 0 &&
+                              reinterpret_cast<uintptr_t>(q) % 16 == 0;
   if (q_vectorizable) {
     constexpr uint32_t kQVecsPerHead = HEAD_DIM / kQVec;
     for (uint32_t i = threadIdx.x; i < kTileN * kQVecsPerHead; i += kThreads) {
@@ -215,6 +217,15 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
   (void)page_span;
   __syncthreads();
 
+  // The staged loads are 128 bits and cp_async has no narrower form, so every
+  // row start the strides can produce has to be aligned to that as well as the
+  // base. When it is not, the same slice is staged an element at a time; the
+  // group is still committed so the pipeline's waits stay paired, and the
+  // barrier that follows the wait publishes the writes either way.
+  const bool k_vectorizable = reinterpret_cast<uintptr_t>(k_cache) % 16 == 0 &&
+                              (stride_cache_page * sizeof(DType)) % 16 == 0 &&
+                              (stride_cache_entry * sizeof(DType)) % 16 == 0;
+
   // One step stages one slice of one tile, so the pipeline runs unbroken across
   // tile boundaries.
   auto stage = [&](uint32_t step) {
@@ -230,20 +241,33 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
     constexpr uint32_t kEvenVecs = SLICE_K / kPerVec;
     const uint32_t vecs =
         kEvenSlices ? kEvenVecs : min(SLICE_K, HEAD_DIM - k0) / kPerVec;
+    if (k_vectorizable) {
 #pragma unroll 4
-    for (uint32_t i = threadIdx.x; i < kBlockN * vecs; i += kThreads) {
-      const uint32_t c = i / vecs;
-      const uint32_t v = i - c * vecs;
-      const int32_t page = pages_smem[tile * kBlockN + c];
-      // A column with no page contributes nothing; zero-filling keeps the mma
-      // clean and the -inf below keeps it unselectable.
-      const DType* src = page >= 0 ? k_cache + static_cast<int64_t>(page) * stride_cache_page +
-                                         entries_smem[tile * kBlockN + c] * stride_cache_entry +
-                                         k0 + v * kPerVec
-                                   : nullptr;
-      cp_async::pred_load<128, cp_async::PrefetchMode::kNoPrefetch,
-                          cp_async::SharedMemFillMode::kFillZero>(
-          dst_base + c * kSliceRow + v * kPerVec, src, page >= 0);
+      for (uint32_t i = threadIdx.x; i < kBlockN * vecs; i += kThreads) {
+        const uint32_t c = i / vecs;
+        const uint32_t v = i - c * vecs;
+        const int32_t page = pages_smem[tile * kBlockN + c];
+        // A column with no page contributes nothing; zero-filling keeps the mma
+        // clean and the -inf below keeps it unselectable.
+        const DType* src = page >= 0 ? k_cache + static_cast<int64_t>(page) * stride_cache_page +
+                                           entries_smem[tile * kBlockN + c] * stride_cache_entry +
+                                           k0 + v * kPerVec
+                                     : nullptr;
+        cp_async::pred_load<128, cp_async::PrefetchMode::kNoPrefetch,
+                            cp_async::SharedMemFillMode::kFillZero>(
+            dst_base + c * kSliceRow + v * kPerVec, src, page >= 0);
+      }
+    } else {
+      const uint32_t elems = vecs * kPerVec;
+      for (uint32_t i = threadIdx.x; i < kBlockN * elems; i += kThreads) {
+        const uint32_t c = i / elems;
+        const uint32_t e = i - c * elems;
+        const int32_t page = pages_smem[tile * kBlockN + c];
+        dst_base[c * kSliceRow + e] =
+            page >= 0 ? k_cache[static_cast<int64_t>(page) * stride_cache_page +
+                                entries_smem[tile * kBlockN + c] * stride_cache_entry + k0 + e]
+                      : DType(0);
+      }
     }
     cp_async::commit_group();
   };

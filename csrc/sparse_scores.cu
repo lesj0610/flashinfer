@@ -115,7 +115,7 @@ void sparse_paged_scores(TensorView q, TensorView k_cache, TensorView page_table
                                 << "; expected 64, 128, 192 or 256";
       }
       TVM_FFI_ICHECK(status != cudaErrorInvalidValue)
-          << "unsupported query head count " << num_heads << "; expected at most 32";
+          << "unsupported query head count " << num_heads << "; expected at most 16";
       TVM_FFI_ICHECK(status == cudaSuccess)
           << "SparsePagedScores failed: " << cudaGetErrorString(status);
       return true;

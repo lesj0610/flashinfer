@@ -455,8 +455,10 @@ def sparse_paged_scores(
     There is no softmax and no value aggregation -- this is the input to a top-k,
     not an attention output.
 
-    Entries the query cannot see, and entries on a page the block table does not
-    map, come out as ``-inf`` so a top-k never selects them.
+    Entries on a page the block table does not map come out as ``-inf`` so a
+    top-k never selects them. Columns past what the query can see are left
+    untouched instead, and the count of what it can see is returned, so a top-k
+    has to bound itself by that count rather than by the column width.
 
     Parameters
     ----------
