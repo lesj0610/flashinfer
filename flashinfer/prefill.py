@@ -35,6 +35,7 @@ from .jit import (
     get_batch_prefill_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
+    with_fa2_route_scalars,
 )
 from .page import get_seq_lens
 from .quantization import packbits, segment_packbits
@@ -1768,7 +1769,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
-            self._jit_additional_scalar_names = list(jit_args[9])
+            # jit_args[9] is additional_scalar_names, which the module generator
+            # extends for FA2. The run arguments are built from this list, so it
+            # has to be extended the same way or the kernel is called with one
+            # scalar fewer than it was generated to take.
+            self._jit_additional_scalar_names = with_fa2_route_scalars(
+                backend, jit_args[9], jit_args[10]
+            )[0]
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []

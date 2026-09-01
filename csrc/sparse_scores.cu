@@ -19,11 +19,11 @@
 
 using namespace flashinfer;
 
-#define _FI_DISPATCH_HEAD_DIM(DIM, ...)                                          \
-  case DIM: {                                                                    \
-    constexpr uint32_t HEAD_DIM = DIM;                                           \
-    __VA_ARGS__                                                                  \
-    break;                                                                       \
+#define _FI_DISPATCH_HEAD_DIM(DIM, ...) \
+  case DIM: {                           \
+    constexpr uint32_t HEAD_DIM = DIM;  \
+    __VA_ARGS__                         \
+    break;                              \
   }
 
 void sparse_paged_scores(TensorView q, TensorView k_cache, TensorView page_table,
@@ -37,8 +37,8 @@ void sparse_paged_scores(TensorView q, TensorView k_cache, TensorView page_table
   CHECK_DEVICE(query_positions, logits);
   CHECK_DEVICE(sequence_lengths, logits);
   CHECK_DEVICE(visible_blocks, logits);
-  CHECK_DIM(3, q);         // [rows, heads, head_dim]
-  CHECK_DIM(3, k_cache);   // [pages, page_size, head_dim]
+  CHECK_DIM(3, q);        // [rows, heads, head_dim]
+  CHECK_DIM(3, k_cache);  // [pages, page_size, head_dim]
   CHECK_DIM(2, page_table);
   CHECK_DIM(2, logits);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
@@ -88,14 +88,12 @@ void sparse_paged_scores(TensorView q, TensorView k_cache, TensorView page_table
             static_cast<c_idtype*>(visible_blocks.data_ptr()),
             static_cast<float*>(logits.data_ptr()), static_cast<uint32_t>(q.stride(0)),
             static_cast<uint32_t>(q.stride(1)), static_cast<uint32_t>(k_cache.stride(0)),
-            static_cast<uint32_t>(k_cache.stride(1)),
-            static_cast<uint32_t>(page_table.stride(0)),
+            static_cast<uint32_t>(k_cache.stride(1)), static_cast<uint32_t>(page_table.stride(0)),
             static_cast<uint32_t>(logits.stride(0)), static_cast<uint32_t>(rows),
             static_cast<uint32_t>(num_columns), static_cast<uint32_t>(k_cache.size(0)),
-            static_cast<uint32_t>(page_table.size(0)),
-            static_cast<uint32_t>(page_table.size(1)), static_cast<uint32_t>(num_heads),
-            static_cast<uint32_t>(k_cache.size(1)), static_cast<uint32_t>(compress_ratio),
-            static_cast<float>(divisor), stream);
+            static_cast<uint32_t>(page_table.size(0)), static_cast<uint32_t>(page_table.size(1)),
+            static_cast<uint32_t>(num_heads), static_cast<uint32_t>(k_cache.size(1)),
+            static_cast<uint32_t>(compress_ratio), static_cast<float>(divisor), stream);
       };
       switch (head_dim) {
         case 64:

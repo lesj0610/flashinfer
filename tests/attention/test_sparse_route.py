@@ -347,7 +347,9 @@ def test_paged_route_reads_a_wide_quantized_head(head_dim, kv_dtype):
     torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
 
 
-def _scores_case(head_dim=128, num_heads=4, rows=8, pages=6, page_size=8, dtype=torch.bfloat16):
+def _scores_case(
+    head_dim=128, num_heads=4, rows=8, pages=6, page_size=8, dtype=torch.bfloat16
+):
     """An aligned scorer case, plus what it takes to re-run it from a view."""
     torch.manual_seed(0)
     q = torch.randn(rows, num_heads, head_dim, dtype=dtype, device=DEV)
@@ -373,12 +375,17 @@ def test_scores_accept_a_query_view_with_a_storage_offset():
     want, want_visible = _run_scores(q, k_cache, table, t2r, pos, lens)
 
     head_dim = q.shape[2]
+    # Pad by a whole vector so every stride stays a multiple of it, and take the
+    # slice one element in. Padding by one instead would misalign the strides
+    # too, and the staging already refuses those -- the base would never be
+    # reached.
     backing = torch.empty(
-        q.shape[0], q.shape[1], head_dim + 1, dtype=q.dtype, device=DEV
+        q.shape[0], q.shape[1], head_dim + 8, dtype=q.dtype, device=DEV
     )
-    backing[..., 1:] = q
-    offset_q = backing[..., 1:]
-    assert offset_q.storage_offset() != 0
+    backing[..., 1 : 1 + head_dim] = q
+    offset_q = backing[..., 1 : 1 + head_dim]
+    assert offset_q.storage_offset() % 8 != 0
+    assert all(stride % 8 == 0 for stride in offset_q.stride()[:-1])
     got, got_visible = _run_scores(offset_q, k_cache, table, t2r, pos, lens)
     torch.testing.assert_close(got, want)
     torch.testing.assert_close(got_visible, want_visible)
@@ -391,12 +398,14 @@ def test_scores_accept_a_cache_view_with_a_storage_offset():
     want, want_visible = _run_scores(q, k_cache, table, t2r, pos, lens)
 
     pages, page_size, head_dim = k_cache.shape
+    # Same shape of view: aligned page and entry strides, misaligned base.
     backing = torch.empty(
-        pages, page_size, head_dim + 1, dtype=k_cache.dtype, device=DEV
+        pages, page_size, head_dim + 8, dtype=k_cache.dtype, device=DEV
     )
-    backing[..., 1:] = k_cache
-    offset_cache = backing[..., 1:]
-    assert offset_cache.storage_offset() != 0
+    backing[..., 1 : 1 + head_dim] = k_cache
+    offset_cache = backing[..., 1 : 1 + head_dim]
+    assert offset_cache.storage_offset() % 8 != 0
+    assert all(stride % 8 == 0 for stride in offset_cache.stride()[:-1])
     got, got_visible = _run_scores(q, offset_cache, table, t2r, pos, lens)
     torch.testing.assert_close(got, want)
     torch.testing.assert_close(got_visible, want_visible)

@@ -304,8 +304,12 @@ def _paged_reference(q, k_cache, v_cache, route, page_size, layout, num_kv_heads
     """Gather the routed KV entries and run dense attention on them."""
     pages = k_cache.shape[0]
     if layout == "HND":
-        flat_k = k_cache.permute(0, 2, 1, 3).reshape(pages * page_size, num_kv_heads, -1)
-        flat_v = v_cache.permute(0, 2, 1, 3).reshape(pages * page_size, num_kv_heads, -1)
+        flat_k = k_cache.permute(0, 2, 1, 3).reshape(
+            pages * page_size, num_kv_heads, -1
+        )
+        flat_v = v_cache.permute(0, 2, 1, 3).reshape(
+            pages * page_size, num_kv_heads, -1
+        )
     else:
         flat_k = k_cache.reshape(pages * page_size, num_kv_heads, -1)
         flat_v = v_cache.reshape(pages * page_size, num_kv_heads, -1)
@@ -345,7 +349,9 @@ def test_block_sparse_paged_route(num_kv_heads, layout, page_size):
     # repeat one page so several entries share it
     route = torch.randint(0, entries, (rows, width), dtype=torch.int32, device=device)
 
-    indptr = torch.arange(0, (rows + 1) * width, width, dtype=torch.int32, device=device)
+    indptr = torch.arange(
+        0, (rows + 1) * width, width, dtype=torch.int32, device=device
+    )
     wrapper = flashinfer.BlockSparseAttentionWrapper(
         torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
         kv_layout=layout,
@@ -367,9 +373,7 @@ def test_block_sparse_paged_route(num_kv_heads, layout, page_size):
         kv_cache_page_size=page_size,
     )
     out = wrapper.run(q, k_cache, v_cache)
-    ref = _paged_reference(
-        q, k_cache, v_cache, route, page_size, layout, num_kv_heads
-    )
+    ref = _paged_reference(q, k_cache, v_cache, route, page_size, layout, num_kv_heads)
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
 
 
@@ -385,7 +389,9 @@ def test_block_sparse_paged_route_rejects_bad_geometry():
     v_cache = torch.randn_like(k_cache)
     q = torch.randn(rows, num_qo_heads, head_dim, dtype=torch.float16, device=device)
     route = torch.randint(0, entries, (rows, width), dtype=torch.int32, device=device)
-    indptr = torch.arange(0, (rows + 1) * width, width, dtype=torch.int32, device=device)
+    indptr = torch.arange(
+        0, (rows + 1) * width, width, dtype=torch.int32, device=device
+    )
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
 
     def make_plan(**overrides):

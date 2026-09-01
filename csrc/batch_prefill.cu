@@ -16,7 +16,6 @@
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/pos_enc.cuh>
-
 #include <type_traits>
 #include <utility>
 

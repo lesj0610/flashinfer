@@ -19,7 +19,6 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-
 #include <sstream>
 
 #include "../cp_async.cuh"
@@ -75,10 +74,10 @@ constexpr uint32_t kMultiTileSliceK = 64;
  * There is no softmax and no value aggregation -- this produces the logits a
  * top-k runs on, not an attention output.
  *
- * Entries past what the query can see, and entries on a page the block table does
- * not map, come out as -inf so a top-k never selects them. The count of visible
- * entries per row is written out as well, since the selector needs it to bound
- * its own k.
+ * Entries on a page the block table does not map come out as -inf so a top-k
+ * never selects them. Columns past what the query can see are left untouched
+ * instead; the count of visible entries per row is written out, and the
+ * selector bounds its own k by that rather than by the column width.
  *
  * The ReLU applies to a head's completed dot product, so the feature axis has to
  * be fully accumulated before the heads are summed.
@@ -148,8 +147,7 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
   // whatever strides it started with and a base that is not.
   constexpr uint32_t kQVec = 16 / sizeof(DType);
   const bool q_vectorizable = HEAD_DIM % kQVec == 0 && stride_q_head % kQVec == 0 &&
-                              stride_q_row % kQVec == 0 &&
-                              reinterpret_cast<uintptr_t>(q) % 16 == 0;
+                              stride_q_row % kQVec == 0 && reinterpret_cast<uintptr_t>(q) % 16 == 0;
   if (q_vectorizable) {
     constexpr uint32_t kQVecsPerHead = HEAD_DIM / kQVec;
     for (uint32_t i = threadIdx.x; i < kTileN * kQVecsPerHead; i += kThreads) {
@@ -157,8 +155,7 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
       const uint32_t d = (i - h * kQVecsPerHead) * kQVec;
       float4* dst = reinterpret_cast<float4*>(q_smem + h * kSmemRow + d);
       if (h < heads) {
-        *dst = *reinterpret_cast<const float4*>(
-            q + row * stride_q_row + h * stride_q_head + d);
+        *dst = *reinterpret_cast<const float4*>(q + row * stride_q_row + h * stride_q_head + d);
       } else {
         *dst = make_float4(0.f, 0.f, 0.f, 0.f);
       }
@@ -239,8 +236,7 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
     const uint32_t k0 = (step - tile * kSlices) * SLICE_K;
     DType* dst_base = k_smem + (step & 1) * kBlockN * kSliceRow;
     constexpr uint32_t kEvenVecs = SLICE_K / kPerVec;
-    const uint32_t vecs =
-        kEvenSlices ? kEvenVecs : min(SLICE_K, HEAD_DIM - k0) / kPerVec;
+    const uint32_t vecs = kEvenSlices ? kEvenVecs : min(SLICE_K, HEAD_DIM - k0) / kPerVec;
     if (k_vectorizable) {
 #pragma unroll 4
       for (uint32_t i = threadIdx.x; i < kBlockN * vecs; i += kThreads) {
@@ -401,8 +397,8 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
   int dev_id = 0, num_sms = 0, max_smem_per_block_optin = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
-      &max_smem_per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_block_optin,
+                                              cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
   const size_t largest = max(smem_for(8, kMultiTileSliceK), smem_for(1, kSingleTileSliceK));
   if (largest > static_cast<size_t>(max_smem_per_block_optin)) {
     std::ostringstream err_msg;

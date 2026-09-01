@@ -248,8 +248,8 @@ struct paged_kv_t {
       page_idx_out = index;
       entry_idx_out = entry_idx;
     } else {
-      storage_page_size.divmod(index * static_cast<uint32_t>(page_size) + entry_idx,
-                               page_idx_out, entry_idx_out);
+      storage_page_size.divmod(index * static_cast<uint32_t>(page_size) + entry_idx, page_idx_out,
+                               entry_idx_out);
     }
   }
 

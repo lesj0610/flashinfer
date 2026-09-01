@@ -53,8 +53,8 @@ inline cudaError_t choose_wide(KernelFn wide_kernel, uint32_t threads, uint32_t 
   int dev_id = 0, num_sms = 0, blocks_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
-  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &blocks_per_sm, wide_kernel, static_cast<int>(threads), 0));
+  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, wide_kernel,
+                                                                     static_cast<int>(threads), 0));
   *wide = num_sms == 0 || blocks_per_sm == 0 ||
           wide_blocks >= static_cast<uint32_t>(num_sms) * static_cast<uint32_t>(blocks_per_sm) / 2;
   return cudaSuccess;
@@ -82,14 +82,14 @@ inline cudaError_t choose_wide(KernelFn wide_kernel, uint32_t threads, uint32_t 
  */
 template <uint32_t COMPRESS_RATIO, bool CONTIGUOUS_COLUMNS, uint32_t TILE, uint32_t THREADS,
           typename IdType>
-__global__ void __launch_bounds__(THREADS) ExpandBlockRouteKernel(const IdType* __restrict__ block_indices,
-                                       const IdType* __restrict__ query_positions,
-                                       const IdType* __restrict__ sequence_lengths,
-                                       const IdType* __restrict__ token_to_req,
-                                       IdType* __restrict__ out, uint32_t stride_blocks_row,
-                                       uint32_t stride_blocks_col, uint32_t stride_out_row,
-                                       uint32_t stride_out_col, uint32_t rows,
-                                       uint32_t num_requests, uint32_t block_topk) {
+__global__ void __launch_bounds__(THREADS)
+    ExpandBlockRouteKernel(const IdType* __restrict__ block_indices,
+                           const IdType* __restrict__ query_positions,
+                           const IdType* __restrict__ sequence_lengths,
+                           const IdType* __restrict__ token_to_req, IdType* __restrict__ out,
+                           uint32_t stride_blocks_row, uint32_t stride_blocks_col,
+                           uint32_t stride_out_row, uint32_t stride_out_col, uint32_t rows,
+                           uint32_t num_requests, uint32_t block_topk) {
   // blockIdx.x walks the columns of one row so consecutive blocks write consecutive
   // memory; putting the row on x instead interleaves unrelated rows in flight.
   // The width follows from the selection: every block expands to COMPRESS_RATIO
@@ -282,13 +282,15 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
  * out-of-range slot would be read before the mask is applied.
  */
 template <uint32_t TILE, uint32_t THREADS, typename IdType>
-__global__ void __launch_bounds__(THREADS) QSARouteFromLogicalKernel(
-    const IdType* __restrict__ logical, const IdType* __restrict__ token_to_req,
-    const IdType* __restrict__ block_table, IdType* __restrict__ out_route,
-    uint8_t* __restrict__ out_mask, uint32_t stride_logical_row, uint32_t stride_table_row,
-    uint32_t rows, uint32_t valid_rows, uint32_t num_requests, uint32_t width,
-    uint32_t table_width, uint_fastdiv page_size, uint32_t num_slots,
-    uint32_t mask_bytes_per_row) {
+__global__ void __launch_bounds__(THREADS)
+    QSARouteFromLogicalKernel(const IdType* __restrict__ logical,
+                              const IdType* __restrict__ token_to_req,
+                              const IdType* __restrict__ block_table,
+                              IdType* __restrict__ out_route, uint8_t* __restrict__ out_mask,
+                              uint32_t stride_logical_row, uint32_t stride_table_row, uint32_t rows,
+                              uint32_t valid_rows, uint32_t num_requests, uint32_t width,
+                              uint32_t table_width, uint_fastdiv page_size, uint32_t num_slots,
+                              uint32_t mask_bytes_per_row) {
   const uint32_t row = blockIdx.y;
   const uint32_t tile_base = blockIdx.x * TILE;
   if (row >= rows || tile_base >= width) return;
@@ -384,8 +386,8 @@ cudaError_t QSARouteFromLogical(const IdType* logical, const IdType* token_to_re
 
 template <typename IdType>
 cudaError_t ExpandBlockRoute(const IdType* block_indices, const IdType* query_positions,
-                             const IdType* sequence_lengths, const IdType* token_to_req, IdType* out,
-                             uint32_t stride_blocks_row, uint32_t stride_blocks_col,
+                             const IdType* sequence_lengths, const IdType* token_to_req,
+                             IdType* out, uint32_t stride_blocks_row, uint32_t stride_blocks_col,
                              uint32_t stride_out_row, uint32_t stride_out_col, uint32_t rows,
                              uint32_t num_requests, uint32_t block_topk, uint32_t compress_ratio,
                              uint32_t output_width, cudaStream_t stream) {
@@ -401,21 +403,18 @@ cudaError_t ExpandBlockRoute(const IdType* block_indices, const IdType* query_po
   // away turns the inner address into an add.
   const bool contiguous = stride_blocks_col == 1 && stride_out_col == 1;
 
-#define _FI_LAUNCH_CFG(RATIO, CONTIGUOUS, TILE, THREADS)                                       \
-  ExpandBlockRouteKernel<RATIO, CONTIGUOUS, TILE, THREADS, IdType>                              \
-      <<<grid, THREADS, 0, stream>>>(                                                           \
-          block_indices, query_positions, sequence_lengths, token_to_req, out,                  \
-          stride_blocks_row, stride_blocks_col, stride_out_row, stride_out_col, rows,           \
-          num_requests, block_topk)
+#define _FI_LAUNCH_CFG(RATIO, CONTIGUOUS, TILE, THREADS)                                          \
+  ExpandBlockRouteKernel<RATIO, CONTIGUOUS, TILE, THREADS, IdType><<<grid, THREADS, 0, stream>>>( \
+      block_indices, query_positions, sequence_lengths, token_to_req, out, stride_blocks_row,     \
+      stride_blocks_col, stride_out_row, stride_out_col, rows, num_requests, block_topk)
 
-#define _FI_LAUNCH(RATIO, CONTIGUOUS)                                                        \
-  do {                                                                                        \
-    if (wide) {                                                                               \
-      _FI_LAUNCH_CFG(RATIO, CONTIGUOUS, sparse_route::kWideTile, sparse_route::kWideThreads);  \
-    } else {                                                                                  \
-      _FI_LAUNCH_CFG(RATIO, CONTIGUOUS, sparse_route::kNarrowTile,                            \
-                     sparse_route::kNarrowThreads);                                           \
-    }                                                                                         \
+#define _FI_LAUNCH(RATIO, CONTIGUOUS)                                                             \
+  do {                                                                                            \
+    if (wide) {                                                                                   \
+      _FI_LAUNCH_CFG(RATIO, CONTIGUOUS, sparse_route::kWideTile, sparse_route::kWideThreads);     \
+    } else {                                                                                      \
+      _FI_LAUNCH_CFG(RATIO, CONTIGUOUS, sparse_route::kNarrowTile, sparse_route::kNarrowThreads); \
+    }                                                                                             \
   } while (0)
 
 #define _FI_DISPATCH_COMPRESS_RATIO(RATIO) \
@@ -453,45 +452,45 @@ cudaError_t QSARouteFromBlocks(const IdType* block_indices, const IdType* query_
                                uint32_t stride_blocks_col, uint32_t stride_logical_row,
                                uint32_t stride_table_row, uint32_t rows, uint32_t num_requests,
                                uint32_t block_topk, uint32_t table_width, uint32_t page_size,
-                               uint32_t num_slots, uint32_t mask_bytes_per_row, uint32_t compress_ratio,
-                               cudaStream_t stream) {
+                               uint32_t num_slots, uint32_t mask_bytes_per_row,
+                               uint32_t compress_ratio, cudaStream_t stream) {
   const uint32_t output_width = block_topk * compress_ratio + compress_ratio - 1;
   if (rows == 0 || output_width == 0) return cudaSuccess;
   const uint32_t wide_blocks = rows * ceil_div(output_width, sparse_route::kWideTile);
   bool wide = true;
-  FLASHINFER_CUDA_CALL(sparse_route::choose_wide(
-      QSARouteFromBlocksKernel<1, true, sparse_route::kWideTile, sparse_route::kWideThreads,
-                               IdType>,
-      sparse_route::kWideThreads, wide_blocks, &wide));
+  FLASHINFER_CUDA_CALL(
+      sparse_route::choose_wide(QSARouteFromBlocksKernel<1, true, sparse_route::kWideTile,
+                                                         sparse_route::kWideThreads, IdType>,
+                                sparse_route::kWideThreads, wide_blocks, &wide));
   const uint32_t tile = wide ? sparse_route::kWideTile : sparse_route::kNarrowTile;
   const dim3 grid(ceil_div(output_width, tile), rows);
   const bool contiguous = stride_blocks_col == 1;
 
-#define _FI_ROUTE_CFG(RATIO, CONTIGUOUS, TILE, THREADS)                                        \
-  QSARouteFromBlocksKernel<RATIO, CONTIGUOUS, TILE, THREADS, IdType><<<grid, THREADS, 0, stream>>>( \
-      block_indices, query_positions, sequence_lengths, token_to_req, block_table, out_logical, \
-      out_route, out_mask, stride_blocks_row, stride_blocks_col, stride_logical_row,            \
-      stride_table_row, rows, num_requests, block_topk, table_width, page_size, num_slots,      \
-      mask_bytes_per_row)
+#define _FI_ROUTE_CFG(RATIO, CONTIGUOUS, TILE, THREADS)                                           \
+  QSARouteFromBlocksKernel<RATIO, CONTIGUOUS, TILE, THREADS, IdType>                              \
+      <<<grid, THREADS, 0, stream>>>(block_indices, query_positions, sequence_lengths,            \
+                                     token_to_req, block_table, out_logical, out_route, out_mask, \
+                                     stride_blocks_row, stride_blocks_col, stride_logical_row,    \
+                                     stride_table_row, rows, num_requests, block_topk,            \
+                                     table_width, page_size, num_slots, mask_bytes_per_row)
 
-#define _FI_ROUTE_LAUNCH(RATIO, CONTIGUOUS)                                                    \
-  do {                                                                                         \
-    if (wide) {                                                                                \
-      _FI_ROUTE_CFG(RATIO, CONTIGUOUS, sparse_route::kWideTile, sparse_route::kWideThreads);    \
-    } else {                                                                                   \
-      _FI_ROUTE_CFG(RATIO, CONTIGUOUS, sparse_route::kNarrowTile,                              \
-                    sparse_route::kNarrowThreads);                                             \
-    }                                                                                          \
+#define _FI_ROUTE_LAUNCH(RATIO, CONTIGUOUS)                                                      \
+  do {                                                                                           \
+    if (wide) {                                                                                  \
+      _FI_ROUTE_CFG(RATIO, CONTIGUOUS, sparse_route::kWideTile, sparse_route::kWideThreads);     \
+    } else {                                                                                     \
+      _FI_ROUTE_CFG(RATIO, CONTIGUOUS, sparse_route::kNarrowTile, sparse_route::kNarrowThreads); \
+    }                                                                                            \
   } while (0)
 
-#define _FI_ROUTE_DISPATCH(RATIO) \
-  case RATIO: {                   \
-    if (contiguous) {             \
+#define _FI_ROUTE_DISPATCH(RATIO)     \
+  case RATIO: {                       \
+    if (contiguous) {                 \
       _FI_ROUTE_LAUNCH(RATIO, true);  \
-    } else {                      \
+    } else {                          \
       _FI_ROUTE_LAUNCH(RATIO, false); \
-    }                             \
-    break;                        \
+    }                                 \
+    break;                            \
   }
 
   switch (compress_ratio) {

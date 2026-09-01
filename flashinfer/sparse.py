@@ -757,6 +757,12 @@ class BlockSparseAttentionWrapper:
             Number of valid entries in each direct selection row, contiguous
             int32 with shape ``(num_qo_heads, MB)``. When omitted, every direct
             row uses the full ``topk`` dimension.
+        kv_cache_page_size : int, optional
+            Page size of a paged KV cache passed to :meth:`run` as raw pages,
+            rather than as the gathered blocks the wrapper otherwise expects.
+            Read by the FA2 planner, so it is only supported for the ``auto``,
+            ``fa2`` and ``fa3`` backends and must be ``None`` for the
+            block-sparse ones, which plan without it.
         kv_splits : Optional[Union[int, str]]
             Number of KV splits for the split-KV combine path, or ``"auto"`` to pick a
             split count from the sparsity heuristics. Only supported for the
@@ -799,6 +805,16 @@ class BlockSparseAttentionWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
+
+        if kv_cache_page_size is not None and self._backend not in (
+            "auto",
+            "fa2",
+            "fa3",
+        ):
+            raise ValueError(
+                "kv_cache_page_size is read by the FA2 planner and is not "
+                f"supported for backend={self._backend!r}"
+            )
 
         if self._backend != "vsa_sm100_blk64" and (
             kv_splits is not None
