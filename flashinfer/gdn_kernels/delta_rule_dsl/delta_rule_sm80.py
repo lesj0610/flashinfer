@@ -225,8 +225,9 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         # One stage, not the sm_90 kernel's two. A second buffer only pays if
         # a load can run ahead of the math, and none can: PipelineCpAsyncSm80
         # is constructed with prefetch left at zero everywhere, so the loads
-        # commit and the math drains them inside one iteration and the extra
-        # 16 KiB was never read from.
+        # commit and the math drains them inside one iteration. The second
+        # buffer was read -- odd iterations used it -- but it never held a tile
+        # fetched ahead of the math, so it bought no overlap.
         #
         # Freeing it does not buy residency -- that is register-limited at one
         # CTA either way -- so this is a 16 KiB reclaim with no measured

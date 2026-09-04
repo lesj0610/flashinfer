@@ -1094,11 +1094,17 @@ def test_fp8_state_rejected_without_fp8_convert(state_dtype):
 def test_checkpoint_non_contiguous_rejected(qkv_factory):
     """A non-contiguous checkpoint tensor is refused, not silently dropped.
 
-    Both checkpoint tensors reach the kernel as ``reshape(-1)``, which returns
+    ``state_checkpoints`` reaches the kernel as ``reshape(-1)``, which returns
     a copy when the tensor is not contiguous. The kernel then writes every
     checkpoint into a temporary that is freed on return: measured, a pool
     sliced as ``pool[::2]`` came back with 0 of 4 checkpoints written and
     nothing raised.
+
+    ``checkpoint_cu_starts`` is passed unreshaped, so that is not its failure
+    mode. It is rejected because ``mark_layout_dynamic`` bakes a unit stride
+    whenever a dimension has one while the compile cache keys on dtypes and
+    tile config without strides -- so a contiguous first call would bake
+    stride 1 and a later strided one would reuse that kernel.
     """
     _skip_if_unsupported()
     device = torch.device("cuda")
@@ -1121,6 +1127,41 @@ def test_checkpoint_non_contiguous_rejected(qkv_factory):
             cu_seqlens=cu_seqlens,
             state_checkpoints=sliced,
             checkpoint_cu_starts=cu_starts,
+            checkpoint_every_n_tokens=every,
+        )
+
+
+def test_checkpoint_cu_starts_non_contiguous_rejected(qkv_factory):
+    """A strided ``checkpoint_cu_starts`` is refused too, for its own reason.
+
+    Unlike ``state_checkpoints`` this one is passed unreshaped, so nothing is
+    copied. It is rejected because the kernel's layout is marked dynamic and
+    the compile cache does not key on strides: a contiguous first call bakes a
+    unit stride into the cached kernel, and a later strided call reuses it and
+    reads the wrong offsets.
+    """
+    _skip_if_unsupported()
+    device = torch.device("cuda")
+    H, D = 2, 128
+    seq_len, every = 256, 64
+    num_checkpoints = seq_len // every
+    zeros = torch.zeros(seq_len, H, D, dtype=torch.bfloat16, device=device)
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int64, device=device)
+    checkpoints = torch.zeros(
+        num_checkpoints, H, D, D, dtype=torch.float32, device=device
+    )
+    strided_starts = torch.tensor(
+        [0, -1, num_checkpoints, -1], dtype=torch.int64, device=device
+    )[::2]
+    assert not strided_starts.is_contiguous()
+    with pytest.raises(RuntimeError, match="checkpoint_cu_starts must be contiguous"):
+        chunk_gated_delta_rule(
+            zeros,
+            zeros,
+            zeros,
+            cu_seqlens=cu_seqlens,
+            state_checkpoints=checkpoints,
+            checkpoint_cu_starts=strided_starts,
             checkpoint_every_n_tokens=every,
         )
 
