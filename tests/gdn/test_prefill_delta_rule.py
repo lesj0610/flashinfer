@@ -26,6 +26,7 @@ import pytest
 from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule
 
 from flashinfer.utils import (
+    is_sm8x_supported,
     is_sm90a_supported,
     is_sm100a_supported,
     is_sm12x_supported,
@@ -34,7 +35,7 @@ from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 
 def _skip_if_unsupported():
-    """Skip test if not SM90, SM100, or SM12x (with CUDA 13+) architecture."""
+    """Skip test if not SM8x, SM90, SM100, or SM12x (with CUDA 13+)."""
     device = torch.device("cuda")
     if is_sm100a_supported(device):
         cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
@@ -42,10 +43,14 @@ def _skip_if_unsupported():
             pytest.skip(
                 f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}"
             )
-    elif is_sm12x_supported(device) or is_sm90a_supported(device):
+    elif (
+        is_sm12x_supported(device)
+        or is_sm90a_supported(device)
+        or is_sm8x_supported(device)
+    ):
         pass  # No additional CUDA version requirement
     else:
-        pytest.skip("GDN prefill requires SM90, SM100, or SM12x")
+        pytest.skip("GDN prefill requires SM8x, SM90, SM100, or SM12x")
 
 
 def _skip_if_cp_unsupported():
@@ -60,6 +65,22 @@ def _skip_if_cp_unsupported():
         return
     if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
         pytest.skip("CP GDN prefill requires SM90, SM100, or SM12x")
+
+
+def _skip_if_fp8_state_unsupported(state_dtype: torch.dtype):
+    """Skip an FP8 state on parts with no FP8 convert.
+
+    Converting to or from FP8 is a single instruction from SM89 on; SM80 and
+    SM86 have neither that nor a software path in the kernel.
+    """
+    if state_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return
+    capability = torch.cuda.get_device_capability(torch.device("cuda"))
+    if capability < (8, 9):
+        pytest.skip(
+            f"{state_dtype} state needs compute capability 8.9+, "
+            f"got {capability[0]}.{capability[1]}"
+        )
 
 
 def _skip_if_not_sm100():
@@ -1036,6 +1057,40 @@ def test_checkpoint_wrong_dtype(qkv_factory):
         )
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_fp8_state_rejected_without_fp8_convert(state_dtype):
+    """An FP8 state is refused where the hardware cannot convert to it.
+
+    Converting to or from FP8 is a single instruction starting at SM89, and
+    there is no software path in the kernel. Without this the request reaches
+    the compiler and comes back as a bare "NVVM backend compilation failed",
+    which names no argument. The counterpart on parts that do have the
+    instruction is that the request must still be accepted, so this asserts
+    both directions.
+    """
+    _skip_if_unsupported()
+    device = torch.device("cuda")
+    capability = torch.cuda.get_device_capability(device)
+    seq_len = 64
+
+    def run():
+        return chunk_gated_delta_rule(
+            torch.zeros(seq_len, 1, 128, dtype=torch.bfloat16, device=device),
+            torch.zeros(seq_len, 1, 128, dtype=torch.bfloat16, device=device),
+            torch.zeros(seq_len, 1, 128, dtype=torch.bfloat16, device=device),
+            cu_seqlens=torch.tensor([0, seq_len], dtype=torch.int64, device=device),
+            output_state=torch.zeros(1, 1, 128, 128, dtype=state_dtype, device=device),
+            output_final_state=True,
+        )
+
+    if capability < (8, 9):
+        with pytest.raises(NotImplementedError, match="FP8 conversion"):
+            run()
+    else:
+        run()
+        torch.cuda.synchronize()
+
+
 def test_checkpoint_wrong_cu_starts_size(qkv_factory):
     """Verify error when checkpoint_cu_starts has wrong size."""
     _skip_if_unsupported()
@@ -1195,6 +1250,7 @@ def test_prefill_kernel_state_dtype(
     use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
+    _skip_if_fp8_state_unsupported(state_dtype)
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_prefill_kernel_state_dtype(
         qkv_factory,
