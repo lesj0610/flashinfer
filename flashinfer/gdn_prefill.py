@@ -23,6 +23,7 @@ from .api_logging import flashinfer_api
 from .trace.templates.gdn import gdn_prefill_trace
 from .utils import get_compute_capability, get_device_name, get_device_sm_count
 from .gdn_kernels import (
+    chunk_gated_delta_rule_sm80,
     chunk_gated_delta_rule_sm90,
     chunk_gated_delta_rule_sm100,
     chunk_gated_delta_rule_sm120,
@@ -164,7 +165,7 @@ def chunk_gated_delta_rule(
         Initial KV state. Packed, sequence-ordered shape
         ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be
         float32, bfloat16, float16, float8_e4m3fn, or float8_e5m2. Starts from zero state
-        when ``None``.  When ``state_indices`` is given (SM90/SM100/SM103/SM120),
+        when ``None``.  When ``state_indices`` is given (SM8x/SM90/SM100/SM103/SM120),
         this is instead the state **pool** ``[N_pool, num_sab_heads,
         head_size, head_size]`` and sequence ``i`` reads its initial state
         from row ``state_indices[i]``; the pool may be non-compact (padded
@@ -217,7 +218,8 @@ def chunk_gated_delta_rule(
         routing, ``True`` requires CP support, and ``False`` disables CP.
         Default: ``"auto"``.
     state_indices : torch.Tensor, optional
-        Int32 tensor of shape ``[num_seqs]`` (SM90/SM100/SM103/SM120). When provided,
+        Int32 tensor of shape ``[num_seqs]`` (SM8x/SM90/SM100/SM103/SM120). When
+        provided,
         ``initial_state`` and ``output_state`` are treated as a state pool whose
         first dimension is indexed by these slot ids rather than laid out in
         sequence order: sequence ``i`` reads its initial state from row
@@ -254,10 +256,14 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - Requires SM90 (Hopper) or SM100 (Blackwell) architecture.  The SM100
-      path requires ``head_size == 128`` and
+    - Requires SM8x (Ampere), SM90 (Hopper), SM100 (Blackwell) or SM120.  The
+      SM100 path requires ``head_size == 128`` and
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).
+    - On SM8x the state may not be FP8: converting to or from it is a single
+      instruction starting at SM89, and there is no software path here.  SM89
+      itself is unaffected.  ``use_cp`` has no SM8x implementation either, so
+      leave it ``False`` there.
     """
     if use_cp not in ("auto", True, False):
         raise ValueError(f'use_cp must be "auto", True, or False, got {use_cp!r}')
@@ -376,10 +382,10 @@ def chunk_gated_delta_rule(
             )
         # Reject unsupported dispatch paths rather than silently reading/writing
         # the state in packed, sequence-ordered layout.
-        if _arch_major not in (9, 10, 12):
+        if _arch_major not in (8, 9, 10, 12):
             raise NotImplementedError(
-                "state_indices is only supported on the SM90/SM100/SM103/SM120 GDN "
-                f"prefill kernels; got compute-capability major {_arch_major}, "
+                "state_indices is only supported on the SM80/SM90/SM100/SM103/SM120 "
+                f"GDN prefill kernels; got compute-capability major {_arch_major}, "
                 f"use_cp={use_cp!r}."
             )
         # The kernel writes each final state to output_state[state_indices[i]],
@@ -528,6 +534,37 @@ def chunk_gated_delta_rule(
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             cu_checkpoints=checkpoint_cu_starts,
             output_checkpoints=state_checkpoints,
+            state_indices=state_indices,
+        )
+    elif _arch_major == 8:
+        # SM80 Ampere path (CuTe DSL kernel). Same kernel structure as SM120,
+        # with the loads on cp.async and the stores and barriers rebuilt out of
+        # what exists before SM90.
+        if chunk_gated_delta_rule_sm80 is None:
+            raise NotImplementedError("SM80 GDN prefill DSL kernel is unavailable")
+        if output_state is None:
+            output_state_shape = (
+                initial_state.shape
+                if state_indices is not None and initial_state is not None
+                else (num_seqs, num_sab_heads, head_size, head_size)
+            )
+            output_state = torch.empty(
+                output_state_shape, dtype=torch.float32, device=device
+            )
+        chunk_gated_delta_rule_sm80(
+            output,
+            output_state,
+            q,
+            k,
+            v,
+            initial_state,
+            g,
+            beta,
+            cu_seqlens,
+            _scale,
+            state_checkpoints,
+            checkpoint_cu_starts,
+            checkpoint_every_n_tokens,
             state_indices=state_indices,
         )
     elif _arch_major == 12:
