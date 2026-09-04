@@ -222,7 +222,17 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         self.BLK_KV = 64
         self.D = 128
         self.q_stage = 1
-        self.k_stage = 2
+        # One stage, not the sm_90 kernel's two. A second buffer only pays if
+        # a load can run ahead of the math, and none can: PipelineCpAsyncSm80
+        # is constructed with prefetch left at zero everywhere, so the loads
+        # commit and the math drains them inside one iteration and the extra
+        # 16 KiB was never read from.
+        #
+        # Freeing it does not buy residency -- that is register-limited at one
+        # CTA either way -- so this is a 16 KiB reclaim with no measured
+        # regression, not a speedup. It is also the 16 KiB a later look-ahead
+        # would need back.
+        self.k_stage = 1
         self.v_stage = 1
         self.o_stage = 1
         self.alpha_beta_stage = 2
@@ -1175,6 +1185,11 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         tQKcMqk = qk_thr_mma.partition_C(cMqk)
         cMkk = cMqk  # same shape (BlkKV == BlkQ == 64)
         tKKcMkk = kk_thr_mma.partition_C(cMkk)
+        # Buffer reuse is ordered by the barrier that CollectiveStoreSm80
+        # takes after writing O out, which sits between the last read here and
+        # the next issue_block_loads. The consumer states below still advance,
+        # because they name the stage; there is just no separate release
+        # barrier for each of them.
         cO = cute.make_identity_tensor((d, blk_q))
         tOcO = o1_thr_mma.partition_C(cO)
         cSK = cute.make_identity_tensor((d, blk_kv))
@@ -1183,11 +1198,12 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         tKVcV = kv_thr_mma.partition_A(cV)
 
         # ── KK GEMM (WG0 only) ────────────────────────────────────────────────
+        # One wait for all five tensors, not one each. issue_block_loads has
+        # already committed Q, K, V and, through ordinary stores, alpha and
+        # beta, and prefetch is zero -- so this cp_async_wait_group(0) drains
+        # every outstanding group and its barrier publishes all of it to the
+        # block at once. A second wait would drain nothing and re-barrier.
         k_pipeline.consumer_wait(k_consumer_state)
-        if cutlass.const_expr(self.needs_alpha):
-            alpha_pipeline.consumer_wait(alpha_consumer_state)
-        if cutlass.const_expr(self.needs_beta):
-            beta_pipeline.consumer_wait(beta_consumer_state)
         # Match the C++ reject-non-role-first shape; ptxas keeps BRA.U around
         # the role body instead of predicating the HMMA/LDSM/STSM sequence.
         if wg_idx != MathWarpGroupRole.KK:
@@ -1213,7 +1229,6 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
                 tKKcMkk,
             )
         if cutlass.const_expr(self.needs_beta):
-            beta_pipeline.consumer_release(beta_consumer_state)
             beta_consumer_state.advance()
 
         # ── QK GEMM (WG1 only) ────────────────────────────────────────────────
@@ -1242,7 +1257,6 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
             tOrKV = SM80.make_acc_into_op(tKVrKV, o1_tiled_mma, self.dtype)
             cute.gemm(o1_tiled_mma, tOrO, tOrKV, tOrQ, tOrO)
             self.o1_epi(tOrO, tOcO, sAlpha, alpha_stage, scale)
-        q_pipeline.consumer_release(q_consumer_state)
         q_consumer_state.advance()
 
         # ── SK: KV_state @ K^T (result negated below via V - SK) ─────────────
@@ -1275,7 +1289,6 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         tNewVrC.fill(self.acc_dtype(0.0))
         cute.gemm(newv_tiled_mma, tNewVrC, tNewVrA, tNewVrB, tNewVrC)
         self._math_order_notify(wg_idx)
-        v_pipeline.consumer_release(v_consumer_state)
         v_consumer_state.advance()
 
         # ── O2 = O1 + NewV @ QK  (ordered: WG0 first) ────────────────────────
@@ -1306,10 +1319,8 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         # KV += NewV @ K
         cute.copy(kv_tiled_copy_B, tKVsK[None, None, None, k_stage], tKVrK_cv)
         cute.gemm(kv_tiled_mma, tKVrKV, tOrNewV, tKVrK, tKVrKV)
-        k_pipeline.consumer_release(k_consumer_state)
         k_consumer_state.advance()
         if cutlass.const_expr(self.needs_alpha):
-            alpha_pipeline.consumer_release(alpha_consumer_state)
             alpha_consumer_state.advance()
         return (
             q_consumer_state,
@@ -2010,6 +2021,12 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
             block=(LOAD_THREADS, 1, 1),
             max_number_threads=(LOAD_THREADS, 1, 1),
             stream=stream,
+            # One. Asking for two costs 30% (1.751 -> 2.270 ms): the bound
+            # forces ptxas to 128 registers a thread, half what this kernel
+            # wants, and it reaches that by spilling. On the shapes where the
+            # extra residency would matter the grid is also smaller than the
+            # SM count -- it is num_seqs * num_sab_heads -- so there is no
+            # second block to co-reside with in the first place.
             min_blocks_per_mp=1,
         )
 
@@ -2329,6 +2346,19 @@ def delta_rule_prefill_dsl(
         ("alpha", alpha),
         ("beta", beta),
         ("state_indices", state_indices),
+        # state_checkpoints reaches the kernel as reshape(-1). On a tensor
+        # that is not contiguous that returns a copy, so the kernel writes its
+        # checkpoints into a temporary that is freed on return -- every
+        # checkpoint lost, nothing raised. Measured: a pool sliced as
+        # pool[::2] writes 0 of 4.
+        ("state_checkpoints", state_checkpoints),
+        # checkpoint_cu_starts is passed unreshaped, so that is not its
+        # failure. Its problem is the compile cache: mark_layout_dynamic bakes
+        # a unit stride whenever a dimension has one, and the cache key
+        # carries dtypes and tile config but no strides -- so a first
+        # contiguous call would bake stride 1 and a later strided one would
+        # reuse that kernel and misread every offset.
+        ("checkpoint_cu_starts", checkpoint_cu_starts),
     ):
         if tensor is not None and not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")

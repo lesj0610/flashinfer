@@ -1091,6 +1091,40 @@ def test_fp8_state_rejected_without_fp8_convert(state_dtype):
         torch.cuda.synchronize()
 
 
+def test_checkpoint_non_contiguous_rejected(qkv_factory):
+    """A non-contiguous checkpoint tensor is refused, not silently dropped.
+
+    Both checkpoint tensors reach the kernel as ``reshape(-1)``, which returns
+    a copy when the tensor is not contiguous. The kernel then writes every
+    checkpoint into a temporary that is freed on return: measured, a pool
+    sliced as ``pool[::2]`` came back with 0 of 4 checkpoints written and
+    nothing raised.
+    """
+    _skip_if_unsupported()
+    device = torch.device("cuda")
+    H, D = 2, 128
+    seq_len, every = 256, 64
+    num_checkpoints = seq_len // every
+    zeros = torch.zeros(seq_len, H, D, dtype=torch.bfloat16, device=device)
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int64, device=device)
+    cu_starts = torch.tensor([0, num_checkpoints], dtype=torch.int64, device=device)
+    # Same shape and dtype as the accepted form, sliced so it is not contiguous.
+    sliced = torch.zeros(
+        num_checkpoints * 2, H, D, D, dtype=torch.float32, device=device
+    )[::2]
+    assert not sliced.is_contiguous()
+    with pytest.raises(RuntimeError, match="state_checkpoints must be contiguous"):
+        chunk_gated_delta_rule(
+            zeros,
+            zeros,
+            zeros,
+            cu_seqlens=cu_seqlens,
+            state_checkpoints=sliced,
+            checkpoint_cu_starts=cu_starts,
+            checkpoint_every_n_tokens=every,
+        )
+
+
 def test_checkpoint_wrong_cu_starts_size(qkv_factory):
     """Verify error when checkpoint_cu_starts has wrong size."""
     _skip_if_unsupported()
