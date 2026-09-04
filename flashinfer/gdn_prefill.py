@@ -391,7 +391,15 @@ def chunk_gated_delta_rule(
         # The kernel writes each final state to output_state[state_indices[i]],
         # so a compact [num_seqs, ...] auto-allocation would be indexed out of
         # bounds by arbitrary pool slot ids. Require the caller to pass the pool.
-        if output_final_state and output_state is None:
+        #
+        # output_final_state does not gate that write -- it decides only whether
+        # the state is returned -- so leaving it False does not make the
+        # auto-allocation safe. The one shape that is safe to derive is
+        # initial_state's, which is the pool itself. Nothing here crashes when
+        # it goes wrong: the caching allocator hands out sub-allocations of a
+        # much larger block, so the overrun lands in another tensor and the
+        # sanitizer sees nothing.
+        if output_state is None and (output_final_state or initial_state is None):
             raise ValueError(
                 "state_indices requires an explicit output_state pool sized like "
                 "the state pool ([N_pool, H, V, K]); refusing to auto-allocate a "
