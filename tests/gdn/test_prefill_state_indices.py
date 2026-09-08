@@ -37,10 +37,6 @@ def _skip_if_not_supported(use_cp: bool = False):
         pytest.skip(
             "state_indices GDN prefill path requires SM8x, SM90, SM100, or SM120"
         )
-    if major == 8 and use_cp:
-        # The context-parallel kernels are SM90 and up; the SM8x path has no
-        # implementation to compare against.
-        pytest.skip("SM8x has no context-parallel GDN prefill kernel")
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     if is_sm100a_supported(device) and cuda_major < 13:
         pytest.skip(f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}")
@@ -456,3 +452,121 @@ def test_prefill_state_indices_none_is_default(use_cp):
     torch.cuda.synchronize()
     assert torch.equal(o1, o2)
     assert torch.equal(f1, f2)
+
+
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_prefill_initial_state_without_final_state(use_cp):
+    """An initial state with no final state asked for.
+
+    The CP path built its initial-state layout out of the *output* state's shape
+    and stride, which only exist when a final state was asked for, so this
+    combination did not compile at all. It is a public contract: a caller may
+    start from a state and want only the output.
+    """
+    _skip_if_not_supported(use_cp)
+    device = torch.device("cuda")
+    H, D = 8, 128
+    seq_lens = [256, 512]
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        seq_lens, H, D, torch.bfloat16, device, seed=0
+    )
+    total = sum(seq_lens)
+    out_ref = torch.empty(total, H, D, dtype=q.dtype, device=device)
+    ref_state = torch.zeros_like(init_state)
+    ref, _ = chunk_gated_delta_rule(
+        q, k, v, g, beta, None,
+        initial_state=init_state, output_final_state=True,
+        cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=False,
+        output=out_ref, output_state=ref_state, use_cp=use_cp,
+    )
+    out = torch.empty(total, H, D, dtype=q.dtype, device=device)
+    got = chunk_gated_delta_rule(
+        q, k, v, g, beta, None,
+        initial_state=init_state, output_final_state=False,
+        cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=False,
+        output=out, use_cp=use_cp,
+    )
+    torch.testing.assert_close(got, ref, atol=1e-2, rtol=5e-3)
+
+
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_prefill_state_indices_pools_of_different_sizes(use_cp):
+    """The initial pool and the output pool need not match in size or in stride.
+
+    They are separate tensors indexed by the same `state_indices`, so nothing
+    ties their leading dimension together -- and the CP path took the output
+    pool's shape for both. The two are given different padding and different
+    inner strides as well, because two contiguous pools that differ only in
+    their leading dimension still have the same element strides and would not
+    catch an address built from the wrong tensor.
+
+    Checked against a packed run rather than against itself: unselected rows
+    staying put says nothing about whether the selected ones hold the right
+    numbers, or whether the right initial row was read.
+    """
+    _skip_if_not_supported(use_cp)
+    device = torch.device("cuda")
+    H, D = 8, 128
+    seq_lens = [256, 512]
+    dtype = torch.bfloat16
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        seq_lens, H, D, dtype, device, seed=0
+    )
+    total = sum(seq_lens)
+
+    # One canonical initial state, fp32, fed to both runs. `_make_inputs` hands
+    # back a bf16 state on this target; giving the packed run that and the
+    # indexed run an fp32 copy makes the two differ in arithmetic as well as in
+    # layout, and the comparison stops being about layout at all.
+    canonical_init = init_state.float().contiguous()
+    packed_out = torch.empty(total, H, D, dtype=q.dtype, device=device)
+    packed_state = torch.zeros(
+        len(seq_lens), H, D, D, dtype=torch.float32, device=device
+    )
+    packed, packed_final = chunk_gated_delta_rule(
+        q, k, v, g, beta, None,
+        initial_state=canonical_init, output_final_state=True,
+        cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=False,
+        output=packed_out, output_state=packed_state, use_cp=use_cp,
+    )
+
+    perm = [3, 1]
+    in_pool = _make_pool(canonical_init, perm, 9, 96, torch.float32, device)
+    out_pool = _make_pool(
+        torch.zeros_like(canonical_init), perm, 5, 0, torch.float32, device,
+        inner_stride=2,
+    )
+    sentinel = torch.arange(
+        out_pool.shape[0] * H * D * D, dtype=torch.float32, device=device
+    ).reshape(out_pool.shape)
+    out_pool.copy_(sentinel)
+    idx = torch.tensor(perm, dtype=torch.int32, device=device)
+    assert in_pool.shape[0] != out_pool.shape[0]
+    assert in_pool.stride() != out_pool.stride()
+
+    out = torch.empty(total, H, D, dtype=q.dtype, device=device)
+    indexed, indexed_final = chunk_gated_delta_rule(
+        q, k, v, g, beta, None,
+        initial_state=in_pool, output_final_state=True,
+        cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=False,
+        output=out, output_state=out_pool, state_indices=idx, use_cp=use_cp,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(packed).all() and torch.isfinite(packed_final).all()
+    assert torch.isfinite(indexed).all()
+    torch.testing.assert_close(indexed, packed, atol=1e-2, rtol=5e-3)
+    for i, r in enumerate(perm):
+        assert torch.isfinite(out_pool[r]).all()
+        torch.testing.assert_close(
+            out_pool[r], packed_final[i], atol=1e-2, rtol=5e-3,
+            msg=lambda m, r=r, i=i: (
+                f"output pool row {r} is not sequence {i}'s final state\n{m}"
+            ),
+        )
+    for r in range(out_pool.shape[0]):
+        if r in perm:
+            continue
+        assert torch.equal(out_pool[r], sentinel[r]), (
+            f"output pool row {r} was written although no sequence selected it"
+        )

@@ -27,6 +27,7 @@ from .gdn_kernels import (
     chunk_gated_delta_rule_sm90,
     chunk_gated_delta_rule_sm100,
     chunk_gated_delta_rule_sm120,
+    cp_delta_rule_dsl_sm80,
     cp_delta_rule_dsl_sm90,
     cp_delta_rule_dsl_sm100,
     cp_delta_rule_dsl_sm120,
@@ -50,6 +51,52 @@ def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
     return ", ".join(str(dtype).removeprefix("torch.") for dtype in dtypes)
 
 
+def _allocate_output_state(
+    num_seqs: int,
+    num_sab_heads: int,
+    head_size: int,
+    device,
+    initial_state: Optional[torch.Tensor],
+    state_indices: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Allocate the final-state buffer with every row already defined.
+
+    Every kernel here guards its body on the sequence being non-empty, so a
+    sequence of zero tokens never writes its row and that row keeps whatever the
+    buffer held. Allocated with `torch.empty`, that is uninitialised memory
+    returned as a state.
+
+    A caller who supplies `output_state` owns its contents and this does not
+    run: the row keeps what the caller put there, which is the documented
+    behaviour and what a state pool wants. It is only the buffer allocated here
+    that has to start from something, and the something is the batch's own
+    initial state where there is one and zero where there is not -- both of
+    which the kernel then overwrites for every sequence that has tokens.
+
+    No branch on whether the batch *has* an empty sequence. Asking that question
+    means `bool(...)` on a device tensor, which is a device-to-host
+    synchronisation on the hot path: removing it took a loop of single-token
+    calls from 256 us to 173 us, and moved every cell of the pinned baseline.
+    The buffer is initialised unconditionally instead, which costs one pass over
+    memory this branch had to allocate anyway.
+
+    The shape follows the initial state when the caller indexes a pool, because
+    the two are copied row for row and a batch-shaped buffer against a
+    pool-shaped source is a `copy_` that raises. It is computed here rather than
+    at each of the five call sites, three of which had it hardcoded to the batch.
+    """
+    shape = (
+        initial_state.shape
+        if state_indices is not None and initial_state is not None
+        else (num_seqs, num_sab_heads, head_size, head_size)
+    )
+    if initial_state is None:
+        return torch.zeros(shape, dtype=torch.float32, device=device)
+    out = torch.empty(shape, dtype=torch.float32, device=device)
+    out.copy_(initial_state)
+    return out
+
+
 def _cp_delta_rule_rejection_reason(
     *,
     arch_major: int,
@@ -66,7 +113,12 @@ def _cp_delta_rule_rejection_reason(
     checkpoint_cu_starts: Optional[torch.Tensor],
     state_indices: Optional[torch.Tensor],
 ) -> Optional[str]:
-    if arch_major == 9:
+    if arch_major == 8:
+        # Reachable only with `use_cp=True`. The heuristic that picks CP on its
+        # own still lists 9, 10 and 12, so nothing dispatches here by itself.
+        if cp_delta_rule_dsl_sm80 is None:
+            return "CP delta rule SM8x DSL kernel is unavailable"
+    elif arch_major == 9:
         if cp_delta_rule_dsl_sm90 is None:
             return "CP delta rule SM90 DSL kernel is unavailable"
     elif arch_major == 10:
@@ -78,7 +130,10 @@ def _cp_delta_rule_rejection_reason(
         if cp_delta_rule_dsl_sm120 is None:
             return "CP delta rule SM120 DSL kernel is unavailable"
     else:
-        return "CP delta rule is currently implemented only for SM90, SM100, and SM120"
+        return (
+            "CP delta rule is currently implemented only for SM8x, SM90, "
+            "SM100, and SM120"
+        )
     if (
         checkpoint_every_n_tokens > 0
         or state_checkpoints is not None
@@ -132,6 +187,18 @@ def chunk_gated_delta_rule(
     checkpoint_every_n_tokens: int = 0,
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
+    # The longest sequence in this batch, from the caller's host-side data.
+    # Private, and not a performance hint: it feeds `max_t_blocks_per_seq` and
+    # `max_cp_chunks_per_seq`, so a value below the real maximum under-sizes
+    # per-sequence indexing.  Caller precondition: if given it must equal
+    # `max(seq_lens)` for this batch.  The check below is type and range
+    # sanity only -- nothing here can verify the value without a
+    # synchronisation, which is the cost this argument exists to avoid.
+    #
+    # The wrapper cannot work it out for itself -- `cu_seqlens` lives on the
+    # device and reading it here would synchronise -- but vLLM's metadata
+    # builder already holds `prefill_query_start_loc_cpu`.
+    _max_seq_len: Optional[int] = None,
     _cp_chunk_len: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
@@ -262,8 +329,10 @@ def chunk_gated_delta_rule(
       flashinfer-python[cu13]``).
     - On SM8x the state may not be FP8: converting to or from it is a single
       instruction starting at SM89, and there is no software path here.  SM89
-      itself is unaffected.  ``use_cp`` has no SM8x implementation either, so
-      leave it ``False`` there.
+      itself is unaffected.  ``use_cp=True`` is implemented on SM8x, but nothing
+      selects it there on its own: ``use_cp="auto"`` still considers only SM90,
+      SM100 and SM120, and CP state checkpointing is not offered on SM8x
+      either.  A caller has to ask for it by name.
     """
     if use_cp not in ("auto", True, False):
         raise ValueError(f'use_cp must be "auto", True, or False, got {use_cp!r}')
@@ -299,6 +368,23 @@ def chunk_gated_delta_rule(
 
     num_seqs = cu_seqlens.size(0) - 1
     total_seq_len = q.size(0)
+    if _max_seq_len is not None:
+        # Type and range sanity, nothing more.  Correctness rests entirely
+        # on the caller precondition: a positive value below the real maximum
+        # passes this and silently under-sizes `max_t_blocks_per_seq` and
+        # `max_cp_chunks_per_seq`.  Catching that would mean reading
+        # `cu_seqlens`, which is a device tensor, and the point of taking this
+        # argument is to avoid that synchronisation.  What the bounds do catch
+        # is a value that cannot be a sequence length in this batch at all.
+        if not isinstance(_max_seq_len, int) or isinstance(_max_seq_len, bool):
+            raise ValueError(
+                f"_max_seq_len must be an int, got {type(_max_seq_len).__name__}"
+            )
+        if not 1 <= _max_seq_len <= total_seq_len:
+            raise ValueError(
+                f"_max_seq_len must be in [1, total_seq_len={total_seq_len}], "
+                f"got {_max_seq_len}"
+            )
     num_q_heads = q.size(1)
     num_v_heads = v.size(1)
     head_size = q.size(2)
@@ -432,10 +518,13 @@ def chunk_gated_delta_rule(
             )
         else:
             if output_final_state and output_state is None:
-                output_state = torch.empty(
-                    (num_seqs, num_sab_heads, head_size, head_size),
-                    dtype=torch.float32,
-                    device=device,
+                output_state = _allocate_output_state(
+                    num_seqs,
+                    num_sab_heads,
+                    head_size,
+                    device,
+                    initial_state,
+                    state_indices,
                 )
             _g = (
                 g
@@ -454,6 +543,7 @@ def chunk_gated_delta_rule(
             cp_delta_rule_dsl = cast(
                 Callable[..., None],
                 {
+                    8: cp_delta_rule_dsl_sm80,
                     9: cp_delta_rule_dsl_sm90,
                     10: cp_delta_rule_dsl_sm100,
                     12: cp_delta_rule_dsl_sm120,
@@ -482,7 +572,10 @@ def chunk_gated_delta_rule(
                 cu_seqlens,
                 _scale,
                 initial_state=initial_state,
-                max_seqlen=total_seq_len,
+                # `total_seq_len` when the caller did not say. Conservative
+                # for the chunk chooser -- it never under-sizes -- but it is
+                # not the real maximum.
+                max_seqlen=total_seq_len if _max_seq_len is None else _max_seq_len,
                 cp_chunk_len=_cp_chunk_len,
                 **state_indices_kwargs,
                 **checkpoint_kwargs,
@@ -507,10 +600,13 @@ def chunk_gated_delta_rule(
         if not output_final_state:
             output_state = None
         elif output_state is None:
-            output_state = torch.empty(
-                (num_seqs, num_sab_heads, head_size, head_size),
-                dtype=torch.float32,
-                device=device,
+            output_state = _allocate_output_state(
+                num_seqs,
+                num_sab_heads,
+                head_size,
+                device,
+                initial_state,
+                state_indices,
             )
 
         _g = (
@@ -551,13 +647,13 @@ def chunk_gated_delta_rule(
         if chunk_gated_delta_rule_sm80 is None:
             raise NotImplementedError("SM80 GDN prefill DSL kernel is unavailable")
         if output_state is None:
-            output_state_shape = (
-                initial_state.shape
-                if state_indices is not None and initial_state is not None
-                else (num_seqs, num_sab_heads, head_size, head_size)
-            )
-            output_state = torch.empty(
-                output_state_shape, dtype=torch.float32, device=device
+            output_state = _allocate_output_state(
+                num_seqs,
+                num_sab_heads,
+                head_size,
+                device,
+                initial_state,
+                state_indices,
             )
         chunk_gated_delta_rule_sm80(
             output,
@@ -580,13 +676,13 @@ def chunk_gated_delta_rule(
         if chunk_gated_delta_rule_sm120 is None:
             raise NotImplementedError("SM120 GDN prefill DSL kernel is unavailable")
         if output_state is None:
-            output_state_shape = (
-                initial_state.shape
-                if state_indices is not None and initial_state is not None
-                else (num_seqs, num_sab_heads, head_size, head_size)
-            )
-            output_state = torch.empty(
-                output_state_shape, dtype=torch.float32, device=device
+            output_state = _allocate_output_state(
+                num_seqs,
+                num_sab_heads,
+                head_size,
+                device,
+                initial_state,
+                state_indices,
             )
         chunk_gated_delta_rule_sm120(
             output,
@@ -610,10 +706,13 @@ def chunk_gated_delta_rule(
             raise NotImplementedError("SM90 GDN prefill DSL kernel is unavailable")
 
         if output_state is None:
-            output_state = torch.empty(
-                (num_seqs, num_sab_heads, head_size, head_size),
-                dtype=torch.float32,
-                device=device,
+            output_state = _allocate_output_state(
+                num_seqs,
+                num_sab_heads,
+                head_size,
+                device,
+                initial_state,
+                state_indices,
             )
 
         chunk_gated_delta_rule_sm90(

@@ -26,6 +26,7 @@ import torch
 from .reference_delta_rule import exclusive_cumsum
 from . import reference_delta_rule as reference
 from flashinfer.utils import (
+    is_sm8x_supported,
     is_sm90a_supported,
     is_sm100a_supported,
     is_sm12x_supported,
@@ -60,6 +61,17 @@ elif torch.cuda.is_available() and is_sm12x_supported(torch.device("cuda")):
         cp_delta_rule_prefill_dsl_sm120 as cp_delta_rule_prefill_dsl,
         cp_delta_rule_t_precompute_dsl_sm120 as cp_delta_rule_t_precompute_dsl,
     )
+elif torch.cuda.is_available() and is_sm8x_supported(torch.device("cuda")):
+    # Ported one stage at a time. What is not here yet stays None, so the tests
+    # for it skip rather than reaching for a name that does not exist -- and a
+    # half-ported pipeline is never assembled by accident.
+    from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm80 import (
+        cp_delta_rule_dsl_sm80 as cp_delta_rule_dsl,
+        cp_delta_rule_fixup_dsl_sm80 as cp_delta_rule_fixup_dsl,
+        cp_delta_rule_mn_precompute_dsl_sm80 as cp_delta_rule_mn_precompute_dsl,
+        cp_delta_rule_prefill_dsl_sm80 as cp_delta_rule_prefill_dsl,
+        cp_delta_rule_t_precompute_dsl_sm80 as cp_delta_rule_t_precompute_dsl,
+    )
 else:
     cp_delta_rule_dsl = None
     cp_delta_rule_fixup_dsl = None
@@ -77,10 +89,22 @@ from flashinfer.gdn_prefill import chunk_gated_delta_rule
 FIXUP_TF32_ATOL = 2e-3
 FIXUP_TF32_RTOL = 2e-3
 FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8", "hmma"]
+if torch.cuda.is_available() and is_sm8x_supported(torch.device("cuda")):
+    # The HMMA fixup hands its math warps extra registers with `setmaxnreg`,
+    # which SM8x does not have. It is not built there, so there is no kind to
+    # parametrize over rather than a kind that raises.
+    FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8"]
 
 
-def _skip_if_cp_unsupported():
-    """Skip test if context parallelism is unsupported."""
+def _skip_if_cp_unsupported(*stages):
+    """Skip when this device has no CP path, or none for the stages asked for.
+
+    SM8x is being ported a stage at a time, so a test names the entry points it
+    needs and skips when one of them is still None. Naming them is what keeps a
+    half-ported pipeline from being assembled: the test for a stage that does
+    not exist skips, it does not fail on a missing attribute and it does not
+    quietly run against another architecture's.
+    """
     device = torch.device("cuda")
     if is_sm100a_supported(device):
         cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
@@ -88,9 +112,14 @@ def _skip_if_cp_unsupported():
             pytest.skip(
                 f"SM100 CP GDN prefill requires CUDA 13+, got {torch.version.cuda}"
             )
-        return
-    if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
-        pytest.skip("CP GDN prefill requires SM90, SM100, or SM12x")
+    elif is_sm8x_supported(device):
+        pass
+    elif not (is_sm90a_supported(device) or is_sm12x_supported(device)):
+        pytest.skip("CP GDN prefill requires SM8x, SM90, SM100, or SM12x")
+
+    for stage in stages or ("cp_delta_rule_dsl",):
+        if globals().get(stage) is None:
+            pytest.skip(f"{stage} is not ported for this device yet")
 
 
 def _seed_all(seed):
@@ -226,7 +255,7 @@ def test_cp_delta_rule_t_precompute(
     gate_baseline,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_if_cp_unsupported()
+    _skip_if_cp_unsupported("cp_delta_rule_t_precompute_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = getattr(torch, dtype)
@@ -275,7 +304,7 @@ def test_cp_delta_rule_t_precompute_varlen_tail_is_projected(
     qkv_factory,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_if_cp_unsupported()
+    _skip_if_cp_unsupported("cp_delta_rule_t_precompute_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -330,7 +359,7 @@ def test_cp_delta_rule_mn_precompute(
     gate_baseline,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_if_cp_unsupported()
+    _skip_if_cp_unsupported("cp_delta_rule_mn_precompute_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = getattr(torch, dtype)
@@ -420,7 +449,7 @@ def test_cp_delta_rule_fixup(
     kernel_kind,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_if_cp_unsupported()
+    _skip_if_cp_unsupported("cp_delta_rule_fixup_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
     head_size = 128
@@ -526,7 +555,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
     gate_baseline,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_if_cp_unsupported()
+    _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = getattr(torch, dtype)
@@ -636,7 +665,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
     num_v_heads,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_if_cp_unsupported()
+    _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -753,7 +782,7 @@ def test_cp_delta_rule_kernel_chain_long_small_bh_matches_non_cp_prefill(
     scale,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_if_cp_unsupported()
+    _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
     head_size = 128
@@ -793,7 +822,7 @@ def test_cp_delta_rule_e2e_with_initial_state(
     seq_lens,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_if_cp_unsupported()
+    _skip_if_cp_unsupported("cp_delta_rule_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
     head_size = 128
@@ -866,7 +895,7 @@ def test_cp_delta_rule_e2e(
     gate_baseline,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_if_cp_unsupported()
+    _skip_if_cp_unsupported("cp_delta_rule_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
     head_size = 128
@@ -960,7 +989,7 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     seq_lens,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_if_cp_unsupported()
+    _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = getattr(torch, dtype)
@@ -1001,7 +1030,7 @@ def test_cp_delta_rule_external_state_dtype(
     seq_lens,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_if_cp_unsupported()
+    _skip_if_cp_unsupported("cp_delta_rule_dsl")
     device = torch.device("cuda")
     _seed_all(seed)
     dtype = torch.bfloat16
@@ -1062,3 +1091,193 @@ def test_cp_delta_rule_external_state_dtype(
 
     torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
     torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)
+
+
+# ─── Regressions for the CP prefill's bookkeeping ─────────────────────────────
+# Three properties, one per defect. None of them is a value comparison against a
+# reference: they hold whether or not the recurrence itself is right, so they
+# keep working while it is being fixed and they fail the moment the bookkeeping
+# regresses.
+
+
+def _cp_stage_inputs(
+    seq_lens, cp_chunk_len, qkv_factory, device, dtype,
+    num_q_heads=1, num_k_heads=1, num_v_heads=1,
+):
+    """Stages 1 through 3, and everything stage 4 needs to run.
+
+    Head counts are separate parameters because they arrive at the kernel as
+    four adjacent scalars, and an equal-head case cannot tell them apart -- the
+    argument shift this file's tests were written for was invisible in exactly
+    that way.
+    """
+    head_size = 128
+    num_heads = max(num_q_heads, num_v_heads)
+    total_seqlen = sum(seq_lens)
+    cu_seqlens = _make_cu_seqlens(seq_lens, device)
+    with torch.device(device):
+        q, k, v = qkv_factory(
+            seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype=dtype
+        )
+    beta = _make_gates(total_seqlen, num_heads, 0.25, device)
+    alpha = _make_gates(total_seqlen, num_heads, 0.9, device)
+    k_sab = k if num_k_heads == num_heads else k.repeat_interleave(
+        num_heads // num_k_heads, dim=1
+    ).contiguous()
+    max_seqlen = max(seq_lens)
+    t = cp_delta_rule_t_precompute_dsl(
+        k_sab, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen
+    )
+    local_transfer, local_state = cp_delta_rule_mn_precompute_dsl(
+        k_sab, v, t, alpha, cu_seqlens, total_seqlen,
+        cp_chunk_len=cp_chunk_len, max_seqlen=max_seqlen,
+    )
+    fixed_state = cp_delta_rule_fixup_dsl(
+        local_transfer, local_state, cu_seqlens, total_seqlen,
+        cp_chunk_len=cp_chunk_len,
+    )
+    return dict(
+        q=q, k=k, v=v, t=t, alpha=alpha, fixed_state=fixed_state,
+        cu_seqlens=cu_seqlens, total_seqlen=total_seqlen, max_seqlen=max_seqlen,
+        num_heads=num_heads, head_size=head_size, cp_chunk_len=cp_chunk_len,
+        beta=beta,
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_cp_prefill_leaves_the_fixup_workspace_alone(qkv_factory, dtype):
+    """No final state asked for means none written.
+
+    `fixed_state` is the fixup workspace, and on this path the state tensor the
+    kernel would write points into it. A store that runs when it was not asked
+    for lands on a chunk state another block still has to read, so the property
+    is that the workspace comes back byte for byte.
+    """
+    _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
+    _seed_all(0)
+    device = torch.device("cuda")
+    seq_lens = [64, 192]
+    args = _cp_stage_inputs(seq_lens, 64, qkv_factory, device, getattr(torch, dtype))
+    before = args["fixed_state"].clone()
+    o = torch.empty(
+        (args["total_seqlen"], args["num_heads"], args["head_size"]),
+        dtype=args["q"].dtype, device=device,
+    )
+    cp_delta_rule_prefill_dsl(
+        o, None, args["q"], args["k"], args["v"], args["t"], args["fixed_state"],
+        args["alpha"], 1.0, args["cu_seqlens"], args["total_seqlen"],
+        cp_chunk_len=args["cp_chunk_len"], max_seqlen=args["max_seqlen"],
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(args["fixed_state"], before), (
+        "the fixup workspace was written while no final state was asked for"
+    )
+
+
+@torch.inference_mode()
+# The kernel takes GQA (k == v, q a multiple) and GVA (q == k, v a multiple),
+# so those are the two ways the four head counts can differ from each other.
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(1, 1, 1), (4, 1, 1), (1, 1, 4)],
+)
+def test_cp_prefill_writes_every_value_band(
+    qkv_factory, num_q_heads, num_k_heads, num_v_heads
+):
+    """Both halves of O get written.
+
+    `head_size` is 128 and the fused kernel owns 64 rows per block, so two value
+    slices cover it. A grid without that axis runs slice 0 only and leaves the
+    other band at whatever the caller passed -- which a value comparison against
+    a reference would report as "wrong numbers" rather than "never written".
+    Poisoning O separates the two.
+    """
+    _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
+    _seed_all(0)
+    device = torch.device("cuda")
+    args = _cp_stage_inputs(
+        [64], 64, qkv_factory, device, torch.float16,
+        num_q_heads=num_q_heads, num_k_heads=num_k_heads, num_v_heads=num_v_heads,
+    )
+    poison = float("nan")
+    o = torch.full(
+        (args["total_seqlen"], args["num_heads"], args["head_size"]),
+        poison, dtype=args["q"].dtype, device=device,
+    )
+    state = torch.zeros(
+        len(args["cu_seqlens"]) - 1, args["num_heads"],
+        args["head_size"], args["head_size"], dtype=torch.float32, device=device,
+    )
+    cp_delta_rule_prefill_dsl(
+        o, state, args["q"], args["k"], args["v"], args["t"], args["fixed_state"],
+        args["alpha"], 1.0, args["cu_seqlens"], args["total_seqlen"],
+        cp_chunk_len=args["cp_chunk_len"], max_seqlen=args["max_seqlen"],
+    )
+    torch.cuda.synchronize()
+    half = args["head_size"] // 2
+    for band, name in ((o[..., :half], "band 0"), (o[..., half:], "band 1")):
+        assert not band.isnan().any(), f"{name} of O was never written"
+
+
+@torch.inference_mode()
+def test_cp_prefill_checkpoints_land_in_sequence_order(qkv_factory):
+    """Every checkpoint slot holds the state after its own prefix.
+
+    The shape matters. A `cp_chunk_len` equal to the block length runs one block
+    per chunk and never reaches the middle-block or last-block checkpoint calls,
+    so this is 384 tokens in chunks of 192 with a checkpoint every 64: two
+    chunks, three blocks each, and the second chunk goes through both paths.
+
+    Checking that a slot was written catches an index that collapses; checking
+    it against the state after that many tokens also catches two that swapped.
+    """
+    _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
+    _seed_all(0)
+    device = torch.device("cuda")
+    cp_chunk_len = 192
+    every = 64
+    seq_lens = [384]
+    args = _cp_stage_inputs(seq_lens, cp_chunk_len, qkv_factory, device, torch.float16)
+    per_seq = [length // every for length in seq_lens]
+    starts = [0]
+    for count in per_seq:
+        starts.append(starts[-1] + count)
+    checkpoints = torch.full(
+        (sum(per_seq), args["num_heads"], args["head_size"], args["head_size"]),
+        float("nan"), dtype=torch.float32, device=device,
+    )
+    o = torch.empty(
+        (args["total_seqlen"], args["num_heads"], args["head_size"]),
+        dtype=args["q"].dtype, device=device,
+    )
+    state = torch.zeros(
+        len(seq_lens), args["num_heads"], args["head_size"], args["head_size"],
+        dtype=torch.float32, device=device,
+    )
+    cp_delta_rule_prefill_dsl(
+        o, state, args["q"], args["k"], args["v"], args["t"], args["fixed_state"],
+        args["alpha"], 1.0, args["cu_seqlens"], args["total_seqlen"],
+        cp_chunk_len=cp_chunk_len, max_seqlen=args["max_seqlen"],
+        state_checkpoints=checkpoints,
+        checkpoint_cu_starts=torch.tensor(starts, dtype=torch.int32, device=device),
+        checkpoint_every_n_tokens=every,
+    )
+    torch.cuda.synchronize()
+    for slot in range(checkpoints.shape[0]):
+        assert not checkpoints[slot].isnan().any(), (
+            f"checkpoint slot {slot} of {checkpoints.shape[0]} was never written"
+        )
+    for slot in range(checkpoints.shape[0]):
+        n = (slot + 1) * every
+        _, prefix_state = _run_non_cp_prefill(
+            args["q"][:n], args["k"][:n], args["v"][:n],
+            args["alpha"][:n], args["beta"][:n],
+            _make_cu_seqlens([n], device), 1.0,
+        )
+        torch.testing.assert_close(
+            checkpoints[slot], prefix_state[0], atol=5e-3, rtol=2e-3,
+            msg=lambda m, slot=slot, n=n: (
+                f"checkpoint slot {slot} is not the state after {n} tokens\n{m}"
+            ),
+        )

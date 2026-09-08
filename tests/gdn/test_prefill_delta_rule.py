@@ -1340,3 +1340,73 @@ def test_prefill_kernel_state_dtype(
         use_cp,
         seed=seed,
     )
+
+
+@pytest.mark.parametrize("with_initial_state", [False, True])
+def test_prefill_zero_length_sequence_state_is_defined_when_allocated_here(
+    qkv_factory,
+    with_initial_state: bool,
+    scale: float = 0.1,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    """A row nothing writes still has to hold something.
+
+    Every kernel here guards its body on the sequence being non-empty, so a
+    zero-token sequence never writes its row of `output_state`. The companion
+    test above covers the caller-supplied buffer, where keeping what the caller
+    put there is the point. This covers the other half: when the entry point
+    allocates the buffer, `torch.empty` left that row as uninitialised memory
+    and returned it as a state.
+    """
+    _skip_if_unsupported()
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    head_size = 128
+    num_heads = 2
+    seq_lens = [96, 0, 300]
+    total = sum(seq_lens)
+    device = torch.device("cuda")
+
+    with device:
+        q, k, v = qkv_factory(
+            [total], num_heads, num_heads, num_heads, head_size, torch.bfloat16
+        )
+        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+        alpha = torch.rand(total, num_heads)
+        beta = torch.rand(total, num_heads)
+        cu_seq_lens = torch.tensor([0, 96, 96, 396], dtype=torch.int64)
+        initial_state = None
+        if with_initial_state:
+            initial_state = (
+                torch.randn(
+                    len(seq_lens), num_heads, head_size, head_size, dtype=torch.float32
+                )
+                * 0.05
+            )
+
+    # Repeated, because uninitialised memory is only reliably caught by getting
+    # a different answer twice from the same inputs.
+    seen = []
+    for _ in range(4):
+        _, state = chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            scale,
+            initial_state,
+            True,
+            cu_seq_lens,
+        )
+        torch.cuda.synchronize()
+        seen.append(state[1].clone())
+
+    for later in seen[1:]:
+        torch.testing.assert_close(seen[0], later, atol=0.0, rtol=0.0)
+
+    want = initial_state[1] if with_initial_state else torch.zeros_like(seen[0])
+    torch.testing.assert_close(seen[0], want, atol=0.0, rtol=0.0)
