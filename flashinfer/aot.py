@@ -119,10 +119,12 @@ from .jit.bgmv_moe import (
     BGMV_MOE_SUPPORTED_MAJOR_VERSIONS,
     gen_bgmv_moe_module,
 )
-from .jit.blackwell_bgmv_moe import (
-    BLACKWELL_BGMV_MOE_DTYPES,
-    BLACKWELL_BGMV_MOE_HIDDEN_SIZES,
-    gen_blackwell_bgmv_moe_module,
+from .jit.cake_bgmv_moe import (
+    CAKE_BGMV_MOE_DTYPES,
+    CAKE_BGMV_MOE_GENERIC_RANKS,
+    CAKE_BGMV_MOE_HIDDEN_SIZES,
+    gen_cake_bgmv_moe_generic_module,
+    gen_cake_bgmv_moe_module,
 )
 from .jit.monomoe import gen_monomoe_module
 from .jit.cute_sm12x_gemm import gen_gemm_sm120_module_cute
@@ -175,6 +177,13 @@ from .jit.mla import (
     gen_mla_module,
     gen_sparse_mla_sm120_module,
 )
+from .jit.cake_sparse_mla_sm120_dsv4_nvfp4 import (
+    gen_cake_sparse_mla_sm120_dsv4_nvfp4_module,
+)
+from .jit.cake_sparse_mla_sm120_dsv41_mixed import (
+    cake_sparse_mla_sm120_dsv41_mixed_available,
+    gen_cake_sparse_mla_sm120_dsv41_mixed_module,
+)
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
@@ -195,6 +204,12 @@ from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
+from .jit.qsa_ops import (
+    gen_qsa_output_gate_module,
+    gen_qsa_pre_indexer_module,
+    gen_qsa_route_module,
+    gen_qsa_scores_module,
+)
 from .jit.cake_sampling import gen_cake_sampling_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
@@ -806,12 +821,23 @@ def gen_all_modules(
         # Multi-LoRA MoE BGMV kernel
         if has_bgmv_moe:
             jit_specs.append(gen_bgmv_moe_module())
+        for cake_bgmv_arch, cake_bgmv_flag in (
+            ("sm90a", "sm90a_exact"),
+            ("sm100a", "sm100a_exact"),
+            ("sm103a", "sm103a_exact"),
+        ):
+            if sm_capabilities.get(cake_bgmv_flag, False):
+                jit_specs.extend(
+                    gen_cake_bgmv_moe_module(hidden_size, dtype, cake_bgmv_arch)
+                    for hidden_size in CAKE_BGMV_MOE_HIDDEN_SIZES
+                    for dtype in CAKE_BGMV_MOE_DTYPES
+                )
+                jit_specs.extend(
+                    gen_cake_bgmv_moe_generic_module(rank, dtype, cake_bgmv_arch)
+                    for rank in CAKE_BGMV_MOE_GENERIC_RANKS
+                    for dtype in CAKE_BGMV_MOE_DTYPES
+                )
         if sm_capabilities.get("sm100a_exact", False):
-            jit_specs.extend(
-                gen_blackwell_bgmv_moe_module(hidden_size, dtype)
-                for hidden_size in BLACKWELL_BGMV_MOE_HIDDEN_SIZES
-                for dtype in BLACKWELL_BGMV_MOE_DTYPES
-            )
             jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm100a"))
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
@@ -887,6 +913,9 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
+            # fused_moe_100 also targets SM110 and must ship in its provider.
+            if not has_sm100:
+                jit_specs.append(gen_cutlass_fused_moe_sm100_module())
         if has_sm120:
             jit_specs.append(gen_fp4_quantization_sm120_module())
         if has_sm121:
@@ -959,6 +988,21 @@ def gen_all_modules(
         jit_specs.append(gen_pcie_ipc_ag_rs_module())
 
     if add_misc:
+        # QSA's scorer, route and output gate are one contract, and a build that
+        # carried some of them would report a capability it cannot serve. The
+        # scorer needs m16n8k16, which every SM8-or-newer target has, so the set
+        # is gated on the target list: has_sm80 is only set when an 8.x target is
+        # in the build, and an SM90-only or SM12x-only build needs these as well.
+        from .jit.core import current_compilation_context
+
+        if any(
+            major >= 8 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+        ):
+            jit_specs += [
+                gen_qsa_output_gate_module(),
+                gen_qsa_route_module(),
+                gen_qsa_scores_module(),
+            ]
         jit_specs += [
             gen_api_log_stats_module(),
             gen_cascade_module(),
@@ -968,6 +1012,10 @@ def gen_all_modules(
             gen_quantization_module(),
             gen_rope_module(),
             gen_sampling_module(),
+            # No architecture condition: the QSA pre-indexer uses no SM8-only
+            # instruction, and the bf16 and e4m3 conversions it needs have
+            # software paths below SM80 and SM89.
+            gen_qsa_pre_indexer_module(),
             gen_topk_module(),
         ]
         if has_sm100 or has_sm103:
@@ -1116,6 +1164,12 @@ def gen_all_modules(
     # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
     if has_sm120 or has_sm121:
         jit_specs.append(gen_sparse_mla_sm120_module())
+        # Cake DSv4 NVFP4 sparse-MLA decode + prefill (backend="cake" on SM120/SM121).
+        jit_specs.append(gen_cake_sparse_mla_sm120_dsv4_nvfp4_module())
+        # Cake DSv4.1 mixed-cache sparse-MLA decode (backend="cake",
+        # kv_cache_format="fp8_dsv41_fp4_ca"); present once the family is exported.
+        if cake_sparse_mla_sm120_dsv41_mixed_available():
+            jit_specs.append(gen_cake_sparse_mla_sm120_dsv41_mixed_module())
 
     # Add cuDNN FMHA module
     jit_specs.append(gen_cudnn_fmha_module())
