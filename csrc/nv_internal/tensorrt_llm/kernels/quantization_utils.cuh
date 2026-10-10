@@ -110,6 +110,18 @@ inline __device__ void quantizeAndStore(QuantT* dstPtr, uint4 vec, T const clamp
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Conversion Functions
 
+#if defined(FLASHINFER_FP4_SW_CVT)
+// cvt.rn.satfinite.e2m1x2.f32 for one value: ties-to-even against the E2M1 midpoints, NaN -> +6.
+__device__ __forceinline__ uint32_t fp32_to_e2m1_sw(float x) {
+  uint32_t const bits = __float_as_uint(x);
+  uint32_t const mag = bits & 0x7FFFFFFFu;
+  uint32_t const code = (mag > 0x3E800000u) + (mag >= 0x3F400000u) + (mag > 0x3FA00000u) +
+                        (mag >= 0x3FE00000u) + (mag > 0x40200000u) + (mag >= 0x40600000u) +
+                        (mag > 0x40A00000u);
+  return (mag > 0x7F800000u ? 0u : bits >> 28 & 0x8u) | code;
+}
+#endif
+
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -129,6 +141,11 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
       : "=r"(val)
       : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]), "f"(array[4]), "f"(array[5]),
         "f"(array[6]), "f"(array[7]));
+  return val;
+#elif defined(FLASHINFER_FP4_SW_CVT)
+  uint32_t val = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) val |= fp32_to_e2m1_sw(array[i]) << (4 * i);
   return val;
 #else
   // static_assert(false, "not supported.");
@@ -155,6 +172,13 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
       : "=r"(val)
       : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y), "f"(array[2].x),
         "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
+  return val;
+#elif defined(FLASHINFER_FP4_SW_CVT)
+  uint32_t val = 0;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    val |= (fp32_to_e2m1_sw(array[i].x) | fp32_to_e2m1_sw(array[i].y) << 4) << (8 * i);
+  }
   return val;
 #else
   // static_assert(false, "not supported.");
@@ -196,6 +220,9 @@ inline __device__ uint64_t fp32_vec_to_e2m1(float2 (&array)[8]) {
         "f"(array[5].x), "f"(array[5].y), "f"(array[6].x), "f"(array[6].y), "f"(array[7].x),
         "f"(array[7].y));
   return val;
+#elif defined(FLASHINFER_FP4_SW_CVT)
+  return fp32_vec_to_e2m1(reinterpret_cast<float2(&)[4]>(array[0])) |
+         uint64_t(fp32_vec_to_e2m1(reinterpret_cast<float2(&)[4]>(array[4]))) << 32;
 #else
   // static_assert(false, "not supported.");
   return 0;
@@ -366,6 +393,13 @@ __device__ __forceinline__ float2 e2m1x2_byte_scaled_e4m3_to_float2(uint32_t byt
       "}"
       : "=f"(result.x), "=f"(result.y)
       : "r"(byteVal), "r"(static_cast<uint32_t>(scaleVal)));
+#elif defined(FLASHINFER_FP4_SW_CVT)
+  // Exact in fp32, as in f16: the factors carry at most 2 and 4 significant bits.
+  __nv_fp8_e4m3 scale;
+  scale.__x = scaleVal;
+  result = e2m1x2_byte_to_float2(byteVal);
+  result.x *= static_cast<float>(scale);
+  result.y *= static_cast<float>(scale);
 #else
   result.x = 0.0f;
   result.y = 0.0f;
@@ -431,7 +465,8 @@ template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
     PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout,
     float rowAmax = 0.0f) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000 || (defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ >= 800))
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
                 "CVT_ELTS_PER_THREAD must be 8 or 16");
   static_assert(std::is_same_v<NVFP4_4OVER6_CONFIG, std::false_type> ||
@@ -766,7 +801,8 @@ cvt_warp_fp16_to_fp4_with_vec_max(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, flo
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF>
 __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal,
                                         uint8_t* SFout) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000 || (defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ >= 800))
 
   // Because the return value is a uint64_t, we need to ensure that the CVT_ELTS_PER_THREAD is 16.
   static_assert(CVT_ELTS_PER_THREAD == 16, "CVT_ELTS_PER_THREAD must be 16");
@@ -853,7 +889,8 @@ template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_warp_fp16_to_mxfp8(
     PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout) {
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t>;
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000 || (defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ >= 800))
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
                 "CVT_ELTS_PER_THREAD must be 8 or 16");
   // Get absolute maximum values among the local elements.
@@ -1051,7 +1088,8 @@ __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int
                                                 int colVecIdx, std::optional<int> numRows,
                                                 int numColVecs, SFType* SFout,
                                                 QuantizationSFLayout layout) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000 || (defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ >= 800))
   static_assert(CVT_NUM_THREADS_PER_SF == 1 || CVT_NUM_THREADS_PER_SF == 2 ||
                 CVT_NUM_THREADS_PER_SF == 4);
 
@@ -1100,7 +1138,8 @@ __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int
 template <class SFType, int CVT_FP4_SF_VEC_SIZE, int CVT_FP4_NUM_THREADS_PER_SF>
 __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx, int numCols,
                                                        SFType* SFout) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000 || (defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ >= 800))
   static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
 
   // One pair of threads write one SF to global memory.

@@ -27,7 +27,13 @@ from cutlass import Float32, Int32, Int64, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ..cute_dsl.fp4_common import habs2, hmax2, bfloat2_habs2, bfloat2_hmax2
+from ..cute_dsl.fp4_common import (
+    bfloat2_habs2,
+    bfloat2_hmax2,
+    habs2,
+    hmax2,
+    target_inline_asm,
+)
 from .nvfp4_quantization_utils import NVFP44Over6Config, NVFP44Over6ErrMode
 
 
@@ -253,7 +259,7 @@ def half2_to_fp8x2_scaled(
 ) -> Uint32:
     """Convert Half2 to 2 FP8 E4M3 values with scaling."""
     return Uint32(
-        llvm.inline_asm(
+        target_inline_asm(
             T.i32(),
             [
                 Uint32(h2).ir_value(loc=loc, ip=ip),
@@ -296,7 +302,7 @@ def bfloat2_to_fp8x2_scaled(
 ) -> Uint32:
     """Convert BFloat16x2 to 2 FP8 E4M3 values with scaling."""
     return Uint32(
-        llvm.inline_asm(
+        target_inline_asm(
             T.i32(),
             [
                 Uint32(bf2).ir_value(loc=loc, ip=ip),
@@ -342,7 +348,7 @@ def float2_to_fp8x2_scaled(
 ) -> Uint32:
     """Convert 2 FP32 values (u32 bit patterns) to 2 FP8 E4M3 with scaling."""
     return Uint32(
-        llvm.inline_asm(
+        target_inline_asm(
             T.i32(),
             [
                 Uint32(f0_bits).ir_value(loc=loc, ip=ip),
@@ -516,7 +522,7 @@ def cvt_e2m1x8_f32(
     to pairs of 4-bit E2M1 values, then packs all 8 values into a single u32.
     """
     return Uint32(
-        llvm.inline_asm(
+        target_inline_asm(
             T.i32(),
             [
                 Float32(v0).ir_value(loc=loc, ip=ip),
@@ -742,8 +748,8 @@ def bfloat2x4_to_fp8x8_packed(
 def ld_global_v8_u32(
     base_ptr: Int64, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32]:
-    """Load 256 bits (8 x uint32) from global memory (sm_100+, 32B-aligned)."""
-    result = llvm.inline_asm(
+    """Load 256 bits (8 x uint32) from global memory (32B-aligned)."""
+    result = target_inline_asm(
         llvm.StructType.get_literal(
             [T.i32(), T.i32(), T.i32(), T.i32(), T.i32(), T.i32(), T.i32(), T.i32()]
         ),
@@ -1453,7 +1459,7 @@ def _pack_f32x16_to_e2m1(values: tuple) -> tuple:
 @dsl_user_op
 def _e2m1x2_to_f32x2(byte_val: Uint32, *, loc=None, ip=None) -> tuple:
     """Decode one packed E2M1x2 byte to FP32 values."""
-    result = llvm.inline_asm(
+    result = target_inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
         [Uint32(byte_val).ir_value(loc=loc, ip=ip)],
         """
@@ -1616,7 +1622,7 @@ def _e2m1x2_scaled_e4m3_to_f32x2(
     byte_val: Uint32, scale_fp8: Uint32, *, loc=None, ip=None
 ) -> tuple:
     """Decode E2M1x2 and multiply by an E4M3 scale in f16."""
-    result = llvm.inline_asm(
+    result = target_inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
         [
             Uint32(byte_val).ir_value(loc=loc, ip=ip),

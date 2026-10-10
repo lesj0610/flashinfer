@@ -201,7 +201,7 @@ def mxfp8_quantize(
         Backend to use:
 
         - ``"cuda"``: stable JIT-compiled CUDA kernel (default).
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM80+, **experimental**).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
         ``is_sf_swizzled_layout``.
