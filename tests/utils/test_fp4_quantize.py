@@ -37,9 +37,11 @@ from flashinfer.quantization.nvfp4_quantization_utils import (
 )
 from flashinfer.quantization.fp4_quantization import NVFP4_QUANT_ENV_VARS
 from flashinfer.utils import (
+    get_compute_capability,
     is_sm100a_supported,
     is_sm110a_supported,
     is_sm12x_supported,
+    version_at_least,
 )
 
 pytestmark = pytest.mark.long_running
@@ -48,7 +50,9 @@ pytestmark = pytest.mark.long_running
 def _is_fp4_supported(device: torch.device) -> bool:
     """Check if FP4 quantization is supported on this device."""
     return (
-        is_sm100a_supported(device)
+        get_compute_capability(device)[0] in (8, 9)
+        and version_at_least(torch.version.cuda, "12.8")
+        or is_sm100a_supported(device)
         or is_sm110a_supported(device)
         or is_sm12x_supported(device)
     )
@@ -1893,6 +1897,8 @@ def test_nvfp4_quantize_tma_backend_parity(
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
+    if get_compute_capability(torch.device(device))[0] < 9:
+        pytest.skip("TMA requires SM90+")
 
     # TMA is opt-in outside SM107's large FP16/BF16 regime; force it on so this
     # test also exercises it on other architectures and input dtypes.
@@ -1948,6 +1954,8 @@ def test_nvfp4_quantize_tma_oob_rows(device: str) -> None:
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
+    if get_compute_capability(torch.device(device))[0] < 9:
+        pytest.skip("TMA requires SM90+")
 
     from flashinfer.quantization.kernels.nvfp4_quantize import (
         SF_LAYOUT_128x4,

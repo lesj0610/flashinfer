@@ -37,6 +37,7 @@ def gen_mxfp8_quantization_sm100_module() -> JitSpec:
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4",
+            "-DFLASHINFER_FP4_SW_CVT",
         ],
         extra_cflags=[
             "-DENABLE_BF16",

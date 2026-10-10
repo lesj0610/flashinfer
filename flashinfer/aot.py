@@ -52,6 +52,7 @@ from .jit.cascade import gen_cascade_module
 from .jit.cake_fmha import gen_cake_fmha_compat_module
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
+    gen_fp4_quantization_sm80_module,
     gen_fp4_quantization_sm90_module,
     gen_fp4_quantization_sm100_module,
     gen_fp4_quantization_sm103_module,
@@ -865,6 +866,8 @@ def gen_all_modules(
             jit_specs.extend(gen_cake_selective_state_update_modules("sm_100a"))
         if has_cake_selective_state_update_sm103a:
             jit_specs.extend(gen_cake_selective_state_update_modules("sm_103a"))
+        if has_sm80 and get_cuda_version() >= Version("12.8"):
+            jit_specs.append(gen_fp4_quantization_sm80_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
