@@ -448,7 +448,35 @@ def grouped_mm_mxfp8(
 # =========================================================================
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+def _fp4_to_bf16(
+    x: torch.Tensor, descale: torch.Tensor, batch: int, rows: int, block_size: int
+) -> torch.Tensor:
+    """BF16 ``[batch * rows, k]`` of packed FP4 rows with 128x4-swizzled block scales."""
+    from ..trace.templates.gemm import _e8m0_to_float, _unswizzle_batched_sf_128x4
+
+    # BF16 E2M1 pair of every byte, built on the device so CUDA graph capture
+    # needs no host copy. Products are exact unless they overflow BF16, which
+    # takes an MXFP4 scale above 2**125.
+    m = torch.arange(8, device=x.device)
+    e, f = m >> 1, (m & 1).float()
+    mag = torch.where(e == 0, f * 0.5, torch.exp2((e - 1).float()) * (1 + f * 0.5))
+    lut = torch.cat((mag, -mag)).bfloat16()
+    byte = torch.arange(256, device=x.device)
+    pairs = torch.stack((lut[byte & 0xF], lut[byte >> 4]), dim=-1)
+    codes = x.view(torch.uint8).reshape(-1).int()  # index_select keeps int32
+    out = pairs.index_select(0, codes).view(batch * rows, -1, block_size)
+    scale = _unswizzle_batched_sf_128x4(
+        descale.reshape(-1), batch, rows, out.shape[1]
+    ).reshape(batch * rows, -1)
+    scale = (
+        _e8m0_to_float(scale.view(torch.uint8))
+        if block_size == 32
+        else scale.view(torch.float8_e4m3fn).float()
+    )
+    return out.mul_(scale.bfloat16().unsqueeze(-1)).flatten(1)
+
+
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _check_grouped_mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -590,6 +618,11 @@ def grouped_mm_fp4(
     -------
     torch.Tensor
         Output tensor ``(m_out, n)``.
+
+    Below SM100 the FP4 operands are dequantized to BF16 and multiplied by
+    :func:`grouped_mm_bf16`. The dequantization is exact unless an MXFP4 scale
+    is above ``2**125``. There are no cuDNN plans to pick from, so any
+    ``tactic >= 0`` returns ``None`` like an out-of-range index.
     """
 
     if out is not None:
@@ -597,6 +630,21 @@ def grouped_mm_fp4(
 
     if backend == "cudnn":
         major, minor = get_compute_capability(a.device)
+        if major < 10:
+            if tactic >= 0:
+                return None
+            num_experts, n = b.shape[:2]
+            result = grouped_mm_bf16(
+                _fp4_to_bf16(a, a_descale, 1, a.shape[0], block_size),
+                _fp4_to_bf16(b, b_descale, num_experts, n, block_size).view(
+                    num_experts, n, -1
+                ),
+                m_indptr,
+                out_dtype=torch.float32,
+            )
+            if alpha is not None:
+                result.mul_(alpha)
+            return result.to(out_dtype) if out is None else out.copy_(result)
         _check_cudnn_version(
             _cudnn_moe_block_scale_min_version(major * 10 + minor), "grouped_mm_fp4"
         )

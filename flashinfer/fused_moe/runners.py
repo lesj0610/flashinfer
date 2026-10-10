@@ -9897,6 +9897,7 @@ class CudnnGroupedGemmNvfp4Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
 
     backend_key = "cudnn_grouped_gemm_nvfp4"
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    supports_nvfp4_4over6 = True
     _x_dtype = torch.uint8
     _weight_dtype = torch.uint8
     _k_pack = 2
@@ -9979,7 +9980,9 @@ class CudnnGroupedGemmNvfp4Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
         from ..grouped_mm import grouped_mm_fp4
         from .prepare import _quantize_nvfp4_rows
 
-        quantized, scale, _ = _quantize_nvfp4_rows(intermediate)
+        quantized, scale, _ = _quantize_nvfp4_rows(
+            intermediate, nvfp4_4over6=self.config.quant.nvfp4_4over6
+        )
         return self._run_plan(
             2,
             tactic,

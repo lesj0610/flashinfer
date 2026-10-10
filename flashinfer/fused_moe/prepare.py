@@ -41,6 +41,7 @@ import torch
 from ..api_logging import flashinfer_api
 from ..tllm_enums import ActivationType
 from ..quantization.nvfp4_quantization_utils import (
+    _UNSET,
     NVFP44Over6Config,
     make_nvfp4_global_scale,
     resolve_nvfp4_4over6,
@@ -3064,7 +3065,10 @@ def _require_swizzled_scale_tiles(values: torch.Tensor, name: str) -> None:
 
 
 def _quantize_nvfp4_rows(
-    values: torch.Tensor, *, amax: Optional[torch.Tensor] = None
+    values: torch.Tensor,
+    *,
+    amax: Optional[torch.Tensor] = None,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """NVFP4-quantize ``[rows, k]`` BF16 rows for the cuDNN block-scaled grouped GEMMs.
 
@@ -3085,7 +3089,11 @@ def _quantize_nvfp4_rows(
             amax > 0, (nvfp4_scale_max * nvfp4_max) / amax, torch.ones_like(amax)
         ).reshape(-1)
     quantized, scale = fp4_quantize(
-        values, global_scale=global_scale, sf_vec_size=16, is_sf_swizzled_layout=True
+        values,
+        global_scale=global_scale,
+        sf_vec_size=16,
+        is_sf_swizzled_layout=True,
+        nvfp4_4over6=nvfp4_4over6,
     )
     return (
         quantized.view(torch.uint8),
