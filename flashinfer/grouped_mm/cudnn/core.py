@@ -492,6 +492,8 @@ def _cudnn_moe_block_scale_grouped_gemm_plan_count(
     ``range(count)``. Like the plain query, it compiles every plan once and is
     refused while a CUDA graph is being captured.
     """
+    if torch.cuda.get_device_capability(a.device)[0] < 10:
+        return 0  # grouped_mm_fp4 dequantizes below SM100: no block-scaled plans
     token_3d = a.unsqueeze(0)
     weight_3d = b.transpose(1, 2)
     token_descale_3d = a_descale.unsqueeze(0)

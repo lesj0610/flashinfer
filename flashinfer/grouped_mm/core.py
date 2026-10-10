@@ -448,7 +448,29 @@ def grouped_mm_mxfp8(
 # =========================================================================
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+def _nvfp4_to_bf16(
+    x: torch.Tensor, descale: torch.Tensor, batch: int, rows: int
+) -> torch.Tensor:
+    """Exact BF16 ``[batch * rows, k]`` of packed NVFP4 rows with 128x4-swizzled scales."""
+    from ..trace.templates.gemm import _unswizzle_batched_sf_128x4
+
+    # BF16 E2M1 pair of every byte, built on the device so CUDA graph capture
+    # needs no host copy.
+    m = torch.arange(8, device=x.device)
+    e, f = m >> 1, (m & 1).float()
+    mag = torch.where(e == 0, f * 0.5, torch.exp2((e - 1).float()) * (1 + f * 0.5))
+    lut = torch.cat((mag, -mag)).bfloat16()
+    byte = torch.arange(256, device=x.device)
+    pairs = torch.stack((lut[byte & 0xF], lut[byte >> 4]), dim=-1)
+    codes = x.view(torch.uint8).reshape(-1).int()  # index_select keeps int32
+    out = pairs.index_select(0, codes).view(batch * rows, -1, 16)
+    scale = _unswizzle_batched_sf_128x4(
+        descale.reshape(-1), batch, rows, out.shape[1]
+    ).reshape(batch * rows, -1, 1)
+    return out.mul_(scale.view(torch.float8_e4m3fn).bfloat16()).flatten(1)
+
+
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _check_grouped_mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -516,6 +538,8 @@ def _check_grouped_mm_fp4(
                 f"a_descale and b_descale must be float8_e4m3fn, got {a_descale.dtype} and {b_descale.dtype}"
             )
     elif block_size == 32:  # mxfp4
+        if get_compute_capability(a.device)[0] < 10:
+            raise ValueError("block_size=32 (mxfp4) requires SM100 or newer")
         if a_descale.dtype != torch.uint8 or b_descale.dtype != torch.uint8:
             raise ValueError(
                 f"a_descale and b_descale must be uint8, got {a_descale.dtype} and {b_descale.dtype}"
@@ -590,6 +614,11 @@ def grouped_mm_fp4(
     -------
     torch.Tensor
         Output tensor ``(m_out, n)``.
+
+    Below SM100 only NVFP4 runs: the operands are dequantized to BF16, which
+    is exact, and multiplied by :func:`grouped_mm_bf16`. There are no cuDNN
+    plans to pick from, so any ``tactic >= 0`` returns ``None`` like an
+    out-of-range index.
     """
 
     if out is not None:
@@ -597,6 +626,19 @@ def grouped_mm_fp4(
 
     if backend == "cudnn":
         major, minor = get_compute_capability(a.device)
+        if major < 10:
+            if tactic >= 0:
+                return None
+            num_experts, n = b.shape[:2]
+            result = grouped_mm_bf16(
+                _nvfp4_to_bf16(a, a_descale, 1, a.shape[0]),
+                _nvfp4_to_bf16(b, b_descale, num_experts, n).view(num_experts, n, -1),
+                m_indptr,
+                out_dtype=torch.float32,
+            )
+            if alpha is not None:
+                result.mul_(alpha)
+            return result.to(out_dtype) if out is None else out.copy_(result)
         _check_cudnn_version(
             _cudnn_moe_block_scale_min_version(major * 10 + minor), "grouped_mm_fp4"
         )
