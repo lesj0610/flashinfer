@@ -952,7 +952,7 @@ def silu_and_mul_nvfp4_quantize(
     r"""Apply SwiGLU and NVFP4 quantization in one CuTe-DSL kernel.
 
     Computes ``silu(input[..., :K]) * input[..., K:]`` before quantization.
-    Requires CuTe-DSL and an SM100+ GPU.
+    Requires CuTe-DSL and an SM80+ GPU.
 
     Parameters
     ----------
@@ -998,12 +998,12 @@ def silu_and_mul_nvfp4_quantize(
     k = input.shape[-1] // 2
     assert k % sf_vec_size == 0
 
-    # Reject pre-Blackwell GPUs before CuTe-DSL compilation.
+    # Reject unsupported GPUs before CuTe-DSL compilation.
     major, minor = get_compute_capability(input.device)
-    if major < 10:
+    if major < 8:
         raise RuntimeError(
-            "silu_and_mul_nvfp4_quantize requires a Blackwell GPU (SM100+, compute "
-            f"capability >= 10.0); got SM{major}{minor}."
+            "silu_and_mul_nvfp4_quantize requires an SM80+ GPU (compute capability "
+            f">= 8.0); got SM{major}{minor}."
         )
 
     from ..cute_dsl import is_cute_dsl_available
@@ -1082,7 +1082,7 @@ def fp4_quantize(
         Backend to use for quantization:
 
         - ``"cuda"``: stable CUDA kernel (default).
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM80+, **experimental**).
           Supported combinations:
 
           * ``sf_vec_size=16, sf_use_ue8m0=False``: all layouts,
@@ -1569,7 +1569,7 @@ def nvfp4_quantize(
         Backend to use for quantization:
 
         - ``"cuda"``: stable CUDA kernel (default).
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**);
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM80+, **experimental**);
           supports all ``sfLayout`` values
           (``layout_128x4`` / ``layout_8x4`` / ``layout_linear``)
           and input dtypes fp16/bf16/float8_e4m3fn, but only
@@ -1852,7 +1852,7 @@ def mxfp4_quantize(
         Backend to use for quantization:
 
         - ``"cuda"``: stable CUDA kernel (default).
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM80+, **experimental**).
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Only used when
         ``backend == "cute-dsl"``.  Auto-detected from device capability
