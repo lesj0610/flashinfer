@@ -88,7 +88,7 @@ def _run_trtllm_gen_routed_fused_moe_case(
     gemm1_clamp_limit: torch.Tensor | None = None,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10]:
+    if compute_capability[0] not in [8, 9, 10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     torch.manual_seed(42)
     device = torch.device("cuda:0")
@@ -1832,7 +1832,7 @@ def test_fp8_block_scale_moe_fused_shared_routing_replay_cuda_graph():
 def test_fp4_block_scale_moe_fused_shared_routing_replay(num_tokens, num_shared):
     """FP4 sibling of the fused-shared routed-only replay contract."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10]:
+    if compute_capability[0] not in [8, 9, 10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     hidden_size = 1024
     intermediate_size = 512
