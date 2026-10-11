@@ -543,12 +543,14 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
   }
 
   if constexpr (!UE8M0_SF && IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
+#if !(defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000)
     if (vecMax == 0.0f) {
       if (SFout) {
         *SFout = 0;
       }
       return ReturnType{0};
     }
+#endif
 
     constexpr float E2M1_MAX_VALUE = 6.0f;
     float sfHighPrecision6;
@@ -679,6 +681,15 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
       error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 2));
       error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 2));
     }
+#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
+    // A zero block returns only now: every lane in the warp must reach the full-mask shuffles.
+    if (vecMax == 0.0f) {
+      if (SFout) {
+        *SFout = 0;
+      }
+      return ReturnType{0};
+    }
+#endif
 
     if (error4 < error6) {
       if (SFout) {
