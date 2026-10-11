@@ -71,10 +71,11 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
 )
 from ...autotuner import AutoTuner
-from ...cute_dsl.utils import convert_sf_to_mma_layout
+from ...cute_dsl.utils import convert_sf_from_mma_layout, convert_sf_to_mma_layout
 from ...cute_dsl.utils import require_cute_dsl_arch as _require_cute_dsl_arch_for
 from ...quantization.kernels.nvfp4_quantize import (
     SF_LAYOUT_128x4,
+    SF_LAYOUT_LINEAR,
     nvfp4_quantize_per_token_cute_dsl,
 )
 from ...quantization.nvfp4_quantization_utils import (
@@ -85,7 +86,7 @@ from ...quantization.nvfp4_quantization_utils import (
     nvfp4_e4m3_max,
     resolve_nvfp4_4over6,
 )
-from ...utils import supported_compute_capability
+from ...utils import get_compute_capability, supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
@@ -303,6 +304,137 @@ def validate_w4a8_inputs(
             raise ValueError(
                 f"{name} must use MMA scale strides {strides}, shape {shape}"
             )
+
+
+def _moe_dequantized(
+    x: torch.Tensor,
+    x_sf: Optional[torch.Tensor],
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    w1_weight: torch.Tensor,
+    w1_weight_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    fc2_input_scale: Optional[torch.Tensor],
+    w2_weight: torch.Tensor,
+    w2_weight_sf: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    num_local_experts: int,
+    local_expert_offset: int,
+    moe_output: torch.Tensor,
+    per_token_scale: Optional[torch.Tensor] = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+) -> torch.Tensor:
+    """W4A4, W4A8 or W4A16 MoE below SM100, where the tcgen05 kernels cannot run.
+
+    The activations and weights are dequantized to BF16, exactly (E8M0-scaled
+    rows with their largest scale taken out), and each expert's rows are
+    multiplied by ``grouped_mm_bf16`` in FP32. GEMM1's output is activated and
+    requantized as the kernel epilogue does, and the routed rows are summed in
+    FP32, so both finalize modes are deterministic. Tactics and PDL do not apply.
+    """
+    from ...grouped_mm.core import (
+        _dequantized_grouped_mm,
+        _e2m1_to_bf16,
+        _scale_rows_to_bf16,
+    )
+    from ...quantization import fp4_quantize, mxfp8_quantize
+    from ..runners import _combine_rows, _layout_from_topk
+
+    activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    num_tokens, rows = x.shape[0], token_selected_experts.numel()
+    layout = _layout_from_topk(
+        token_selected_experts,
+        num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
+        num_rows=rows,
+        segment_alignment=1,
+    )
+    row_to_token = layout.row_to_token
+    row_expert = layout.row_expert(rows)
+    is_mxfp8 = x.dtype == torch.float8_e4m3fn
+    block_size = 32 if is_mxfp8 else 16
+
+    def dequantize(values, scale, num_rows, block):
+        return _scale_rows_to_bf16(values, scale, 1, num_rows, block, swizzled=False)
+
+    def grouped_mm(a, a_exp, weight, weight_sf, alpha):
+        num_experts, n, k = weight.shape
+        b, b_exp = _scale_rows_to_bf16(
+            _e2m1_to_bf16(weight),
+            convert_sf_from_mma_layout(weight_sf, n, k * 2, num_experts, block_size),
+            num_experts,
+            n,
+            block_size,
+        )
+        return _dequantized_grouped_mm(
+            a, b, a_exp, b_exp, layout.m_indptr, alpha[:, None], None, torch.float32
+        )
+
+    if x.dtype == torch.bfloat16:
+        a, a_exp = x, None
+    else:
+        values = x.bfloat16() if is_mxfp8 else _e2m1_to_bf16(x)
+        a, a_exp = dequantize(values, x_sf, num_tokens, block_size)
+    alpha = w1_alpha.index_select(0, row_expert)
+    if per_token_scale is not None:
+        alpha = alpha * per_token_scale.index_select(0, row_to_token)
+    h = grouped_mm(
+        a.index_select(0, row_to_token),
+        None if a_exp is None else a_exp.index_select(0, row_to_token),
+        w1_weight,
+        w1_weight_sf,
+        alpha,
+    )
+    if gated:
+        # GEMM1 rows are interleaved in 64-row [up, gate] groups.
+        up, gate = h.view(rows, -1, 2, 64).unbind(2)
+        if situ_beta is not None:
+            gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+            if situ_linear_beta is not None:
+                up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+        elif activation == ActivationType.GegluTanh:
+            gate = torch.nn.functional.gelu(gate, approximate="tanh")
+        else:
+            gate = gate.clamp(max=swiglu_limit)
+            gate = gate * torch.sigmoid(swiglu_alpha * gate)
+            up = up.clamp(-swiglu_limit, swiglu_limit) + swiglu_beta
+        h = (gate * up).flatten(1)
+    else:
+        h = torch.relu(h).square()
+
+    alpha = w2_alpha.index_select(0, row_expert)
+    if x.dtype == torch.bfloat16:
+        a, a_exp = h.bfloat16(), None
+    elif is_mxfp8:
+        q, scale = mxfp8_quantize(h.bfloat16(), is_sf_swizzled_layout=False)
+        a, a_exp = dequantize(q.bfloat16(), scale, rows, 32)
+    else:
+        if per_token_scale is None:
+            # Like GEMM1's NVFP4 epilogue: no 4over6, whatever the environment says.
+            q, scale = fp4_quantize(
+                h.bfloat16(),
+                global_scale=fc2_input_scale,
+                is_sf_swizzled_layout=False,
+                nvfp4_4over6=None,
+            )
+        else:
+            q, scale, row_scale = nvfp4_quantize_per_token_cute_dsl(
+                h.to(output_dtype),
+                fc2_input_scale,
+                sf_layout=SF_LAYOUT_LINEAR,
+                nvfp4_4over6=nvfp4_4over6,
+            )
+            alpha = alpha * row_scale
+        a, a_exp = dequantize(_e2m1_to_bf16(q), scale, rows, 16)
+    out = grouped_mm(a, a_exp, w2_weight, w2_weight_sf, alpha)
+    return _combine_rows(out, layout.token_to_row, token_final_scales, out=moe_output)
 
 
 def _moe_core_impl(
@@ -538,6 +670,37 @@ def _moe_core_impl(
         assert moe_output.size(0) == num_tokens, (
             f"moe_output must be sliced to num_tokens rows before calling "
             f"_moe_core_impl (got {moe_output.size(0)}, expected {num_tokens})"
+        )
+
+    if x.is_cuda and get_compute_capability(x.device)[0] < 10:
+        if use_localized_path:
+            raise NotImplementedError(
+                "locality-domain localization is Rubin (SM107) only"
+            )
+        return _moe_dequantized(
+            x,
+            x_sf,
+            token_selected_experts,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            fc2_input_scale,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            num_local_experts,
+            local_expert_offset,
+            moe_output,
+            per_token_scale,
+            output_dtype,
+            activation,
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            situ_beta,
+            situ_linear_beta,
+            nvfp4_4over6,
         )
 
     # Fused finalize overlaps output zeroing with GEMM1.
@@ -900,8 +1063,8 @@ class CuteDslMoEWrapper:
     overlap during capture and replay. Auto-tuning is supported via the `tactic`
     parameter or `autotune()` context.
 
-    Supported architectures: SM100, SM103, and SM107. W4A8 is limited to
-    SM100 and SM103.
+    Supported architectures: SM100, SM103, and SM107, and SM80 to SM90
+    through a dequantize-to-BF16 software path. W4A8 is not supported on SM107.
 
     Attributes:
         num_experts: Total number of experts.
@@ -939,7 +1102,7 @@ class CuteDslMoEWrapper:
         ...     output = moe.run(x, x_sf, topk_ids, topk_weights, w1, w1_sf, ...)
     """
 
-    @supported_compute_capability([100, 103, 107])
+    @supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107])
     @flashinfer_api
     def __init__(
         self,
@@ -1499,7 +1662,7 @@ def _cute_dsl_fused_moe_impl(
     )
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107])
 @flashinfer_api(trace=cute_dsl_fused_moe_trace)
 def cute_dsl_fused_moe(
     x: torch.Tensor,
@@ -1543,8 +1706,9 @@ def cute_dsl_fused_moe(
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
-    Supported architectures: SM100, SM103, and SM107. W4A8 is limited to
-    SM100 and SM103. This is the simple functional API; for CUDA-graph support
+    Supported architectures: SM100, SM103, and SM107, and SM80 to SM90
+    through a dequantize-to-BF16 software path. W4A8 is not supported on SM107.
+    This is the simple functional API; for CUDA-graph support
     use :class:`CuteDslMoEWrapper` instead.
 
     Auto-tuning is controlled by the :func:`autotune` context manager::
@@ -1860,7 +2024,7 @@ def cute_dsl_fused_moe(
     return best_runner(inputs, tactic=best_tactic, **call_kwargs)
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107])
 @flashinfer_api(trace=cute_dsl_fused_moe_trace)
 def cute_dsl_fused_moe_nvfp4(
     x: torch.Tensor,
@@ -1953,7 +2117,7 @@ def cute_dsl_fused_moe_nvfp4(
     )
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103])
 @flashinfer_api(trace=cute_dsl_fused_moe_mxfp8_mxfp4_trace)
 def cute_dsl_fused_moe_mxfp8_mxfp4(
     x: torch.Tensor,
@@ -2039,7 +2203,7 @@ class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
     instance to that call's CUDA stream; create one wrapper per stream.
     """
 
-    @supported_compute_capability([100, 103])
+    @supported_compute_capability([80, 86, 87, 89, 90, 100, 103])
     @flashinfer_api
     def __init__(
         self,

@@ -487,8 +487,10 @@ def _scale_rows_to_bf16(
     batch: int,
     rows: int,
     block_size: int,
+    swizzled: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """BF16 ``[batch * rows, k]`` of ``values`` times 128x4-swizzled block scales.
+    """BF16 ``[batch * rows, k]`` of ``values`` times 128x4-swizzled block scales
+    (row-major ones with ``swizzled=False``).
 
     E4M3 scales (``block_size=16``) are applied exactly, with ``None`` row
     exponents. E8M0 scales (``block_size=32``) are applied relative to the
@@ -500,9 +502,11 @@ def _scale_rows_to_bf16(
     from ..trace.templates.gemm import _unswizzle_batched_sf_128x4
 
     out = values.view(batch * rows, -1, block_size)
-    scale = _unswizzle_batched_sf_128x4(
-        descale.reshape(-1), batch, rows, out.shape[1]
-    ).reshape(batch * rows, -1)
+    if swizzled:
+        descale = _unswizzle_batched_sf_128x4(
+            descale.reshape(-1), batch, rows, out.shape[1]
+        )
+    scale = descale.reshape(batch * rows, -1)
     if block_size == 16:
         scale = scale.view(torch.float8_e4m3fn).bfloat16()
         return out.mul_(scale.unsqueeze(-1)).flatten(1), None

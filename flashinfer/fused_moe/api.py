@@ -2234,12 +2234,13 @@ class CuteDslConfig:
     """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
+    SM80 to SM90 run a dequantize-to-BF16 software path.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM100, SM103 (Blackwell) + SM107 (Rubin) — tighten when CuteDSL adds more targets
-        return arch in (100, 103, 107)
+        # SM80-SM90 (software path), SM100, SM103 (Blackwell) + SM107 (Rubin)
+        return arch in (80, 86, 87, 89, 90, 100, 103, 107)
 
     @staticmethod
     def prepare_weights(
