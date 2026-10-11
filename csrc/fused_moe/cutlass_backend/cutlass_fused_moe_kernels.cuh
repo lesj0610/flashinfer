@@ -1320,15 +1320,48 @@ __device__ inline __nv_bfloat162 blockScaleBf16(uint32_t const s, int const row_
   return scale;
 }
 
+// blockScaleBf16<false> of the E4M3 scales in bytes 0 and 1 of x, as the low and high halves. The
+// scale bits placed in the BF16 exponent and mantissa fields read scale * 2^-120, subnormal scales
+// included, and two exact multiplies by 2^119 make it scale * 2^118; 0x7F and 0xFF become NaN.
+__device__ inline __nv_bfloat162 fusedScalePair(uint32_t const x) {
+  uint32_t y;
+  asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(y) : "r"(x));
+  uint32_t const magnitude = y & 0x007F007Fu;
+  uint32_t const nan = ((magnitude + 0x00010001u) & 0x00800080u) * 0xFFu;
+  uint32_t const bits = magnitude << 4 | (y << 8 & 0x80008000u) | nan;
+  __nv_bfloat162 scale, two119;
+  *reinterpret_cast<uint32_t*>(&scale) = bits;
+  *reinterpret_cast<uint32_t*>(&two119) = 0x7B007B00u;
+  return __hmul2(__hmul2(scale, two119), two119);
+}
+
+// Index (in 16-bit values) of the register that holds activation values k and k + 4 (k % 8 < 4) of
+// a row in the order fusedSmallMGemmKernel reads: per 8-row tile and pair of k16 steps, each lane
+// holds the b0/b1 registers of both steps in 16 bytes.
+// The fragment row of an activation row: each expert's rows start on a multiple of 8, at
+// row + 7 * expert rounded up, so a pass of 8-row tiles covers only that expert's rows.
+__device__ inline int64_t fusedPaddedRow(int64_t const row, int64_t const local_row,
+                                         int64_t const expert) {
+  return (row - local_row + 7 * expert + 7) / 8 * 8 + local_row;
+}
+
+__device__ inline int64_t fusedFragIndex(int64_t const row, int const k, int64_t const cols) {
+  int const reg = 3 - k % 4;
+  int64_t const pair = row / 8 * (cols / 32) + 4 * (k / 128) + k % 32 / 8;
+  return (pair * 32 + row % 8 * 4 + k % 128 / 32) * 8 + reg / 2 * 4 + reg % 2 * 2;
+}
+
 // One warp per row and 8 values per lane, so loads and the 16-byte stores are contiguous. BF16
 // output stores each group of 8 in the order 0, 4, 1, 5, 2, 6, 3, 7, for activations and weights
-// alike, which leaves the GEMM unchanged and lets E2M1 codes convert by bit placement.
+// alike, which leaves the GEMM unchanged and lets E2M1 codes convert by bit placement. With frag,
+// the values go to the B-fragment order of fusedSmallMGemmKernel instead.
 template <class OutputType, class InputType>
 __global__ void dequantizeBlockScaledRowsKernel(
     OutputType* out, uint8_t const* in, TmaWarpSpecializedGroupedGemmInput::ElementSF const* sf,
     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType const scaling_type,
     int64_t const* expert_first_token_offset, int64_t const* routed, int64_t const num_experts,
-    int64_t const rows, int64_t const rows_per_expert, int64_t const cols, int const* row_max) {
+    int64_t const rows, int64_t const rows_per_expert, int64_t const cols, int const* row_max,
+    bool const frag) {
   constexpr int kValues = 8;
   bool const nvfp4 = scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
   int const vec_shift = nvfp4 ? 4 : 5;
@@ -1410,7 +1443,14 @@ __global__ void dequantizeBlockScaledRowsKernel(
               kPaired ? v[j] | uint32_t(v[j + 4]) << 16 : v[2 * j] | uint32_t(v[2 * j + 1]) << 16;
         }
       }
-      *reinterpret_cast<uint4*>(out_row + col) = packed_out;
+      if (frag) {
+        // Pair j goes to register 3 - j of the same 16 bytes.
+        *reinterpret_cast<uint4*>(
+            out + fusedFragIndex(fusedPaddedRow(row, local_row, expert), col + 3, cols)) =
+            make_uint4(words[3], words[2], words[1], words[0]);
+      } else {
+        *reinterpret_cast<uint4*>(out_row + col) = packed_out;
+      }
     }
   }
 }
@@ -1442,21 +1482,567 @@ __global__ void restoreRowScalesKernel(OutputType* out, float const* in, int con
   }
 }
 
+// The fused GEMMs below: 64 weight rows per CTA, K a multiple of 128, and up to 512 rows per
+// expert on average, beyond which the dequantized GEMM is about as fast.
+constexpr int kFusedRowsPerCta = 64;
+constexpr int64_t kFusedMaxRowsPerExpert = 512;
+
+// Eight E2M1 codes of a weight row times their block scale, as BF16 pairs (codes 3 - j, 7 - j).
+// Each code goes to the BF16 exponent and mantissa fields, which reads 2^-126 * code (0.5 is
+// subnormal), and the scale carries 2^126, so the products are exact.
+__device__ inline uint4 fusedWeightValues(uint32_t const word, __nv_bfloat162 const scale) {
+  uint4 v;
+  uint32_t* r = reinterpret_cast<uint32_t*>(&v);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    uint32_t const q = word << (4 * j);
+    r[j] = (q & 0x80008000u) | (q & 0x70007000u) >> 6;
+  }
+  __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&v);
+#pragma unroll
+  for (int p = 0; p < 4; ++p) pairs[p] = __hmul2(pairs[p], scale);
+  return v;
+}
+
+__device__ inline void fusedMma(float (&d)[4], uint32_t const a0, uint32_t const a1,
+                                uint32_t const a2, uint32_t const a3, uint2 const b) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+      "{%0,%1,%2,%3};"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b.x), "r"(b.y));
+}
+
+// The blockIdx.y-th expert that has rows, or -1. Every thread of the CTA gets the result.
+__device__ inline int fusedActiveExpert(int64_t const* expert_first_token_offset,
+                                        int const num_experts) {
+  __shared__ int warp_counts[4];
+  __shared__ int found;
+  int const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  int const rank = blockIdx.y;
+  if (threadIdx.x == 0) found = -1;
+  int base = 0;
+  for (int e0 = 0; e0 < num_experts && base <= rank; e0 += blockDim.x) {
+    int const e = e0 + threadIdx.x;
+    bool const has_rows =
+        e < num_experts && expert_first_token_offset[e + 1] > expert_first_token_offset[e];
+    unsigned const ballot = __ballot_sync(0xFFFFFFFFu, has_rows);
+    if (lane == 0) warp_counts[warp] = __popc(ballot);
+    __syncthreads();
+    int before = base + __popc(ballot & ((1u << lane) - 1));
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+      before += w < warp ? warp_counts[w] : 0;
+      base += warp_counts[w];
+    }
+    if (has_rows && before == rank) found = e;
+    __syncthreads();
+  }
+  __syncthreads();
+  return found;
+}
+
+// Few rows: the E2M1 weights are dequantized in registers as they are read, without a BF16 copy;
+// each pass of a CTA reads its 64 rows again. The weight rows are the mma M and the activation rows
+// the N, 8 * kTilesT per pass, which reuse each converted weight register. A CTA takes 64 weight
+// rows of one expert; warps 0-1 and 2-3 take 32 rows each and split K in 128-k chunks. A thread
+// reads 16 bytes (32 codes) of weight rows g + 16 mt + 8 h per chunk, one chunk ahead, from one
+// base: the rows sit (16 mt + 8 h) rows apart in the weights and (16 mt + 8 h) * 16 bytes apart in
+// the 128x4 scale layout. The activations come in the order of fusedFragIndex: one 16-byte load
+// feeds two mma, and the k order within a chunk matches the weight reads. With an ActType, the
+// activations are its quantized rows instead: a pass takes up to 8 of the expert's rows, which the
+// CTA dequantizes into shared memory in that order, as many chunks at a time as fit. MX weight rows
+// take their largest scale first. The epilogue puts back the row scales and alpha and writes the
+// output type.
+template <class OutputType, bool kMx, int kTilesT, class ActType = void>
+__global__ void __launch_bounds__(128, 3)
+    fusedSmallMGemmKernel(OutputType* out, void const* act,
+                          TmaWarpSpecializedGroupedGemmInput::ElementSF const* act_sf,
+                          uint8_t const* weights,
+                          TmaWarpSpecializedGroupedGemmInput::ElementSF const* weight_sf,
+                          int const* act_row_max, float const* alpha,
+                          int64_t const* expert_first_token_offset, int const num_experts,
+                          int64_t const act_tiles, int64_t const n, int64_t const k) {
+  constexpr int kTilesM = 2, kWarpsK = 2, kWarpRows = 16 * kTilesM;
+  constexpr bool kStage = !std::is_void_v<ActType>;
+  static_assert(!kStage || kTilesT == 1);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890)
+  constexpr int kStageChunks = 8;  // 100 KB of shared memory per SM still holds three CTAs
+#else
+  constexpr int kStageChunks = 16;
+#endif
+  __shared__ float partial[4][8 * kTilesT][kWarpRows];
+  __shared__ int weight_row_max[kFusedRowsPerCta];
+  __shared__ uint4 staged[kStage ? kStageChunks * 4 * 32 : 1];
+  __shared__ int act_max[8];
+  // With fewer CTA rows than experts, CTA row y takes the y-th expert that has rows.
+  int const expert = gridDim.y == num_experts
+                         ? blockIdx.y
+                         : fusedActiveExpert(expert_first_token_offset, num_experts);
+  if (expert < 0) return;
+  int64_t const row_begin = expert_first_token_offset[expert];
+  int64_t const row_end = expert_first_token_offset[expert + 1];
+  if (row_begin == row_end) return;
+  int const warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
+  int const kw = warp % kWarpsK;
+  int64_t const n_cta = int64_t(blockIdx.x) * kFusedRowsPerCta;
+  int const m_cta = warp / kWarpsK * kWarpRows;
+  int const chunks = static_cast<int>(k / 128);
+  int const vecs_per_row = static_cast<int>(k / (kMx ? 32 : 16));
+  int64_t const row_bytes = k / 2;
+  auto const scaling_type = kMx ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+                                : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+  uint8_t const* const w_base = weights + (expert * n + n_cta + m_cta + g) * row_bytes + 16 * t;
+  auto const* const sf_row0 =
+      weight_sf + getOffsetWeightSF(expert, n, k, scaling_type) +
+      get_sf_out_offset_128x4(static_cast<int>(n_cta + m_cta + g), 0, vecs_per_row);
+  int row_max[kTilesM][2];
+#pragma unroll
+  for (int mt = 0; mt < kTilesM; ++mt) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      row_max[mt][h] = 0;
+      if (kMx) {
+        // The row's scale words sit 512 bytes apart; the 4 threads of the row take every fourth.
+        auto const* sf_row = sf_row0 + (16 * mt + 8 * h) * 16;
+        uint32_t m4 = 0;
+        for (int w = t; w < vecs_per_row / 4; w += 4) {
+          m4 = __vmaxu4(m4, *reinterpret_cast<uint32_t const*>(sf_row + w * 512));
+        }
+        int m =
+            max(max(int(m4 & 0xFF), int(m4 >> 8 & 0xFF)), max(int(m4 >> 16 & 0xFF), int(m4 >> 24)));
+        m = max(m, __shfl_xor_sync(0xFFFFFFFFu, m, 1));
+        row_max[mt][h] = max(m, __shfl_xor_sync(0xFFFFFFFFu, m, 2));
+        if (t == 0 && kw == 0) weight_row_max[m_cta + 16 * mt + 8 * h + g] = row_max[mt][h];
+      }
+    }
+  }
+  // Thread t's scales: MX vec = 4c + t, NVFP4 vecs 8c + 2t and + 1, at (vec / 4) * 512 + vec % 4.
+  int const vec0 = kMx ? 4 * kw + t : 8 * kw + 2 * t;
+  auto const* const sf_base = sf_row0 + (vec0 >> 2) * 512 + (vec0 & 3);
+  struct Chunk {
+    uint4 w[kTilesM][2];
+    uint32_t sf[kTilesM][2];
+  };
+  constexpr int kSfStep = kWarpsK * (kMx ? 512 : 1024);
+  int const my_chunks = (chunks - kw + kWarpsK - 1) / kWarpsK;
+  int64_t const tile_stride = k / 32 * 32;  // uint4 per 8-row activation tile
+  for (int64_t row0 = row_begin; row0 < row_end; row0 += 8 * kTilesT) {
+    int64_t const tile = fusedPaddedRow(row0, row0 - row_begin, expert) / 8;
+    // Staged rows: lane g reads row min(g, rows - 1) of the pass, 4 * rows uint4 per k32 step.
+    int const rows = kStage ? static_cast<int>(std::min<int64_t>(8, row_end - row0)) : 8;
+    int const b_step = kStage ? 4 * rows : 32;
+    int const seg_chunks = kStage ? kStageChunks * 8 / rows & ~3 : 0;
+    float acc[kTilesM][kTilesT][4] = {};
+    uint8_t const* wp = w_base + kw * 64;
+    auto const* sp = sf_base;
+    uint4 const* bq = static_cast<uint4 const*>(act) + (tile * (k / 32) + 4 * kw) * 32 + lane;
+    int64_t boff[kTilesT];
+#pragma unroll
+    for (int tt = 0; tt < kTilesT; ++tt) {
+      boff[tt] = kStage ? 0 : (std::min(tile + tt, act_tiles - 1) - tile) * tile_stride;
+    }
+    // Per-tensor activations count as E4M3 1.0 or E8M0 127 blocks.
+    int64_t const act_sf_expert =
+        kStage ? getOffsetActivationSF(expert, row_begin, k, scaling_type) : 0;
+    auto act_scale = [&](int64_t const row, int const vec) {
+      if (!act_sf) return kMx ? 127u : 0x38u;
+      return uint32_t(
+          act_sf[act_sf_expert +
+                 get_sf_out_offset_128x4(static_cast<int>(row - row_begin), 0, vecs_per_row) +
+                 (vec >> 2) * 512 + (vec & 3)]);
+    };
+    if constexpr (kStage && kMx) {
+      for (int r = warp; r < rows; r += 4) {
+        int s = 0;
+        for (int v = lane; v < vecs_per_row; v += 32) s = max(s, int(act_scale(row0 + r, v)));
+#pragma unroll
+        for (int o = 16; o > 0; o /= 2) s = max(s, __shfl_xor_sync(0xFFFFFFFFu, s, o));
+        if (lane == 0) act_max[r] = s;
+      }
+    }
+    // Dequantizes chunks seg0 on of the pass's rows into staged, 8 values per thread and step, as
+    // the pairs (j, j + 4) of fusedWeightValues. E2M1 codes become 2^-126 * code and E4M3 values
+    // 2^-120 * value in the BF16 exponent and mantissa fields (0x7F and 0xFF get an all-ones
+    // exponent), and the block scale carries the rest: NVFP4 rows end up at 2^-8 times their
+    // values, MX rows relative to their largest scale.
+    auto stage = [&](int const seg0) {
+      int const groups = std::min(seg_chunks, chunks - seg0) * 16;
+      for (int idx = threadIdx.x; idx < rows * groups; idx += blockDim.x) {
+        int const r = idx / groups;
+        int64_t const row = row0 + r;
+        int const kk = seg0 * 128 + idx % groups * 8;
+        uint4 v;
+        __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&v);
+        uint32_t bits[4];
+        __nv_bfloat162 scale;
+        if constexpr (kMx) {
+          uint2 const x =
+              *reinterpret_cast<uint2 const*>(static_cast<uint8_t const*>(act) + row * k + kk);
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            uint32_t y;
+            asm("prmt.b32 %0, %1, %2, %3;"
+                : "=r"(y)
+                : "r"(x.x), "r"(x.y), "r"(0x4400u + j * 0x1111u));
+            uint32_t const magnitude = y & 0x007F007Fu;
+            bits[j] = magnitude << 4 | (y << 8 & 0x80008000u) |
+                      ((magnitude + 0x00010001u) & 0x00800080u) * 0xFFu;
+          }
+          scale = blockScaleBf16<true>(act_scale(row, kk / 32), act_max[r] + 6);
+        } else {
+          uint32_t const word = *reinterpret_cast<uint32_t const*>(
+              static_cast<uint8_t const*>(act) + row * (k / 2) + kk / 2);
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            uint32_t const x = word >> (4 * j);
+            bits[j] = (x << 6 & 0x01C001C0u) | (x << 12 & 0x80008000u);
+          }
+          scale = blockScaleBf16<false>(act_scale(row, kk / 16), 0);
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          pairs[3 - j] = __hmul2(*reinterpret_cast<__nv_bfloat162 const*>(&bits[j]), scale);
+        }
+        staged[((kk / 128 - seg0) * 4 + kk % 32 / 8) * b_step + r * 4 + kk % 128 / 32] = v;
+      }
+    };
+    auto load = [&](Chunk& ch) {
+#pragma unroll
+      for (int mt = 0; mt < kTilesM; ++mt) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          ch.w[mt][h] = *reinterpret_cast<uint4 const*>(wp + (16 * mt + 8 * h) * row_bytes);
+          ch.sf[mt][h] =
+              kMx ? uint32_t(sp[(16 * mt + 8 * h) * 16])
+                  : uint32_t(*reinterpret_cast<uint16_t const*>(sp + (16 * mt + 8 * h) * 16));
+        }
+      }
+      wp += kWarpsK * 64;
+      sp += kSfStep;
+    };
+    auto compute = [&](Chunk const& ch) {
+      __nv_bfloat162 scale[kTilesM][2][2];
+#pragma unroll
+      for (int mt = 0; mt < kTilesM; ++mt) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          if constexpr (kMx) {
+            scale[mt][h][0] = scale[mt][h][1] = blockScaleBf16<kMx>(ch.sf[mt][h], row_max[mt][h]);
+          } else {
+            __nv_bfloat162 const pair = fusedScalePair(ch.sf[mt][h]);
+            scale[mt][h][0] = __low2bfloat162(pair);
+            scale[mt][h][1] = __high2bfloat162(pair);
+          }
+        }
+      }
+#pragma unroll
+      for (int wi = 0; wi < 4; ++wi) {
+        uint4 lo[kTilesM], hi[kTilesM];
+#pragma unroll
+        for (int mt = 0; mt < kTilesM; ++mt) {
+          lo[mt] = fusedWeightValues(reinterpret_cast<uint32_t const*>(&ch.w[mt][0])[wi],
+                                     scale[mt][0][wi / 2]);
+          hi[mt] = fusedWeightValues(reinterpret_cast<uint32_t const*>(&ch.w[mt][1])[wi],
+                                     scale[mt][1][wi / 2]);
+        }
+        uint4 b[kTilesT];
+#pragma unroll
+        for (int tt = 0; tt < kTilesT; ++tt) b[tt] = bq[boff[tt] + wi * b_step];
+        if constexpr (kTilesT == 1) {
+#pragma unroll
+          for (int mt = 0; mt < kTilesM; ++mt) {
+            fusedMma(acc[mt][0], lo[mt].x, hi[mt].x, lo[mt].y, hi[mt].y,
+                     make_uint2(b[0].x, b[0].y));
+            fusedMma(acc[mt][0], lo[mt].z, hi[mt].z, lo[mt].w, hi[mt].w,
+                     make_uint2(b[0].z, b[0].w));
+          }
+        } else {
+          // Both k16 steps go to the same accumulators, so all of the first step comes first.
+#pragma unroll
+          for (int tt = 0; tt < kTilesT; ++tt) {
+#pragma unroll
+            for (int mt = 0; mt < kTilesM; ++mt) {
+              fusedMma(acc[mt][tt], lo[mt].x, hi[mt].x, lo[mt].y, hi[mt].y,
+                       make_uint2(b[tt].x, b[tt].y));
+            }
+          }
+#pragma unroll
+          for (int tt = 0; tt < kTilesT; ++tt) {
+#pragma unroll
+            for (int mt = 0; mt < kTilesM; ++mt) {
+              fusedMma(acc[mt][tt], lo[mt].z, hi[mt].z, lo[mt].w, hi[mt].w,
+                       make_uint2(b[tt].z, b[tt].w));
+            }
+          }
+        }
+      }
+      bq += 4 * kWarpsK * b_step;
+    };
+    Chunk c0, c1;
+    if (my_chunks > 0) load(c0);
+    int i = 0;
+    if constexpr (kStage) {
+      // A warp takes seg_chunks / 2 chunks per segment, an even number, so only the last segment
+      // can end on c0.
+      for (int seg0 = 0; seg0 < chunks; seg0 += seg_chunks) {
+        __syncthreads();
+        stage(seg0);
+        __syncthreads();
+        int const my_end = std::min(my_chunks, (seg0 + seg_chunks - kw + 1) / 2);
+        bq = staged + kw * 4 * b_step + std::min(g, rows - 1) * 4 + t;
+        for (; i + 1 < my_end; i += 2) {
+          load(c1);
+          compute(c0);
+          if (i + 2 < my_chunks) load(c0);
+          compute(c1);
+        }
+        if (i < my_end) {
+          compute(c0);
+          ++i;
+        }
+      }
+    } else {
+      for (; i + 1 < my_chunks; i += 2) {
+        load(c1);
+        compute(c0);
+        if (i + 2 < my_chunks) load(c0);
+        compute(c1);
+      }
+      if (i < my_chunks) compute(c0);
+    }
+#pragma unroll
+    for (int mt = 0; mt < kTilesM; ++mt) {
+#pragma unroll
+      for (int tt = 0; tt < kTilesT; ++tt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          partial[warp][8 * tt + 2 * t + e % 2][16 * mt + g + 8 * (e / 2)] = acc[mt][tt][e];
+        }
+      }
+    }
+    __syncthreads();
+    // The sums hold the values scaled down (NVFP4 2^-8, staged 2^-16; MX relative to the rows'
+    // largest scales), so only alpha's mantissa goes on them and its exponent with the rest.
+    int alpha_exponent;
+    float const alpha_mantissa = frexpf(alpha ? alpha[expert] : 1.0f, &alpha_exponent);
+    for (int idx = threadIdx.x; idx < 8 * kTilesT * kFusedRowsPerCta; idx += blockDim.x) {
+      int const r = idx / kFusedRowsPerCta, col = idx % kFusedRowsPerCta;
+      int const m_warp = col / kWarpRows, wcol = col % kWarpRows;
+      int64_t const row = row0 + r;
+      if (row >= row_begin && row < row_end) {
+        float const sum =
+            partial[m_warp * kWarpsK][r][wcol] + partial[m_warp * kWarpsK + 1][r][wcol];
+        int const act_exponent = kStage        ? act_max[r] - 127
+                                 : act_row_max ? act_row_max[row] - 127
+                                               : 0;
+        int const exponent = (kMx      ? act_exponent + weight_row_max[col] - 127
+                              : kStage ? 16
+                                       : 8) +
+                             alpha_exponent;
+        out[row * n + n_cta + col] = OutputType(ldexpf(sum * alpha_mantissa, exponent));
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// More rows: a pass takes 64 of the expert's rows (8 tiles of fusedFragIndex order) for 64 weight
+// rows. Warp w takes weight rows 16 w + g and + 8 over all of K, one chunk ahead as above, and the
+// pass's activation tiles come through shared memory (cp.async, two buffers) for all 4 warps, so
+// each converted weight register feeds 16 mma. Each pass reads the CTA's weights again.
+template <class OutputType, bool kMx>
+__global__ void __launch_bounds__(128, 3)
+    fusedTiledGemmKernel(OutputType* out, uint4 const* act, uint8_t const* weights,
+                         TmaWarpSpecializedGroupedGemmInput::ElementSF const* weight_sf,
+                         int const* act_row_max, float const* alpha,
+                         int64_t const* expert_first_token_offset, int const num_experts,
+                         int64_t const act_tiles, int64_t const n, int64_t const k) {
+  constexpr int kTiles = 8;
+  __shared__ uint4 tiles[2][kTiles][128];
+  __shared__ int weight_row_max[kFusedRowsPerCta];
+  int const expert = gridDim.y == num_experts
+                         ? blockIdx.y
+                         : fusedActiveExpert(expert_first_token_offset, num_experts);
+  if (expert < 0) return;
+  int64_t const row_begin = expert_first_token_offset[expert];
+  int64_t const row_end = expert_first_token_offset[expert + 1];
+  if (row_begin == row_end) return;
+  int const warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
+  int64_t const n_cta = int64_t(blockIdx.x) * kFusedRowsPerCta;
+  int const chunks = static_cast<int>(k / 128);
+  int const vecs_per_row = static_cast<int>(k / (kMx ? 32 : 16));
+  int64_t const row_bytes = k / 2;
+  auto const scaling_type = kMx ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+                                : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+  uint8_t const* const w_base = weights + (expert * n + n_cta + 16 * warp + g) * row_bytes + 16 * t;
+  auto const* const sf_row0 =
+      weight_sf + getOffsetWeightSF(expert, n, k, scaling_type) +
+      get_sf_out_offset_128x4(static_cast<int>(n_cta + 16 * warp + g), 0, vecs_per_row);
+  int row_max[2] = {0, 0};
+  if constexpr (kMx) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      uint32_t m4 = 0;
+      for (int w = t; w < vecs_per_row / 4; w += 4) {
+        m4 = __vmaxu4(m4, *reinterpret_cast<uint32_t const*>(sf_row0 + 8 * h * 16 + w * 512));
+      }
+      int m =
+          max(max(int(m4 & 0xFF), int(m4 >> 8 & 0xFF)), max(int(m4 >> 16 & 0xFF), int(m4 >> 24)));
+      m = max(m, __shfl_xor_sync(0xFFFFFFFFu, m, 1));
+      row_max[h] = max(m, __shfl_xor_sync(0xFFFFFFFFu, m, 2));
+      if (t == 0) weight_row_max[16 * warp + 8 * h + g] = row_max[h];
+    }
+  }
+  // Thread t's scales: MX vec = 4c + t, NVFP4 vecs 8c + 2t and + 1, at (vec / 4) * 512 + vec % 4.
+  auto const* const sf_base = sf_row0 + (kMx ? t : t / 2 * 512 + 2 * t % 4);
+  constexpr int kSfStep = kMx ? 512 : 1024;
+  int64_t const tile_stride = k / 32 * 32;
+  struct Chunk {
+    uint4 w[2];
+    uint32_t sf[2];
+  };
+  for (int64_t row0 = row_begin; row0 < row_end; row0 += 8 * kTiles) {
+    int64_t const tile = fusedPaddedRow(row0, row0 - row_begin, expert) / 8;
+    float acc[kTiles][4] = {};
+    uint8_t const* wp = w_base;
+    auto const* sp = sf_base;
+    // Chunk c of the pass's 8 tiles is 8 runs of 128 uint4; thread i copies element i of each.
+    auto copy = [&](int const c, int const buf) {
+#pragma unroll
+      for (int q = 0; q < kTiles; ++q) {
+        uint4 const* src =
+            act + std::min(tile + q, act_tiles - 1) * tile_stride + c * 128 + threadIdx.x;
+        uint32_t const dst =
+            static_cast<uint32_t>(__cvta_generic_to_shared(&tiles[buf][q][threadIdx.x]));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src));
+      }
+      asm volatile("cp.async.commit_group;");
+    };
+    auto load = [&](Chunk& ch) {
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        ch.w[h] = *reinterpret_cast<uint4 const*>(wp + 8 * h * row_bytes);
+        ch.sf[h] = kMx ? uint32_t(sp[8 * h * 16])
+                       : uint32_t(*reinterpret_cast<uint16_t const*>(sp + 8 * h * 16));
+      }
+      wp += 64;
+      sp += kSfStep;
+    };
+    auto compute = [&](Chunk const& ch, int const buf) {
+      __nv_bfloat162 scale[2][2];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        if constexpr (kMx) {
+          scale[h][0] = scale[h][1] = blockScaleBf16<kMx>(ch.sf[h], row_max[h]);
+        } else {
+          __nv_bfloat162 const pair = fusedScalePair(ch.sf[h]);
+          scale[h][0] = __low2bfloat162(pair);
+          scale[h][1] = __high2bfloat162(pair);
+        }
+      }
+#pragma unroll
+      for (int wi = 0; wi < 4; ++wi) {
+        uint4 const lo =
+            fusedWeightValues(reinterpret_cast<uint32_t const*>(&ch.w[0])[wi], scale[0][wi / 2]);
+        uint4 const hi =
+            fusedWeightValues(reinterpret_cast<uint32_t const*>(&ch.w[1])[wi], scale[1][wi / 2]);
+        uint4 b[kTiles];
+#pragma unroll
+        for (int tt = 0; tt < kTiles; ++tt) b[tt] = tiles[buf][tt][wi * 32 + lane];
+#pragma unroll
+        for (int tt = 0; tt < kTiles; ++tt) {
+          fusedMma(acc[tt], lo.x, hi.x, lo.y, hi.y, make_uint2(b[tt].x, b[tt].y));
+        }
+#pragma unroll
+        for (int tt = 0; tt < kTiles; ++tt) {
+          fusedMma(acc[tt], lo.z, hi.z, lo.w, hi.w, make_uint2(b[tt].z, b[tt].w));
+        }
+      }
+    };
+    // Before chunk c's buffer is read, every warp waits for its copies and has left chunk c - 1,
+    // whose buffer then takes chunk c + 1.
+    Chunk c0, c1;
+    load(c0);
+    copy(0, 0);
+    int c = 0;
+    for (; c + 1 < chunks; c += 2) {
+      load(c1);
+      asm volatile("cp.async.wait_group 0;");
+      __syncthreads();
+      copy(c + 1, 1);
+      compute(c0, 0);
+      if (c + 2 < chunks) load(c0);
+      asm volatile("cp.async.wait_group 0;");
+      __syncthreads();
+      if (c + 2 < chunks) copy(c + 2, 0);
+      compute(c1, 1);
+    }
+    if (c < chunks) {
+      asm volatile("cp.async.wait_group 0;");
+      __syncthreads();
+      compute(c0, 0);
+    }
+    __syncthreads();
+    // The tiles' space holds the pass's sums for coalesced stores.
+    auto sums = reinterpret_cast<float(*)[kFusedRowsPerCta]>(&tiles[0][0][0]);
+#pragma unroll
+    for (int tt = 0; tt < kTiles; ++tt) {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        sums[8 * tt + 2 * t + e % 2][16 * warp + g + 8 * (e / 2)] = acc[tt][e];
+      }
+    }
+    __syncthreads();
+    // As above: only alpha's mantissa goes on the scaled-down sums.
+    int alpha_exponent;
+    float const alpha_mantissa = frexpf(alpha ? alpha[expert] : 1.0f, &alpha_exponent);
+    for (int idx = threadIdx.x; idx < 8 * kTiles * kFusedRowsPerCta; idx += blockDim.x) {
+      int const r = idx / kFusedRowsPerCta, col = idx % kFusedRowsPerCta;
+      int64_t const row = row0 + r;
+      if (row < row_end) {
+        int const exponent =
+            (kMx ? (act_row_max ? act_row_max[row] - 127 : 0) + weight_row_max[col] - 127 : 8) +
+            alpha_exponent;
+        out[row * n + n_cta + col] = OutputType(ldexpf(sums[r][col] * alpha_mantissa, exponent));
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// Few rows of an E2M1 weight GEMM go to the fused GEMMs, which dequantize the weights in registers.
+template <class WeightType>
+bool fusedGemm(int64_t const num_rows, int64_t const n, int64_t const k, int const num_experts) {
+  return std::is_same_v<WeightType, Fp4Type> && k % 128 == 0 && n % kFusedRowsPerCta == 0 &&
+         num_rows <= kFusedMaxRowsPerExpert * num_experts;
+}
+
 // The scratch of dequantizedGroupedGemm in bytes and workspace order: the dequantized activations
 // and weights, the MX row maxima and alpha's exponent, alpha's mantissa and the FP32 GEMM output.
+// Up to 8 rows per expert on average take one 8-row pass of the fused GEMM that reads the
+// quantized activations; more take passes of 32 rows (up to 32 per expert on average) or 64 rows
+// of activations dequantized beforehand. The fused GEMMs take the MX weight rows' largest scales
+// and alpha's exponent themselves.
 template <class OutputType, class InputType, class WeightType>
 std::array<size_t, 5> dequantizedGemmScratch(int64_t const num_rows, int64_t const n,
                                              int64_t const k, int const num_experts,
                                              bool const act_sf, bool const alpha) {
   constexpr bool mx = !std::is_same_v<InputType, Fp4Type>;
   using GemmType = std::conditional_t<mx, __nv_bfloat16, OutputType>;
-  int64_t const maxes =
-      mx ? (act_sf ? num_rows : 0) + num_experts * n + (alpha ? num_experts : 0) : 0;
-  return {static_cast<size_t>(num_rows * k) * sizeof(GemmType),
-          static_cast<size_t>(num_experts * n * k) * sizeof(GemmType),
+  bool const fused = fusedGemm<WeightType>(num_rows, n, k, num_experts);
+  bool const staged = fused && num_rows <= 8 * num_experts;
+  int64_t const maxes = (mx && act_sf && !staged ? num_rows : 0) +
+                        (mx && !fused ? num_experts * n : 0) +
+                        (mx && alpha && !fused ? num_experts : 0);
+  int64_t const a = staged  ? 0
+                    : fused ? ceilDiv(num_rows + 7 * num_experts, 8) * 8 * k
+                            : num_rows * k;
+  return {static_cast<size_t>(a) * (fused ? sizeof(__nv_bfloat16) : sizeof(GemmType)),
+          static_cast<size_t>(fused ? 0 : num_experts * n * k) * sizeof(GemmType),
           static_cast<size_t>(maxes) * sizeof(int),
-          static_cast<size_t>(mx && alpha ? num_experts : 0) * sizeof(float),
-          static_cast<size_t>(mx ? num_rows * n : 0) * sizeof(float)};
+          static_cast<size_t>(mx && alpha && !fused ? num_experts : 0) * sizeof(float),
+          static_cast<size_t>(mx && !fused ? num_rows * n : 0) * sizeof(float)};
 }
 
 // The GEMM workspace that dequantizedGroupedGemm takes at most.
@@ -1495,6 +2081,9 @@ void dequantizedGroupedGemm(
     int const blocks = static_cast<int>(std::min<int64_t>(rows, 4096));
     kernel<<<blocks, 128, 0, stream>>>(args...);
   };
+  bool const fused = fusedGemm<WeightType>(num_rows, n, k, num_experts);
+  bool const staged = fused && num_rows <= 8 * num_experts;
+  int64_t const a_rows = fused ? ceilDiv(num_rows + 7 * num_experts, 8) * 8 : num_rows;
   auto const sizes = dequantizedGemmScratch<OutputType, InputType, WeightType>(
       num_rows, n, k, num_experts, input_sf != nullptr, alpha != nullptr);
   TLLM_CHECK_WITH_INFO(tensorrt_llm::common::calculateTotalWorkspaceSize(
@@ -1508,8 +2097,8 @@ void dequantizedGroupedGemm(
   }
   void *const a = scratch[0], *const b = scratch[1], *const row_max = scratch[2];
   void *const alpha_mantissa = scratch[3], *const c = scratch[4];
-  int64_t const act_maxes = mx && input_sf ? num_rows : 0;
-  int64_t const weight_maxes = mx ? num_experts * n : 0;
+  int64_t const act_maxes = mx && input_sf && !staged ? num_rows : 0;
+  int64_t const weight_maxes = mx && !fused ? num_experts * n : 0;
   int* const act_row_max = act_maxes ? static_cast<int*>(row_max) : nullptr;
   int* const weight_row_max = weight_maxes ? static_cast<int*>(row_max) + act_maxes : nullptr;
   int* const alpha_exponent =
@@ -1530,14 +2119,40 @@ void dequantizedGroupedGemm(
            static_cast<int64_t const*>(nullptr), expert_first_token_offset, int64_t(num_experts),
            num_experts * n, n, k);
   }
+  if (fused) {
+    // At most num_rows experts have rows, so fewer rows than experts launch only that many CTA
+    // rows.
+    dim3 const grid(static_cast<unsigned>(n / kFusedRowsPerCta),
+                    static_cast<unsigned>(std::min<int64_t>(num_experts, num_rows)));
+    if (staged) {
+      fusedSmallMGemmKernel<OutputType, mx, 1, InputType><<<grid, 128, 0, stream>>>(
+          output, input, input_sf, static_cast<uint8_t const*>(weights), weight_sf, nullptr, alpha,
+          expert_first_token_offset, num_experts, 0, n, k);
+      return;
+    }
+    launch(dequantizeBlockScaledRowsKernel<__nv_bfloat16, InputType>, num_rows * 32,
+           static_cast<__nv_bfloat16*>(a), static_cast<uint8_t const*>(input), input_sf,
+           scaling_type, expert_first_token_offset, static_cast<int64_t const*>(nullptr),
+           int64_t(num_experts), num_rows, num_rows, k, static_cast<int const*>(act_row_max), true);
+    if (num_rows <= 32 * num_experts) {
+      fusedSmallMGemmKernel<OutputType, mx, 4><<<grid, 128, 0, stream>>>(
+          output, a, nullptr, static_cast<uint8_t const*>(weights), weight_sf, act_row_max, alpha,
+          expert_first_token_offset, num_experts, a_rows / 8, n, k);
+    } else {
+      fusedTiledGemmKernel<OutputType, mx><<<grid, 128, 0, stream>>>(
+          output, static_cast<uint4 const*>(a), static_cast<uint8_t const*>(weights), weight_sf,
+          act_row_max, alpha, expert_first_token_offset, num_experts, a_rows / 8, n, k);
+    }
+    return;
+  }
   launch(dequantizeBlockScaledRowsKernel<GemmType, InputType>, num_rows * 32,
          static_cast<GemmType*>(a), static_cast<uint8_t const*>(input), input_sf, scaling_type,
          expert_first_token_offset, static_cast<int64_t const*>(nullptr), int64_t(num_experts),
-         num_rows, num_rows, k, static_cast<int const*>(act_row_max));
+         num_rows, num_rows, k, static_cast<int const*>(act_row_max), false);
   launch(dequantizeBlockScaledRowsKernel<GemmType, WeightType>, num_experts * n * 32,
          static_cast<GemmType*>(b), static_cast<uint8_t const*>(weights), weight_sf, scaling_type,
          static_cast<int64_t const*>(nullptr), expert_first_token_offset, int64_t(num_experts),
-         num_experts * n, n, k, static_cast<int const*>(weight_row_max));
+         num_experts * n, n, k, static_cast<int const*>(weight_row_max), false);
   GroupedGemmInput<GemmType, GemmType, GemmOutputType, GemmOutputType> gemm_input{
       static_cast<GemmType*>(a),
       expert_first_token_offset + 1,
