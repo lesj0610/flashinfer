@@ -27,13 +27,8 @@ from cutlass import Float32, Int32, Int64, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ..cute_dsl.fp4_common import (
-    bfloat2_habs2,
-    bfloat2_hmax2,
-    habs2,
-    hmax2,
-    target_inline_asm,
-)
+from ..cute_dsl.fp4_common import habs2, hmax2, bfloat2_habs2, bfloat2_hmax2
+from ..cute_dsl.fp4_common import target_inline_asm
 from .nvfp4_quantization_utils import NVFP44Over6Config, NVFP44Over6ErrMode
 
 
