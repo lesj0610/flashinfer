@@ -113,7 +113,7 @@ def test_cutlass_bf16_config_architectures_and_registration():
         assert CutlassMxfp8Config.supported(arch)
     assert not CutlassBf16Config.supported(80)
     assert not CutlassW4A16Config.supported(100)
-    assert not CutlassNvfp4Config.supported(90)
+    assert not CutlassNvfp4Config.supported(75)
     assert not CutlassFp8BlockConfig.supported(100)
     assert not CutlassMxfp8Config.supported(90)
     assert not CutlassMxfp8Config.supported(110)
@@ -2441,7 +2441,7 @@ def test_cutlass_w4a16_autotuned_compound_tactic_and_cuda_graph():
     _assert_numerically_close(captured, expected, rtol=5e-2, atol=2e-2)
 
 
-def _is_cutlass_nvfp4_runtime_supported() -> bool:
+def _is_cutlass_nvfp4_runtime_supported(sw_fallback: bool = False) -> bool:
     if not torch.cuda.is_available():
         return False
     device = torch.device("cuda")
@@ -2457,12 +2457,12 @@ def _is_cutlass_nvfp4_runtime_supported() -> bool:
         return is_sm110a_supported(device)
     if arch in (120, 121):
         return is_sm12x_supported(device)
-    return False
+    return sw_fallback and arch < 100  # NVFP4 runs dequantized on SM80-SM90
 
 
 cutlass_nvfp4_required = pytest.mark.skipif(
-    not _is_cutlass_nvfp4_runtime_supported(),
-    reason="requires SM100/SM110/SM12x CUTLASS NVFP4 GPU and CUDA toolkit",
+    not _is_cutlass_nvfp4_runtime_supported(sw_fallback=True),
+    reason="requires SM80+ CUTLASS NVFP4 GPU and CUDA toolkit",
 )
 
 

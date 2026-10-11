@@ -62,6 +62,8 @@ struct GroupedGemmInput {
 
   cudaStream_t stream = 0;
   cutlass_extensions::CutlassGemmConfig gemm_config;
+  // Scale each expert by *alpha_scales[expert] in the SM80 epilogue (FP8 always does).
+  bool apply_alpha_scales = false;
 };
 
 struct TmaWarpSpecializedGroupedGemmInput {

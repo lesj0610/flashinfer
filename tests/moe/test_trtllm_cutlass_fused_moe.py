@@ -46,6 +46,9 @@ from tests.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
 from . import utils as moe_utils
 
 _CUTLASS_MOE_SUPPORTED_ARCHES = {
+    (8, 0),
+    (8, 6),
+    (8, 7),
     (8, 9),
     (9, 0),
     (10, 0),
@@ -877,6 +880,9 @@ def test_moe_unfused_finalize(
     [ActivationType.Swiglu, ActivationType.SwigluStep, ActivationType.Situ],
     ids=["swiglu", "swiglustep", "situ"],
 )
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() < (8, 9), reason="FP8 requires SM89+"
+)
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_fp8(
     batch_size,
@@ -985,8 +991,8 @@ def test_moe_fp8(
 # use_autotune=True is regression coverage for issue #4003 (NVFP4 autotune crash).
 @pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
+    torch.cuda.get_device_capability()[0] not in [8, 9, 10, 11, 12],
+    reason="NVFP4 is only supported on SM80, SM90, SM100, SM110 and SM120/SM121",
 )
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4(
@@ -2450,8 +2456,9 @@ def test_moe_w4a8(
 
 
 @pytest.mark.skipif(
-    not is_sm100a_supported(torch.device("cuda")),
-    reason="NVFP4 is only supported on SM100+",
+    not is_sm100a_supported(torch.device("cuda"))
+    and torch.cuda.get_device_capability()[0] not in [8, 9],
+    reason="NVFP4 is only supported on SM80, SM90 and SM100+",
 )
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_unswizzled_input_sf():
@@ -2608,8 +2615,9 @@ def test_moe_nvfp4_unswizzled_input_sf():
 @pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.skipif(
     not is_sm100a_supported(torch.device("cuda"))
-    and not is_sm12x_supported(torch.device("cuda")),
-    reason="NVFP4 is only supported on SM100+",
+    and not is_sm12x_supported(torch.device("cuda"))
+    and torch.cuda.get_device_capability()[0] not in [8, 9],
+    reason="NVFP4 is only supported on SM80, SM90 and SM100+",
 )
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_unaligned_hidden_size(
@@ -2788,8 +2796,8 @@ NDIM_PADDING_INTERMEDIATE_SIZES = [768, 1024]
 @pytest.mark.parametrize("intermediate_size", NDIM_PADDING_INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("quantized_input", [False, True])
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
+    torch.cuda.get_device_capability()[0] not in [8, 9, 10, 11, 12],
+    reason="NVFP4 is only supported on SM80, SM90, SM100, SM110 and SM120/SM121",
 )
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_ndim_padding_safety(
