@@ -1228,83 +1228,189 @@ __device__ inline bool blockScaledRow(
     int64_t const row, int64_t const* expert_first_token_offset, int64_t const num_experts,
     int64_t const rows_per_expert, int64_t const cols,
     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType const scaling_type, int64_t& sf_offset,
-    int64_t& local_row) {
-  int64_t expert = row / rows_per_expert;
-  local_row = row % rows_per_expert;
-  sf_offset = getOffsetWeightSF(expert, rows_per_expert, cols, scaling_type);
+    int64_t& local_row, int64_t& expert) {
   if (expert_first_token_offset) {
     if (row >= expert_first_token_offset[num_experts]) return false;
     expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts, row + 1) - 1;
     local_row = row - expert_first_token_offset[expert];
     sf_offset =
         getOffsetActivationSF(expert, expert_first_token_offset[expert], cols, scaling_type);
+  } else {
+    expert = row / rows_per_expert;
+    local_row = row - expert * rows_per_expert;
+    sf_offset = getOffsetWeightSF(expert, rows_per_expert, cols, scaling_type);
   }
   return true;
 }
 
+// Weight rows of experts that no row is routed to are skipped (routed = expert_first_token_offset).
+__device__ inline bool unroutedWeightRow(int64_t const* routed, int64_t const expert) {
+  return routed && routed[expert] == routed[expert + 1];
+}
+
+// The largest E8M0 block scale of each MX row, one warp per row.
 __global__ void maxRowScaleKernel(int* row_max,
                                   TmaWarpSpecializedGroupedGemmInput::ElementSF const* sf,
-                                  int64_t const* expert_first_token_offset,
+                                  int64_t const* expert_first_token_offset, int64_t const* routed,
                                   int64_t const num_experts, int64_t const rows,
                                   int64_t const rows_per_expert, int64_t const cols) {
-  int64_t const vecs_per_row = cols / TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
-  for (int64_t row = blockIdx.x * int64_t(blockDim.x) + threadIdx.x; row < rows;
-       row += int64_t(gridDim.x) * blockDim.x) {
-    int64_t sf_offset, local_row;
+  int const lane = threadIdx.x % 32;
+  int const vecs_per_row =
+      static_cast<int>(cols / TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize);
+  int64_t const warps = int64_t(gridDim.x) * blockDim.x / 32;
+  for (int64_t row = (blockIdx.x * int64_t(blockDim.x) + threadIdx.x) / 32; row < rows;
+       row += warps) {
+    int64_t sf_offset, local_row, expert;
     if (!blockScaledRow(row, expert_first_token_offset, num_experts, rows_per_expert, cols,
                         TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, sf_offset,
-                        local_row)) {
+                        local_row, expert) ||
+        unroutedWeightRow(routed, expert)) {
       continue;
     }
+    auto const* sf_row = sf + sf_offset + get_sf_out_offset_128x4(local_row, 0, vecs_per_row);
     int s = 0;
-    for (int64_t v = 0; v < vecs_per_row; ++v) {
-      s = max(s, int(sf[sf_offset + get_sf_out_offset_128x4(local_row, v, vecs_per_row)]));
-    }
-    row_max[row] = s;
+    for (int v = lane; v < vecs_per_row; v += 32) s = max(s, int(sf_row[(v >> 2) * 512 + (v & 3)]));
+#pragma unroll
+    for (int o = 16; o > 0; o /= 2) s = max(s, __shfl_xor_sync(0xFFFFFFFFu, s, o));
+    if (lane == 0) row_max[row] = s;
   }
 }
 
+// E4M3 to FP32 without the software conversion, exact under FTZ: normal values are rebiased in the
+// exponent field and subnormal ones are m * 2^-9.
+__device__ inline float e4m3ToFloat(uint32_t const s) {
+  if ((s & 0x7F) == 0x7F) return __uint_as_float(0x7fc00000u);
+  float const m =
+      (s & 0x78) ? __uint_as_float(((s & 0x7F) << 20) + (120u << 23)) : float(s & 7) * 0x1p-9f;
+  return s & 0x80 ? -m : m;
+}
+
+// Eight E2M1 codes (the first in the low nibble) to eight BF16 or FP16 values by byte lookups. The
+// tables hold the low and high bytes of the magnitudes 0, 0.5, 1, 1.5, 2, 3, 4 and 6.
+template <class OutputType>
+__device__ inline uint4 e2m1x8To16Bit(uint32_t const packed) {
+  constexpr bool bf16 = std::is_same_v<OutputType, __nv_bfloat16>;
+  uint32_t const lo0 = bf16 ? 0xC0800000u : 0u, lo1 = bf16 ? 0xC0804000u : 0u;
+  uint32_t const hi0 = bf16 ? 0x3F3F3F00u : 0x3E3C3800u, hi1 = bf16 ? 0x40404040u : 0x46444240u;
+  uint4 out;
+  uint32_t* words = reinterpret_cast<uint32_t*>(&out);
+#pragma unroll
+  for (int p = 0; p < 4; ++p) {
+    uint32_t const pair = packed >> (8 * p);
+    uint32_t const sel = (pair & 0x7u) | (pair & 0x70u) << 4;
+    uint32_t lo, hi;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(lo) : "r"(lo0), "r"(lo1), "r"(sel));
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(hi) : "r"(hi0), "r"(hi1), "r"(sel));
+    words[p] =
+        (lo & 0x00FF00FFu) | (hi << 8 & 0xFF00FF00u) | (pair & 0x8u) << 12 | (pair & 0x80u) << 24;
+  }
+  return out;
+}
+
+// A block scale times 2^126 as a BF16 pair, for values held as 2^-126 * value. E4M3 scales go up to
+// 448, so NVFP4 carries 2^118 and leaves 2^8 to the caller; E8M0 scales are taken relative to the
+// row's largest one.
+template <bool kMx>
+__device__ inline __nv_bfloat162 blockScaleBf16(uint32_t const s, int const row_max) {
+  if (!kMx) return __float2bfloat162_rn(e4m3ToFloat(s) * 0x1p118f);
+  int const field = 253 + int(s) - row_max;
+  uint32_t const bits = s == 255 ? 0x7FC0u : field >= 1 ? uint32_t(field) << 7 : 0u;
+  __nv_bfloat162 scale;
+  *reinterpret_cast<uint32_t*>(&scale) = bits | bits << 16;
+  return scale;
+}
+
+// One warp per row and 8 values per lane, so loads and the 16-byte stores are contiguous. BF16
+// output stores each group of 8 in the order 0, 4, 1, 5, 2, 6, 3, 7, for activations and weights
+// alike, which leaves the GEMM unchanged and lets E2M1 codes convert by bit placement.
 template <class OutputType, class InputType>
 __global__ void dequantizeBlockScaledRowsKernel(
     OutputType* out, uint8_t const* in, TmaWarpSpecializedGroupedGemmInput::ElementSF const* sf,
     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType const scaling_type,
-    int64_t const* expert_first_token_offset, int64_t const num_experts, int64_t const rows,
-    int64_t const rows_per_expert, int64_t const cols, int const* row_max) {
+    int64_t const* expert_first_token_offset, int64_t const* routed, int64_t const num_experts,
+    int64_t const rows, int64_t const rows_per_expert, int64_t const cols, int const* row_max) {
+  constexpr int kValues = 8;
   bool const nvfp4 = scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
-  int const vec_size = nvfp4 ? TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
-                             : TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
-  int64_t const vecs_per_row = cols / vec_size;
-  for (int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x; i < rows * vecs_per_row;
-       i += int64_t(gridDim.x) * blockDim.x) {
-    int64_t const row = i / vecs_per_row;
-    int64_t sf_offset, local_row;
+  int const vec_shift = nvfp4 ? 4 : 5;
+  int const vecs_per_row = static_cast<int>(cols >> vec_shift);
+  int const lane = threadIdx.x % 32;
+  int64_t const warps = int64_t(gridDim.x) * blockDim.x / 32;
+  for (int64_t row = (blockIdx.x * int64_t(blockDim.x) + threadIdx.x) / 32; row < rows;
+       row += warps) {
+    int64_t sf_offset, local_row, expert;
     if (!blockScaledRow(row, expert_first_token_offset, num_experts, rows_per_expert, cols,
-                        scaling_type, sf_offset, local_row)) {
+                        scaling_type, sf_offset, local_row, expert) ||
+        unroutedWeightRow(routed, expert)) {
       continue;
     }
-    float scale = 1.0f;
-    if (sf) {
-      uint32_t const s =
-          sf[sf_offset + get_sf_out_offset_128x4(local_row, i % vecs_per_row, vecs_per_row)];
-      __nv_fp8_e4m3 e4m3;
-      e4m3.__x = s;
-      // E8M0 is 2^(s - 127) and s = 255 is NaN; the row's largest scale is taken out.
-      scale = nvfp4      ? float(e4m3)
-              : s == 255 ? __uint_as_float(0x7fc00000u)
-                         : ldexpf(1.0f, int(s) - row_max[row]);
-    }
-    for (int j = 0; j < vec_size; j += 2) {
-      int64_t const idx = i * vec_size + j;
-      float2 v;
-      if constexpr (std::is_same_v<InputType, Fp4Type>) {
-        v = e2m1x2_byte_to_float2(in[idx / 2]);
-      } else {
-        __nv_fp8x2_e4m3 pair;
-        pair.__x = in[idx] | uint16_t(in[idx + 1]) << 8;
-        v = float2(pair);
+    // The 128x4 layout splits into a row part and, per vector, (vec / 4) * 512 + vec % 4.
+    auto const* sf_row =
+        sf ? sf + sf_offset + get_sf_out_offset_128x4(local_row, 0, vecs_per_row) : nullptr;
+    int const shift = row_max ? row_max[row] : 0;
+    OutputType* out_row = out + row * cols;
+    uint8_t const* in_row = in + (std::is_same_v<InputType, Fp4Type> ? row * cols / 2 : row * cols);
+    constexpr bool kPaired = std::is_same_v<OutputType, __nv_bfloat16>;
+    for (int col = lane * kValues; col < cols; col += 32 * kValues) {
+      uint32_t s = 0;
+      float scale = 1.0f;
+      if (sf_row) {
+        int const vec = col >> vec_shift;
+        s = sf_row[(vec >> 2) * 512 + (vec & 3)];
+        // E8M0 is 2^(s - 127) and s = 255 is NaN; the row's largest scale is taken out.
+        scale = nvfp4      ? e4m3ToFloat(s)
+                : s == 255 ? __uint_as_float(0x7fc00000u)
+                           : ldexpf(1.0f, int(s) - shift);
       }
-      out[idx] = OutputType(v.x * scale);
-      out[idx + 1] = OutputType(v.y * scale);
+      uint4 packed_out;
+      uint32_t* words = reinterpret_cast<uint32_t*>(&packed_out);
+      if constexpr (std::is_same_v<InputType, Fp4Type> && kPaired) {
+        // Pairs (j, j + 4): the code bits in the BF16 exponent and mantissa fields read
+        // 2^-126 * code, and the scale carries 2^126 (NVFP4: 2^8, then 2^118), so the products
+        // are exact.
+        uint32_t const word = *reinterpret_cast<uint32_t const*>(in_row + col / 2);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          uint32_t const x = word >> (4 * j);
+          words[j] = (x << 6 & 0x01C001C0u) | (x << 12 & 0x80008000u);
+        }
+        __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&packed_out);
+        __nv_bfloat162 const scale2 =
+            nvfp4 ? blockScaleBf16<false>(s, 0) : blockScaleBf16<true>(s, shift);
+        __nv_bfloat162 two8;
+        *reinterpret_cast<uint32_t*>(&two8) = 0x43804380u;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          pairs[j] = __hmul2(nvfp4 ? __hmul2(pairs[j], two8) : pairs[j], scale2);
+        }
+      } else if constexpr (std::is_same_v<InputType, Fp4Type>) {
+        // The products are exact: at most 6 significant bits, or a power-of-two scale.
+        using OutputType2 =
+            std::conditional_t<std::is_same_v<OutputType, half>, half2, __nv_bfloat162>;
+        packed_out =
+            e2m1x8To16Bit<OutputType>(*reinterpret_cast<uint32_t const*>(in_row + col / 2));
+        OutputType2 const scale2 = {OutputType(scale), OutputType(scale)};
+        OutputType2* pairs = reinterpret_cast<OutputType2*>(&packed_out);
+#pragma unroll
+        for (int j = 0; j < kValues / 2; ++j) pairs[j] = __hmul2(pairs[j], scale2);
+      } else {
+        uint2 const packed = *reinterpret_cast<uint2 const*>(in_row + col);
+        OutputType values[kValues];
+#pragma unroll
+        for (int j = 0; j < kValues; j += 2) {
+          __nv_fp8x2_e4m3 pair;
+          pair.__x = (j < 4 ? packed.x : packed.y) >> (8 * (j % 4)) & 0xFFFF;
+          float2 const v = float2(pair);
+          values[j] = OutputType(v.x * scale);
+          values[j + 1] = OutputType(v.y * scale);
+        }
+        uint16_t const* v = reinterpret_cast<uint16_t const*>(values);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          words[j] =
+              kPaired ? v[j] | uint32_t(v[j + 4]) << 16 : v[2 * j] | uint32_t(v[2 * j + 1]) << 16;
+        }
+      }
+      *reinterpret_cast<uint4*>(out_row + col) = packed_out;
     }
   }
 }
@@ -1324,16 +1430,42 @@ __global__ void restoreRowScalesKernel(OutputType* out, float const* in, int con
                                        int const* weight_row_max, int const* alpha_exponent,
                                        int64_t const* expert_first_token_offset,
                                        int64_t const num_experts, int64_t const n) {
-  for (int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
-       i < expert_first_token_offset[num_experts] * n; i += int64_t(gridDim.x) * blockDim.x) {
-    int64_t const row = i / n;
+  for (int64_t row = blockIdx.x; row < expert_first_token_offset[num_experts]; row += gridDim.x) {
     int64_t const expert =
         findTotalEltsLessThanTarget(expert_first_token_offset, num_experts, row + 1) - 1;
-    int const exponent = (act_row_max ? act_row_max[row] - 127 : 0) +
-                         weight_row_max[expert * n + i % n] - 127 +
-                         (alpha_exponent ? alpha_exponent[expert] : 0);
-    out[i] = OutputType(ldexpf(float(in[i]), exponent));
+    int const row_exponent = (act_row_max ? act_row_max[row] - 127 : 0) - 127 +
+                             (alpha_exponent ? alpha_exponent[expert] : 0);
+    for (int64_t col = threadIdx.x; col < n; col += blockDim.x) {
+      out[row * n + col] =
+          OutputType(ldexpf(in[row * n + col], row_exponent + weight_row_max[expert * n + col]));
+    }
   }
+}
+
+// The scratch of dequantizedGroupedGemm in bytes and workspace order: the dequantized activations
+// and weights, the MX row maxima and alpha's exponent, alpha's mantissa and the FP32 GEMM output.
+template <class OutputType, class InputType, class WeightType>
+std::array<size_t, 5> dequantizedGemmScratch(int64_t const num_rows, int64_t const n,
+                                             int64_t const k, int const num_experts,
+                                             bool const act_sf, bool const alpha) {
+  constexpr bool mx = !std::is_same_v<InputType, Fp4Type>;
+  using GemmType = std::conditional_t<mx, __nv_bfloat16, OutputType>;
+  int64_t const maxes =
+      mx ? (act_sf ? num_rows : 0) + num_experts * n + (alpha ? num_experts : 0) : 0;
+  return {static_cast<size_t>(num_rows * k) * sizeof(GemmType),
+          static_cast<size_t>(num_experts * n * k) * sizeof(GemmType),
+          static_cast<size_t>(maxes) * sizeof(int),
+          static_cast<size_t>(mx && alpha ? num_experts : 0) * sizeof(float),
+          static_cast<size_t>(mx ? num_rows * n : 0) * sizeof(float)};
+}
+
+// The GEMM workspace that dequantizedGroupedGemm takes at most.
+template <class OutputType, class InputType, class WeightType>
+size_t dequantizedGemmWorkspaceSize(int64_t const num_rows, int64_t const n, int64_t const k,
+                                    int const num_experts) {
+  auto const sizes = dequantizedGemmScratch<OutputType, InputType, WeightType>(
+      num_rows, n, k, num_experts, true, true);
+  return tensorrt_llm::common::calculateTotalWorkspaceSize(sizes.data(), sizes.size());
 }
 
 // The SM80 grouped GEMM with BF16 operands and an FP32 output (moe_gemm_kernels_bf16_bf16.cu).
@@ -1347,59 +1479,69 @@ void dequantizedGroupedGemm(
     float const* alpha, float const** alpha_scale_ptr_array, OutputType* output,
     int64_t const* expert_first_token_offset, int64_t const num_rows, int64_t const n,
     int64_t const k, int const num_experts, cutlass_extensions::CutlassGemmConfig const& config,
-    cudaStream_t stream) {
+    void* const workspace, size_t const workspace_size, cudaStream_t stream) {
+  if (num_rows == 0) return;  // no blocks to launch
   constexpr bool mx = !std::is_same_v<InputType, Fp4Type>;
   using GemmType = std::conditional_t<mx, __nv_bfloat16, OutputType>;
   using GemmOutputType = std::conditional_t<mx, float, OutputType>;
   auto const scaling_type = mx ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
                                : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
-  // Freed on the stream on every exit, including a throwing allocation or GEMM.
-  auto free_on_stream = [stream](void* ptr) { cudaFreeAsync(ptr, stream); };
-  auto allocate = [&](int64_t count, size_t size) {
-    void* ptr = nullptr;
-    if (count > 0) check_cuda_error(cudaMallocAsync(&ptr, count * size, stream));
-    return std::unique_ptr<void, decltype(free_on_stream)>(ptr, free_on_stream);
-  };
   auto launch = [&](auto kernel, int64_t count, auto... args) {
     int const blocks = static_cast<int>(std::min<int64_t>(ceilDiv(count, 256), 65536));
     kernel<<<blocks, 256, 0, stream>>>(args...);
   };
-  auto const a = allocate(num_rows * k, sizeof(GemmType));
-  auto const b = allocate(num_experts * n * k, sizeof(GemmType));
-  // MX: each row's largest scale, alpha's exponent and mantissa, and the FP32 GEMM output.
-  auto const row_max = allocate(mx ? num_rows + num_experts * n + num_experts : 0, sizeof(int));
-  auto const alpha_mantissa = allocate(mx && alpha ? num_experts : 0, sizeof(float));
-  auto const c = allocate(mx ? num_rows * n : 0, sizeof(GemmOutputType));
-  int* const act_row_max = mx && input_sf ? static_cast<int*>(row_max.get()) : nullptr;
-  int* const weight_row_max = mx ? static_cast<int*>(row_max.get()) + num_rows : nullptr;
-  int* const alpha_exponent = alpha_mantissa ? weight_row_max + num_experts * n : nullptr;
+  // Up to 4096 blocks of 128 threads stride over the rows.
+  auto launch_rows = [&](auto kernel, int64_t rows, auto... args) {
+    int const blocks = static_cast<int>(std::min<int64_t>(rows, 4096));
+    kernel<<<blocks, 128, 0, stream>>>(args...);
+  };
+  auto const sizes = dequantizedGemmScratch<OutputType, InputType, WeightType>(
+      num_rows, n, k, num_experts, input_sf != nullptr, alpha != nullptr);
+  TLLM_CHECK_WITH_INFO(tensorrt_llm::common::calculateTotalWorkspaceSize(
+                           sizes.data(), sizes.size()) <= workspace_size,
+                       "The dequantized GEMM needs a larger GEMM workspace.");
+  void* scratch[5];
+  int8_t* next = static_cast<int8_t*>(workspace);
+  for (int i = 0; i < 5; ++i) {
+    scratch[i] = sizes[i] ? next : nullptr;
+    next = tensorrt_llm::common::nextWorkspacePtr(next, sizes[i]);
+  }
+  void *const a = scratch[0], *const b = scratch[1], *const row_max = scratch[2];
+  void *const alpha_mantissa = scratch[3], *const c = scratch[4];
+  int64_t const act_maxes = mx && input_sf ? num_rows : 0;
+  int64_t const weight_maxes = mx ? num_experts * n : 0;
+  int* const act_row_max = act_maxes ? static_cast<int*>(row_max) : nullptr;
+  int* const weight_row_max = weight_maxes ? static_cast<int*>(row_max) + act_maxes : nullptr;
+  int* const alpha_exponent =
+      alpha_mantissa ? static_cast<int*>(row_max) + act_maxes + weight_maxes : nullptr;
   GemmOutputType* const gemm_output =
-      mx ? static_cast<GemmOutputType*>(c.get()) : reinterpret_cast<GemmOutputType*>(output);
+      mx ? static_cast<GemmOutputType*>(c) : reinterpret_cast<GemmOutputType*>(output);
   if (alpha_exponent) {
-    launch(splitAlphaKernel, num_experts, static_cast<float*>(alpha_mantissa.get()), alpha_exponent,
+    launch(splitAlphaKernel, num_experts, static_cast<float*>(alpha_mantissa), alpha_exponent,
            alpha, int64_t(num_experts));
-    alpha = static_cast<float const*>(alpha_mantissa.get());
+    alpha = static_cast<float const*>(alpha_mantissa);
   }
   if (act_row_max) {
-    launch(maxRowScaleKernel, num_rows, act_row_max, input_sf, expert_first_token_offset,
-           int64_t(num_experts), num_rows, num_rows, k);
+    launch(maxRowScaleKernel, num_rows * 32, act_row_max, input_sf, expert_first_token_offset,
+           static_cast<int64_t const*>(nullptr), int64_t(num_experts), num_rows, num_rows, k);
   }
   if (weight_row_max) {
-    launch(maxRowScaleKernel, num_experts * n, weight_row_max, weight_sf,
-           static_cast<int64_t const*>(nullptr), int64_t(num_experts), num_experts * n, n, k);
+    launch(maxRowScaleKernel, num_experts * n * 32, weight_row_max, weight_sf,
+           static_cast<int64_t const*>(nullptr), expert_first_token_offset, int64_t(num_experts),
+           num_experts * n, n, k);
   }
-  launch(dequantizeBlockScaledRowsKernel<GemmType, InputType>, num_rows * k / 16,
-         static_cast<GemmType*>(a.get()), static_cast<uint8_t const*>(input), input_sf,
-         scaling_type, expert_first_token_offset, int64_t(num_experts), num_rows, num_rows, k,
-         static_cast<int const*>(act_row_max));
-  launch(dequantizeBlockScaledRowsKernel<GemmType, WeightType>, num_experts * n * k / 16,
-         static_cast<GemmType*>(b.get()), static_cast<uint8_t const*>(weights), weight_sf,
-         scaling_type, static_cast<int64_t const*>(nullptr), int64_t(num_experts), num_experts * n,
-         n, k, static_cast<int const*>(weight_row_max));
+  launch(dequantizeBlockScaledRowsKernel<GemmType, InputType>, num_rows * 32,
+         static_cast<GemmType*>(a), static_cast<uint8_t const*>(input), input_sf, scaling_type,
+         expert_first_token_offset, static_cast<int64_t const*>(nullptr), int64_t(num_experts),
+         num_rows, num_rows, k, static_cast<int const*>(act_row_max));
+  launch(dequantizeBlockScaledRowsKernel<GemmType, WeightType>, num_experts * n * 32,
+         static_cast<GemmType*>(b), static_cast<uint8_t const*>(weights), weight_sf, scaling_type,
+         static_cast<int64_t const*>(nullptr), expert_first_token_offset, int64_t(num_experts),
+         num_experts * n, n, k, static_cast<int const*>(weight_row_max));
   GroupedGemmInput<GemmType, GemmType, GemmOutputType, GemmOutputType> gemm_input{
-      static_cast<GemmType*>(a.get()),
+      static_cast<GemmType*>(a),
       expert_first_token_offset + 1,
-      static_cast<GemmType*>(b.get()),
+      static_cast<GemmType*>(b),
       /*scales*/ nullptr,
       /*zeros*/ nullptr,
       /*biases*/ nullptr,
@@ -1419,10 +1561,10 @@ void dequantizedGroupedGemm(
   gemm_input.apply_alpha_scales = true;
   if constexpr (mx) {
     moeGemmBf16Fp32Output(gemm_input, tensorrt_llm::common::getMultiProcessorCount());
-    launch(restoreRowScalesKernel<OutputType>, num_rows * n, output,
-           static_cast<float const*>(gemm_output), static_cast<int const*>(act_row_max),
-           static_cast<int const*>(weight_row_max), static_cast<int const*>(alpha_exponent),
-           expert_first_token_offset, int64_t(num_experts), n);
+    launch_rows(restoreRowScalesKernel<OutputType>, num_rows, output,
+                static_cast<float const*>(gemm_output), static_cast<int const*>(act_row_max),
+                static_cast<int const*>(weight_row_max), static_cast<int const*>(alpha_exponent),
+                expert_first_token_offset, int64_t(num_experts), n);
   } else {
     MoeGemmRunner<GemmType, GemmType, GemmType>().moeGemm(gemm_input,
                                                           TmaWarpSpecializedGroupedGemmInput{});
@@ -1430,7 +1572,8 @@ void dequantizedGroupedGemm(
 }
 
 // One FC layer's dequantized GEMM with the scales its quant params carry, as the TMA path reads
-// them: NVFP4, MXFP8 x MXFP4, FP8 per-tensor x MXFP4 or MXFP8 x MXFP8.
+// them: NVFP4, MXFP8 x MXFP4, FP8 per-tensor x MXFP4 or MXFP8 x MXFP8. The scratch goes in the
+// GEMM workspace of the TMA input.
 template <class OutputType, class T, class WeightType, class Fp4, class Mxfp8Mxfp4, class Fp8Mxfp4,
           class Mxfp8Mxfp8>
 void dequantizedFcGemm(Fp4 const& fp4, Mxfp8Mxfp4 const& mxfp8_mxfp4, Fp8Mxfp4 const& fp8_mxfp4,
@@ -1439,7 +1582,9 @@ void dequantizedFcGemm(Fp4 const& fp4, Mxfp8Mxfp4 const& mxfp8_mxfp4, Fp8Mxfp4 c
                        void const* weights, float const** alpha_scale_ptr_array, OutputType* output,
                        int64_t const* expert_first_token_offset, int64_t const num_rows,
                        int64_t const n, int64_t const k, int const num_experts,
-                       cutlass_extensions::CutlassGemmConfig const& config, cudaStream_t stream) {
+                       cutlass_extensions::CutlassGemmConfig const& config,
+                       TmaWarpSpecializedGroupedGemmInput const& tma_ws_input,
+                       cudaStream_t stream) {
   using SF = TmaWarpSpecializedGroupedGemmInput::ElementSF;
   constexpr bool nvfp4 = std::is_same_v<T, Fp4Type>;
   bool const mxfp8_act =
@@ -1454,7 +1599,7 @@ void dequantizedFcGemm(Fp4 const& fp4, Mxfp8Mxfp4 const& mxfp8_mxfp4, Fp8Mxfp4 c
   dequantizedGroupedGemm<OutputType, T, WeightType>(
       input, nvfp4 || mxfp8_act ? act_sf : nullptr, weights, static_cast<SF const*>(weight_sf),
       alpha, alpha_scale_ptr_array, output, expert_first_token_offset, num_rows, n, k, num_experts,
-      config, stream);
+      config, tma_ws_input.gemm_workspace, tma_ws_input.gemm_workspace_size, stream);
 }
 #endif
 
@@ -3217,6 +3362,24 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
           bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode, class Enable>
+size_t
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, Sm90Wfp4Afp8Mode,
+                   Enable>::getDequantizedGemmWorkspaceSize(int64_t const num_rows, int64_t const n,
+                                                            int64_t const k,
+                                                            int const num_experts_per_node) const {
+#if defined(FLASHINFER_FP4_SW_CVT)
+  if constexpr (dequantizable) {
+    if (moe_gemm_runner_.getSM() < 100) {
+      return dequantizedGemmWorkspaceSize<UnfusedGemmOutputType, T, WeightType>(
+          num_rows, n, k, num_experts_per_node);
+    }
+  }
+#endif
+  return 0;
+}
+
+template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode, class Enable>
 std::map<std::string, std::pair<size_t, size_t>>
 CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, Sm90Wfp4Afp8Mode,
                    Enable>::getWorkspaceDeviceBufferSizes(int64_t const num_rows,
@@ -3307,7 +3470,14 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
                                                 num_experts_per_node, getScalingType())
                                           : 0;
 
-  size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
+  // The dequantized GEMMs below SM100 run in the GEMM workspace, one at a time.
+  size_t const gemm_workspace_size =
+      std::max({moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node),
+                getDequantizedGemmWorkspaceSize(num_moe_inputs,
+                                                is_gated_activation ? inter_size * 2 : inter_size,
+                                                hidden_size, num_experts_per_node),
+                getDequantizedGemmWorkspaceSize(num_moe_inputs, hidden_size, inter_size,
+                                                num_experts_per_node)});
   size_t const precomputed_scheduler_workspace_size =
       (using_tma_ws && use_sm90_mixed_input_gemm)
           ? cutlass_kernels_oss::detail::precomputed_scheduler_workspace_size(
@@ -3545,6 +3715,12 @@ void CutlassMoeFCRunner<
         getWsPtr(int8_t{}, "gemm_workspace"), workspaces.at("gemm_workspace").first,
         getWsPtr(int8_t{}, "precomputed_scheduler_workspace"),
         workspaces.at("precomputed_scheduler_workspace").first, getScalingType());
+  }
+  if (dequantizable && moe_gemm_runner_.getSM() < 100) {
+    for (auto* input : {&tma_ws_grouped_gemm1_input_, &tma_ws_grouped_gemm2_input_}) {
+      input->gemm_workspace = getWsPtr(uint8_t{}, "gemm_workspace");
+      input->gemm_workspace_size = workspaces.at("gemm_workspace").first;
+    }
   }
 
   lora_fc1_result_ = {};
@@ -3809,7 +3985,8 @@ void CutlassMoeFCRunner<
             quant_params.mxfp8_mxfp8.fc1, fc1_fp8_dequant, input, fc1_fp4_act_flat,
             fc1_expert_weights, alpha_scale_ptr_array,
             static_cast<UnfusedGemmOutputType*>(gemm_output), expert_first_token_offset,
-            expanded_num_rows, fc1_out_size, hidden_size, num_experts_per_node, config, stream);
+            expanded_num_rows, fc1_out_size, hidden_size, num_experts_per_node, config,
+            tma_ws_input_template, stream);
       }
     }
     if (!dequantized)
@@ -4079,7 +4256,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
           quant_params.mxfp8_mxfp8.fc2, fc2_fp8_dequant, input, fc2_fp4_act_flat,
           fc2_expert_weights, alpha_scale_ptr_array,
           static_cast<UnfusedGemmOutputType*>(gemm_output), expert_first_token_offset,
-          expanded_num_rows, hidden_size, inter_size, num_experts_per_node, config, stream);
+          expanded_num_rows, hidden_size, inter_size, num_experts_per_node, config,
+          tma_ws_input_template, stream);
     }
   }
   if (!dequantizable || using_tma_ws_gemm2)
@@ -5305,7 +5483,14 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   if (use_humming_pre_mma) {
     alpha_scale_ptr_array_size *= NUM_ROUTING_SAMPLES;
   }
-  size_t gemm_workspace_size = mInterface->getGemmWorkspaceSize(num_experts_per_node);
+  // The dequantized GEMMs below SM100 run in the GEMM workspace.
+  size_t gemm_workspace_size =
+      std::max(mInterface->getGemmWorkspaceSize(num_experts_per_node),
+               mGemmToProfile == GemmToProfile::GEMM_1
+                   ? mInterface->getDequantizedGemmWorkspaceSize(num_expanded_tokens, fc1_out_size,
+                                                                 hidden_size, num_experts_per_node)
+                   : mInterface->getDequantizedGemmWorkspaceSize(num_expanded_tokens, hidden_size,
+                                                                 inter_size, num_experts_per_node));
   size_t precomputed_scheduler_workspace_size =
       (is_tma_ws_input && isSm90MixedInputFamily())
           ? cutlass_kernels_oss::detail::precomputed_scheduler_workspace_size(
@@ -5850,6 +6035,10 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
     tma_ws_input_template = mTmaInputCache[use_finalize_index][tactic.swap_ab][mSampleIndex];
     TLLM_CHECK_WITH_INFO(tma_ws_input_template.isValid(),
                          "TMA WS input template is not initialized");
+  } else {
+    // The dequantized GEMMs below SM100 run in the GEMM workspace.
+    tma_ws_input_template.gemm_workspace = static_cast<uint8_t*>(gemm_workspace);
+    tma_ws_input_template.gemm_workspace_size = workspaces.at("gemm_workspace").first;
   }
 
   mInterface->is_profiler = true;
