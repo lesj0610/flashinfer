@@ -1259,10 +1259,15 @@ void dequantizedFp4GroupedGemm(
     int64_t const* expert_first_token_offset, int64_t const num_rows, int64_t const n,
     int64_t const k, int const num_experts, cutlass_extensions::CutlassGemmConfig const& config,
     cudaStream_t stream) {
-  OutputType* a;
-  OutputType* b;
-  check_cuda_error(cudaMallocAsync(&a, num_rows * k * sizeof(OutputType), stream));
-  check_cuda_error(cudaMallocAsync(&b, num_experts * n * k * sizeof(OutputType), stream));
+  // Freed on the stream on every exit, including a throwing allocation or GEMM.
+  auto free_on_stream = [stream](OutputType* ptr) { cudaFreeAsync(ptr, stream); };
+  auto allocate = [&](int64_t count) {
+    OutputType* ptr;
+    check_cuda_error(cudaMallocAsync(&ptr, count * sizeof(OutputType), stream));
+    return std::unique_ptr<OutputType, decltype(free_on_stream)>(ptr, free_on_stream);
+  };
+  auto const a = allocate(num_rows * k);
+  auto const b = allocate(num_experts * n * k);
   auto dequantize = [&](OutputType* out, void const* in,
                         TmaWarpSpecializedGroupedGemmInput::ElementSF const* sf,
                         int64_t const* offsets, int64_t rows, int64_t rows_per_expert) {
@@ -1271,12 +1276,12 @@ void dequantizedFp4GroupedGemm(
     dequantizeFp4RowsKernel<<<blocks, 256, 0, stream>>>(
         out, static_cast<uint64_t const*>(in), sf, offsets, num_experts, rows, rows_per_expert, k);
   };
-  dequantize(a, input, input_sf, expert_first_token_offset, num_rows, num_rows);
-  dequantize(b, weights, weight_sf, nullptr, num_experts * n, n);
+  dequantize(a.get(), input, input_sf, expert_first_token_offset, num_rows, num_rows);
+  dequantize(b.get(), weights, weight_sf, nullptr, num_experts * n, n);
   GroupedGemmInput<OutputType, OutputType, OutputType, OutputType> gemm_input{
-      a,
+      a.get(),
       expert_first_token_offset + 1,
-      b,
+      b.get(),
       /*scales*/ nullptr,
       /*zeros*/ nullptr,
       /*biases*/ nullptr,
@@ -1296,8 +1301,6 @@ void dequantizedFp4GroupedGemm(
   gemm_input.apply_alpha_scales = true;
   MoeGemmRunner<OutputType, OutputType, OutputType>().moeGemm(gemm_input,
                                                               TmaWarpSpecializedGroupedGemmInput{});
-  check_cuda_error(cudaFreeAsync(a, stream));
-  check_cuda_error(cudaFreeAsync(b, stream));
 }
 #endif
 
