@@ -148,6 +148,11 @@ struct genericMoeGemmKernelLauncher {
         epilogue_op.alpha_ptr_array = inputs.alpha_scales;
       }
 #endif
+      if constexpr (std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefault>) {
+        if (inputs.apply_alpha_scales) {
+          epilogue_op.alpha_ptr_array = inputs.alpha_scales;
+        }
+      }
 
       // Finally, set up the kernel.
       using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemmGrouped<
@@ -572,7 +577,14 @@ std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
       weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_hopper | fp8_only_flag);
 
-  if (!tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>() ||
+#if defined(FLASHINFER_FP4_SW_CVT)
+  // Below SM100, NVFP4 is dequantized to the output type and runs these configs.
+  constexpr bool ampere_fp4 = use_fp4;
+#else
+  constexpr bool ampere_fp4 = false;
+#endif
+  if ((!tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>() &&
+       !ampere_fp4) ||
       (use_w4afp8 && sm != 89) || use_wfp4a16) {
     return {};
   }

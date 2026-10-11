@@ -541,9 +541,9 @@ _CUTILE_SUPPORTED_ACTIVATIONS = (
     ActivationType.Silu,
 )
 
-# NVFP4 CUTLASS fused MoE matches the flat-API skip: SM100/SM110/SM12x.
-# Major 10/11/12 covers SM100/103/107, SM110, and SM120/121.
-_CUTLASS_NVFP4_ARCHS = (100, 103, 107, 110, 120, 121)
+# NVFP4 CUTLASS fused MoE matches the flat-API skip: SM80/SM90 (dequantized to
+# the SM80 grouped GEMM), SM100/SM110 and SM12x.
+_CUTLASS_NVFP4_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
 
 # Per-tensor FP8 follows the dense CUTLASS architecture list.
 _CUTLASS_FP8_ARCHS = _CUTLASS_BF16_ARCHS

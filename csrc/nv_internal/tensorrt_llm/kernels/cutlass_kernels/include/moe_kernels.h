@@ -607,6 +607,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 #else
   static constexpr bool use_fp8 = false;
   static constexpr bool use_w4afp8 = false;
+  static constexpr bool use_fp8_input = false;
 #endif
 #if defined(ENABLE_FP4)
   static constexpr bool act_fp4 = std::is_same_v<T, Fp4Type>;
@@ -942,9 +943,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
  private:
   bool mayHaveDifferentGEMMOutputType() const {
     // We just check if its supported because we need to know when calculating workspace size
+    // NVFP4 below SM100 runs its GEMMs dequantized, into the unquantized output type.
     return ((moe_gemm_runner_.supportsTmaWarpSpecialized() &&
              !std::is_same_v<T, UnfusedGemmOutputType>) ||
-            use_fp8);
+            use_fp8 || use_fp4);
   }
 
   bool mayHaveFinalizeFused() const {

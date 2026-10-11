@@ -113,7 +113,7 @@ def test_cutlass_bf16_config_architectures_and_registration():
         assert CutlassMxfp8Config.supported(arch)
     assert not CutlassBf16Config.supported(80)
     assert not CutlassW4A16Config.supported(100)
-    assert not CutlassNvfp4Config.supported(90)
+    assert not CutlassNvfp4Config.supported(75)
     assert not CutlassFp8BlockConfig.supported(100)
     assert not CutlassMxfp8Config.supported(90)
     assert not CutlassMxfp8Config.supported(110)

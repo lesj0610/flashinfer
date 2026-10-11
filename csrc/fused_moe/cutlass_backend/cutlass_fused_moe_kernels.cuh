@@ -1214,6 +1214,93 @@ float const** computeFP8DequantScale(float const** alpha_scale_ptr_array,
   return alpha_scale_ptr_array;
 }
 
+#if defined(FLASHINFER_FP4_SW_CVT)
+// Below SM100 an NVFP4 GEMM dequantizes both operands to the output type, which is exact (an E2M1
+// value times an E4M3 scale has at most 6 significant bits), and runs the SM80 grouped GEMM with
+// the per-expert alpha in its FP32 epilogue. Activation rows are grouped by
+// expert_first_token_offset and use the activation scale layout; weight rows use the weight one.
+template <class OutputType>
+__global__ void dequantizeFp4RowsKernel(OutputType* out, uint64_t const* in,
+                                        TmaWarpSpecializedGroupedGemmInput::ElementSF const* sf,
+                                        int64_t const* expert_first_token_offset,
+                                        int64_t const num_experts, int64_t const rows,
+                                        int64_t const rows_per_expert, int64_t const cols) {
+  constexpr int VecSize = TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
+  constexpr auto kNvfp4 = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+  int64_t const vecs_per_row = cols / VecSize;
+  for (int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x; i < rows * vecs_per_row;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    int64_t const row = i / vecs_per_row;
+    int64_t expert = row / rows_per_expert;
+    int64_t local_row = row % rows_per_expert;
+    int64_t sf_offset = getOffsetWeightSF(expert, rows_per_expert, cols, kNvfp4);
+    if (expert_first_token_offset) {
+      if (row >= expert_first_token_offset[num_experts]) continue;
+      expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts, row + 1) - 1;
+      local_row = row - expert_first_token_offset[expert];
+      sf_offset = getOffsetActivationSF(expert, expert_first_token_offset[expert], cols, kNvfp4);
+    }
+    __nv_fp8_e4m3 scale;
+    scale.__x = sf[sf_offset + get_sf_out_offset_128x4(local_row, i % vecs_per_row, vecs_per_row)];
+    uint64_t const packed = in[i];
+    for (int j = 0; j < VecSize / 2; ++j) {
+      float2 const v = e2m1x2_byte_to_float2(uint32_t(packed >> (8 * j)) & 0xFF);
+      out[i * VecSize + 2 * j] = OutputType(v.x * float(scale));
+      out[i * VecSize + 2 * j + 1] = OutputType(v.y * float(scale));
+    }
+  }
+}
+
+template <class OutputType>
+void dequantizedFp4GroupedGemm(
+    void const* input, TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf,
+    void const* weights, TmaWarpSpecializedGroupedGemmInput::ElementSF const* weight_sf,
+    float const* alpha, float const** alpha_scale_ptr_array, OutputType* output,
+    int64_t const* expert_first_token_offset, int64_t const num_rows, int64_t const n,
+    int64_t const k, int const num_experts, cutlass_extensions::CutlassGemmConfig const& config,
+    cudaStream_t stream) {
+  OutputType* a;
+  OutputType* b;
+  check_cuda_error(cudaMallocAsync(&a, num_rows * k * sizeof(OutputType), stream));
+  check_cuda_error(cudaMallocAsync(&b, num_experts * n * k * sizeof(OutputType), stream));
+  auto dequantize = [&](OutputType* out, void const* in,
+                        TmaWarpSpecializedGroupedGemmInput::ElementSF const* sf,
+                        int64_t const* offsets, int64_t rows, int64_t rows_per_expert) {
+    int64_t const vecs = rows * k / TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
+    int const blocks = static_cast<int>(std::min<int64_t>(ceilDiv(vecs, 256), 65536));
+    dequantizeFp4RowsKernel<<<blocks, 256, 0, stream>>>(
+        out, static_cast<uint64_t const*>(in), sf, offsets, num_experts, rows, rows_per_expert, k);
+  };
+  dequantize(a, input, input_sf, expert_first_token_offset, num_rows, num_rows);
+  dequantize(b, weights, weight_sf, nullptr, num_experts * n, n);
+  GroupedGemmInput<OutputType, OutputType, OutputType, OutputType> gemm_input{
+      a,
+      expert_first_token_offset + 1,
+      b,
+      /*scales*/ nullptr,
+      /*zeros*/ nullptr,
+      /*biases*/ nullptr,
+      output,
+      computeFP8DequantScale(alpha_scale_ptr_array, num_experts, alpha, stream),
+      /*occupancy*/ nullptr,
+      ActivationType::Identity,
+      num_rows,
+      n,
+      k,
+      num_experts,
+      /*groupwise_quant_group_size*/ 0,
+      /*bias_is_broadcast*/ true,
+      /*use_fused_moe*/ false,
+      stream,
+      config};
+  gemm_input.apply_alpha_scales = true;
+  MoeGemmRunner<OutputType, OutputType, OutputType>().moeGemm(gemm_input,
+                                                              TmaWarpSpecializedGroupedGemmInput{});
+  check_cuda_error(cudaFreeAsync(a, stream));
+  check_cuda_error(cudaFreeAsync(b, stream));
+}
+#endif
+
 __global__ void prepareProfilerFP8TokenScalePtrArrayKernel(
     float const** alpha_scale_ptr_array, float const* fp8_token_scale,
     int64_t const* expert_first_token_offset, int const num_experts_per_node,
@@ -3237,8 +3324,9 @@ void CutlassMoeFCRunner<
   bool const gemm1_using_fused_moe = moe_gemm_runner_.isFusedGatedActivation(
       *gemm1_config_, activation_type, inter_size, hidden_size);
   bool const gemm1_using_tma_ws = moe_gemm_runner_.isTmaWarpSpecialized(*gemm1_config_);
+  // NVFP4 below SM100 also runs GEMM1 into an unquantized intermediate.
   bool const tma_ws_has_glu =
-      gemm1_using_tma_ws && (mayHaveDifferentGEMMOutputType() || is_gated_activation);
+      (gemm1_using_tma_ws || use_fp4) && (mayHaveDifferentGEMMOutputType() || is_gated_activation);
   // We always use fused path if we can
   bool const non_tma_ws_has_glu = !gemm1_using_fused_moe && is_gated_activation;
   bool const has_glu_inter_result = tma_ws_has_glu || non_tma_ws_has_glu || use_fp8;
@@ -3495,6 +3583,28 @@ void CutlassMoeFCRunner<
       ((!use_ampere_activation_fusion) && is_gated_activation) ? inter_size * 2 : inter_size;
 
   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
+
+#if defined(FLASHINFER_FP4_SW_CVT)
+  if constexpr (use_fp4) {
+    if (!using_tma_ws_gemm1) {
+      TLLM_CHECK_WITH_INFO(!min_latency_mode, "Min latency mode requires SM100 for NVFP4.");
+      dequantizedFp4GroupedGemm(
+          input, fc1_fp4_act_flat, fc1_expert_weights, quant_params.fp4.fc1.weight_block_scale,
+          quant_params.fp4.fc1.global_scale, alpha_scale_ptr_array,
+          static_cast<UnfusedGemmOutputType*>(intermediate_result), expert_first_token_offset,
+          expanded_num_rows, is_gated_activation ? inter_size * 2 : inter_size, hidden_size,
+          num_experts_per_node, config, stream);
+      doActivation<T, UnfusedGemmOutputType>(
+          output, static_cast<UnfusedGemmOutputType const*>(intermediate_result), fc2_fp8_quant,
+          fc1_expert_biases, bias_is_broadcast, expert_first_token_offset,
+          permuted_token_selected_experts, num_experts_per_node, inter_size, expanded_num_rows,
+          fc1_activation_type, quant_params, quant_params.fp4.fc2.use_per_expert_act_scale,
+          fc2_fp4_act_flat, nullptr, nullptr, enable_pdl, stream);
+      sync_check_cuda_error(stream);
+      return;
+    }
+  }
+#endif
 
   if (min_latency_mode) {
     TLLM_CHECK_WITH_INFO(using_tma_ws_gemm1,
@@ -3806,7 +3916,19 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
       /*use_fused_moe*/ false,
       stream,
       config};
-  gemm_runner.moeGemmBiasAct(universal_input, tma_ws_input);
+#if defined(FLASHINFER_FP4_SW_CVT)
+  if constexpr (use_fp4) {
+    if (!using_tma_ws_gemm2) {
+      dequantizedFp4GroupedGemm(
+          input, fc2_fp4_act_flat, fc2_expert_weights, quant_params.fp4.fc2.weight_block_scale,
+          quant_params.fp4.fc2.global_scale, alpha_scale_ptr_array,
+          static_cast<UnfusedGemmOutputType*>(gemm_output), expert_first_token_offset,
+          expanded_num_rows, hidden_size, inter_size, num_experts_per_node, config, stream);
+    }
+  }
+  if (!use_fp4 || using_tma_ws_gemm2)
+#endif
+    gemm_runner.moeGemmBiasAct(universal_input, tma_ws_input);
   sync_check_cuda_error(stream);
 
   if (min_latency_mode) return;
@@ -3823,7 +3945,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
     sync_check_cuda_error(stream);
   }
 
-  bool has_different_output_type_ampere = (use_w4afp8 || use_fp8) && !using_tma_ws_gemm2;
+  bool has_different_output_type_ampere = (use_w4afp8 || use_fp8 || use_fp4) && !using_tma_ws_gemm2;
   bool using_fused_finalize =
       tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
   bool has_different_output_type_tma_ws = !using_fused_finalize && using_tma_ws_gemm2;
