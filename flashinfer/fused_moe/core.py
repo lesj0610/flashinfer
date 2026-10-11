@@ -6481,12 +6481,11 @@ def _trtllm_fp4_block_scale_moe_sw(
         ActivationType.Relu2,
         ActivationType.Identity,
     ):
-        raise NotImplementedError(f"activation_type={act!r} requires SM100 or newer.")
+        raise NotImplementedError(f"activation_type={act!r} is not supported.")
     if hidden_states_scale is not None:
         resolve_moe_act_sf_layout(hidden_states_scale_layout)
-    elif hidden_states.dtype == torch.float8_e4m3fn:
-        raise NotImplementedError("FP8 per-tensor activations require SM100 or newer.")
     nvfp4 = hidden_states.dtype == torch.uint8
+    fp8 = hidden_states.dtype == torch.float8_e4m3fn and hidden_states_scale is None
     hidden_size = hidden_states.shape[1] * (2 if nvfp4 else 1)
     _check_valid_hidden_size_supports_finalize(
         valid_hidden_size, do_finalize, hidden_size
@@ -6496,7 +6495,7 @@ def _trtllm_fp4_block_scale_moe_sw(
             f"output.shape[1] must equal valid_hidden_size={valid_hidden_size}, "
             f"got {output.shape[1]}"
         )
-    if not nvfp4:
+    if not (nvfp4 or fp8):
         # Like the kernels, MXFP8 and BF16 activations ignore the output scalars.
         output1_scale_scalar = output1_scale_gate_scalar = output2_scale_scalar = None
     num_tokens = hidden_states.shape[0]
@@ -6586,7 +6585,7 @@ def _trtllm_fp4_block_scale_moe_sw(
         )
         if a_exp is not None:
             a_exp = a_exp.index_select(0, layout.row_to_token)
-    a = a.index_select(0, layout.row_to_token)
+    a = a.bfloat16().index_select(0, layout.row_to_token)
     if valid_hidden_size is not None:
         # Zero padding in one operand contracts only the valid region.
         a[:, valid_hidden_size:] = 0
@@ -6654,6 +6653,10 @@ def _trtllm_fp4_block_scale_moe_sw(
             _e2m1_to_bf16(intermediate), scale, 1, num_rows, 16
         )
         out_scale = out_scale * dequant.reshape(-1, 1)
+    elif fp8:
+        # The FP8 per-tensor epilogue saturates to E4M3; the scalars carry the scale.
+        intermediate = y.clamp(-448, 448).to(torch.float8_e4m3fn)
+        y, y_exp = intermediate.bfloat16(), None
     elif hidden_states_scale is not None:
         intermediate, scale = _quantize_mxfp8_rows(y)
         y, y_exp = _scale_rows_to_bf16(intermediate.bfloat16(), scale, 1, num_rows, 32)
@@ -6726,8 +6729,7 @@ def trtllm_fp4_block_scale_moe(
 
     Below SM100 the routing and both GEMMs run in software: the GEMMs
     dequantize their operands to BF16 and multiply them in FP32 like
-    :func:`~flashinfer.grouped_mm.grouped_mm_fp4`. FP8 per-tensor activations
-    need SM100.
+    :func:`~flashinfer.grouped_mm.grouped_mm_fp4`.
 
     Parameters
     ----------
