@@ -1140,8 +1140,7 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_utils_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())
-        if has_sm100 or has_sm103 or has_sm110 or has_sm120 or has_sm121:
-            jit_specs.append(gen_fp4_kv_quantization_module())
+        jit_specs.append(gen_fp4_kv_quantization_module())
 
     if (
         add_xqa and get_cuda_version() > Version("12.8")

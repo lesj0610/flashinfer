@@ -2538,7 +2538,7 @@ def nvfp4_kv_dequantize_paged(
     )
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 107, 110, 120, 121])
 def _nvfp4_kv_quant_check(input, global_scale):
     return True
 
@@ -2551,8 +2551,8 @@ def nvfp4_kv_quantize(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""GPU quantization to the NVFP4 KV-cache format with linear block-scale layout.
 
-    Requires SM100+ (Blackwell) for the ``cvt.rn.satfinite.e2m1x2.f32`` PTX
-    instruction.
+    Requires SM80+. Below SM100 the E2M1 conversion runs in software, with
+    the same results as the ``cvt.rn.satfinite.e2m1x2.f32`` PTX instruction.
 
     Parameters
     ----------
