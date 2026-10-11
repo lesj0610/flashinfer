@@ -6458,7 +6458,11 @@ def _trtllm_fp4_block_scale_moe_sw(
         _e2m1_to_bf16,
         _scale_rows_to_bf16,
     )
-    from ..quantization.fp4_quantization import block_scale_interleave
+    from ..quantization.fp4_quantization import block_scale_interleave, nvfp4_quantize
+    from ..quantization.nvfp4_quantization_utils import (
+        nvfp4_e4m3_max,
+        resolve_nvfp4_4over6,
+    )
     from ..trace.templates.moe import _trtllm_unshuffle_weight
     from .cute_dsl.moe_utils import get_max_num_permuted_tokens
     from .prepare import _quantize_mxfp8_rows, _quantize_nvfp4_rows
@@ -6630,16 +6634,23 @@ def _trtllm_fp4_block_scale_moe_sw(
 
     out_scale = per_row(output2_scale_scalar)
     if nvfp4:
-        amax = None if per_token_scale is None else y.abs().amax(dim=1).float()
-        # The standard recipe: below SM100 the 4over6 quantizer hangs on a block
-        # of zeros, which Relu2 produces.
-        intermediate, scale, dequant = _quantize_nvfp4_rows(
-            y, amax=amax, nvfp4_4over6=None
-        )
+        if per_token_scale is None:
+            # GEMM1's fused epilogue quantizes with the standard recipe.
+            intermediate, scale, dequant = _quantize_nvfp4_rows(y, nvfp4_4over6=None)
+        else:
+            # Like the kernel: per-token requantization with the environment's
+            # recipe, whose E4M3 limit also sets the global scale.
+            recipe = resolve_nvfp4_4over6()
+            intermediate, scale, dequant = nvfp4_quantize(
+                y,
+                1.0 / (6.0 * nvfp4_e4m3_max(recipe)),
+                per_token_activation=True,
+                nvfp4_4over6=recipe,
+            )
         y, y_exp = _scale_rows_to_bf16(
             _e2m1_to_bf16(intermediate), scale, 1, num_rows, 16
         )
-        out_scale = out_scale * dequant[:, None]
+        out_scale = out_scale * dequant.reshape(-1, 1)
     elif hidden_states_scale is not None:
         intermediate, scale = _quantize_mxfp8_rows(y)
         y, y_exp = _scale_rows_to_bf16(intermediate.bfloat16(), scale, 1, num_rows, 32)
