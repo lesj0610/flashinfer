@@ -541,9 +541,9 @@ _CUTILE_SUPPORTED_ACTIVATIONS = (
     ActivationType.Silu,
 )
 
-# NVFP4 CUTLASS fused MoE matches the flat-API skip: SM100/SM110/SM12x.
-# Major 10/11/12 covers SM100/103/107, SM110, and SM120/121.
-_CUTLASS_NVFP4_ARCHS = (100, 103, 107, 110, 120, 121)
+# NVFP4 CUTLASS fused MoE matches the flat-API skip: SM80/SM90 (dequantized to
+# the SM80 grouped GEMM), SM100/SM110 and SM12x.
+_CUTLASS_NVFP4_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
 
 # Per-tensor FP8 follows the dense CUTLASS architecture list.
 _CUTLASS_FP8_ARCHS = _CUTLASS_BF16_ARCHS
@@ -552,13 +552,13 @@ _CUTLASS_FP8_ARCHS = _CUTLASS_BF16_ARCHS
 _CUTLASS_FP8_BLOCK_ARCHS = (90,)
 
 # MXFP8 activations x MXFP4 weights matches a *wider* flat-API skip than
-# MXFP8 x MXFP8: ``capability[0] not in [10, 11, 12]`` (SM100/103/107, SM110,
-# SM120/121). Do not collapse this to ``_CUTLASS_MXFP8_ARCHS``.
-_CUTLASS_MXFP8_MXFP4_ARCHS = (100, 103, 107, 110, 120, 121)
+# MXFP8 x MXFP8: SM80/SM90 (dequantized), SM100/103/107, SM110 and SM120/121.
+# Do not collapse this to ``_CUTLASS_MXFP8_ARCHS``.
+_CUTLASS_MXFP8_MXFP4_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
 
-# MXFP8 x MXFP8 follows the narrower flat skip: ``capability[0] not in [10]``
-# (SM10x only, including B300 SM103). Not claimed on SM11x/SM12x.
-_CUTLASS_MXFP8_ARCHS = (100, 103, 107)
+# MXFP8 x MXFP8 follows the narrower flat skip: SM80/SM90 (dequantized) and SM10x,
+# including B300 SM103. Not claimed on SM11x/SM12x.
+_CUTLASS_MXFP8_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107)
 
 # INT4 W4A8 and Humming MXFP4 x FP8 are Hopper mixed-input paths.
 _CUTLASS_W4A8_ARCHS = (90,)
@@ -566,8 +566,8 @@ _CUTLASS_HUMMING_ARCHS = (90,)
 
 _CUDNN_GROUPED_GEMM_BF16_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
 _CUDNN_GROUPED_GEMM_FP8_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
-_CUDNN_GROUPED_GEMM_MXFP8_ARCHS = (100, 103, 107, 110, 120, 121)
-_CUDNN_GROUPED_GEMM_FP4_ARCHS = (100, 103, 107, 110, 120, 121)
+_CUDNN_GROUPED_GEMM_MXFP8_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
+_CUDNN_GROUPED_GEMM_FP4_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
 
 
 # Default MMA pair shared by the FP4 ``prepare_*`` helpers
@@ -2234,12 +2234,13 @@ class CuteDslConfig:
     """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
+    SM80 to SM90 run a dequantize-to-BF16 software path.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM100, SM103 (Blackwell) + SM107 (Rubin) — tighten when CuteDSL adds more targets
-        return arch in (100, 103, 107)
+        # SM80-SM90 (software path), SM100, SM103 (Blackwell) + SM107 (Rubin)
+        return arch in (80, 86, 87, 89, 90, 100, 103, 107)
 
     @staticmethod
     def prepare_weights(

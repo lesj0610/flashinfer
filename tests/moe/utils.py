@@ -294,12 +294,21 @@ def skip_checks(
 
     if moe_gemm_backend is None:
         moe_gemm_backend = MoeGemmBackend.TRTLLM
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10]:
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
-
     # Check moe_impl class by name to avoid circular imports
     is_fp4_moe = type(moe_impl).__name__ == "FP4Moe"
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    # The TRT-LLM FP4 MoE runs in software on SM8x and SM90, without DA tuning.
+    # A real LoRA delta (dict of LoRA args) is built by the SM90+ BGMV kernels.
+    is_sw_fp4_moe = (
+        is_fp4_moe
+        and moe_gemm_backend == MoeGemmBackend.TRTLLM
+        and compute_capability[0] in [8, 9]
+        and not routing_config.get("enable_da_moe", False)
+        and not (isinstance(gemm1_lora_delta, dict) and compute_capability[0] < 9)
+    )
+    if compute_capability[0] not in [10] and not is_sw_fp4_moe:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
     is_fp8_per_tensor_moe = type(moe_impl).__name__ == "FP8PerTensorMoe"
     is_fp8_block_scale_moe = type(moe_impl).__name__ == "FP8BlockScaleMoe"
 

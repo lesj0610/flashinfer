@@ -153,13 +153,23 @@ sm100_required = pytest.mark.skipif(
     reason="Requires CuteDSL MoE target SM100, SM103 or SM107",
 )
 sm10x_required = sm100_required
+# The public MoE APIs also run on SM80 to SM90, through a software path.
+is_sm8x_sm9x = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in (
+    8,
+    9,
+)
+api_arch_required = pytest.mark.skipif(
+    not (is_sm8x_sm9x or is_sm100_family()),
+    reason="Requires SM80 to SM90, SM100, SM103 or SM107",
+)
 
 mxfp8_required = pytest.mark.skipif(
     not (
-        torch.cuda.is_available()
+        is_sm8x_sm9x
+        or torch.cuda.is_available()
         and torch.cuda.get_device_capability(0) in ((10, 0), (10, 3))
     ),
-    reason="W4A8 CuTe-DSL MoE requires SM100 or SM103",
+    reason="W4A8 CuTe-DSL MoE requires SM80 to SM90, SM100 or SM103",
 )
 
 
@@ -1711,7 +1721,7 @@ class TestAutotunerBucketConfig:
 
 
 @cute_dsl_available
-@sm100_required
+@api_arch_required
 class TestCuteDslMoeW4A16:
     pytestmark = _requires_dsl_arch
 
@@ -1775,6 +1785,7 @@ class TestCuteDslMoeW4A16:
         updated = run()
         torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
 
+    @sm100_required
     @pytest.mark.parametrize("scale_axis", ["row", "k"])
     @pytest.mark.parametrize(
         "rows,route_tile,tactic",
@@ -1856,6 +1867,7 @@ class TestCuteDslMoeW4A16:
         )
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
+    @sm100_required
     @pytest.mark.parametrize(
         "route_tile,gemm1_tactic,gemm2_tactic",
         [
@@ -1980,7 +1992,7 @@ class TestCuteDslMoeW4A16:
 
 
 @cute_dsl_available
-@sm10x_required
+@api_arch_required
 class TestCuteDslFusedMoeFunctional:
     """Tests for the functional API: cute_dsl_fused_moe."""
 
@@ -2507,7 +2519,7 @@ class TestCuteDslFusedMoeFunctional:
 
 
 @cute_dsl_available
-@sm10x_required
+@api_arch_required
 class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
 
@@ -3049,7 +3061,7 @@ class TestCuteDslMoEWrapper:
 
 
 @cute_dsl_available
-@sm10x_required
+@api_arch_required
 class TestApiConsistency:
     """Tests verifying consistency between functional and wrapper APIs."""
 
@@ -3140,7 +3152,7 @@ class TestApiConsistency:
 
 
 @cute_dsl_available
-@sm10x_required
+@api_arch_required
 class TestExpertParallelism:
     """Tests for expert parallelism (EP) configurations."""
 

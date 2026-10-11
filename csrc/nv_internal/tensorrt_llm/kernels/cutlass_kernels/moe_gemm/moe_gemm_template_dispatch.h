@@ -148,6 +148,11 @@ struct genericMoeGemmKernelLauncher {
         epilogue_op.alpha_ptr_array = inputs.alpha_scales;
       }
 #endif
+      if constexpr (std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefault>) {
+        if (inputs.apply_alpha_scales) {
+          epilogue_op.alpha_ptr_array = inputs.alpha_scales;
+        }
+      }
 
       // Finally, set up the kernel.
       using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemmGrouped<
@@ -569,10 +574,15 @@ std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<
   int const grouped_gemm_flag = CutlassGemmConfig::GROUPED_GEMM;
   int const enable_hopper = CutlassGemmConfig::NONE;
 
+  // Below SM100, block-scaled GEMMs are dequantized to the output type and run these configs.
+  constexpr bool dequantized = dequantizable && kDequantizedBelowSm100;
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
-      weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_hopper | fp8_only_flag);
+      dequantized
+          ? grouped_gemm_flag
+          : weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_hopper | fp8_only_flag);
 
-  if (!tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>() ||
+  if ((!tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>() &&
+       !dequantized) ||
       (use_w4afp8 && sm != 89) || use_wfp4a16) {
     return {};
   }
@@ -590,6 +600,9 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
               Sm90Wfp4Afp8Mode>::getTmaWarpSpecializedConfigs(int sm,
                                                               bool supports_finalize_fusion) {
   using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
+  if (dequantizable && kDequantizedBelowSm100 && sm < 100) {
+    return {};  // Dequantized below SM100, through the Ampere configs.
+  }
   static constexpr auto weight_only_flag =
       std::is_same<T, WeightType>::value ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
   static constexpr auto simt_only_flag =

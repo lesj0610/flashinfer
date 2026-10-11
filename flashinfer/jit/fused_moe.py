@@ -171,6 +171,7 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
         "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         "-DCUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1",
+        "-DFLASHINFER_FP4_SW_CVT",
     ]
     module_name = None
     if _should_enable_sm90_moe_prebuilt_d_descriptor():
@@ -186,9 +187,24 @@ def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_BF16",
         "-DENABLE_FP8",
         "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
+        "-DENABLE_FP4",
+        "-DFLASHINFER_FP4_SW_CVT",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "89", use_fast_build)
+
+
+def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[8]
+    ) + [
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+        "-DFLASHINFER_FP4_SW_CVT",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+    ]
+    return gen_cutlass_fused_moe_module(nvcc_flags, "80", use_fast_build)
 
 
 def gen_cutlass_fused_moe_module(

@@ -204,7 +204,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #endif
 #ifdef ENABLE_FP4
     int const sm = common::getSMVersion();
-    if (sm >= 100 && (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant())) {
+    if ((sm >= 100 || kernels::kDequantizedBelowSm100) &&
+        (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant())) {
       mInnerDimMultiplier = 16;  // 16 FP4 -> 1 LONG
       mKernelRunner = switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type>(mOutputDtype);
     }

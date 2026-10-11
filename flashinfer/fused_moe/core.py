@@ -60,6 +60,7 @@ from ..jit import (
 from ..jit.core import logger
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.fused_moe import (
+    gen_cutlass_fused_moe_sm80_module,
     gen_cutlass_fused_moe_sm89_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -657,6 +658,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         module = gen_cutlass_fused_moe_sm90_module(use_fast_build).build_and_load()
     elif backend == "89":
         module = gen_cutlass_fused_moe_sm89_module(use_fast_build).build_and_load()
+    elif backend in ("80", "86", "87"):
+        module = gen_cutlass_fused_moe_sm80_module(use_fast_build).build_and_load()
     else:
         raise ValueError(f"Invalid backend: {backend}")
 
@@ -6357,6 +6360,331 @@ def trtllm_fp8_block_scale_routed_moe(
         return result
 
 
+def _route_trtllm_moe_torch(
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    routing_method_type: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    routed_scaling_factor: Optional[float],
+    norm_topk_prob: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Torch port of the trtllm-gen routing kernels: ``[T, top_k]`` int32 ids and FP32 weights."""
+    method = RoutingMethodType(routing_method_type)
+    logits = routing_logits.float()
+    if method in (RoutingMethodType.DeepSeekV3, RoutingMethodType.MiniMax2):
+        # Sigmoid plus bias selects; the unbiased sigmoid of the picks is sum-normalized.
+        scores = torch.sigmoid(logits)
+        select = scores if routing_bias is None else scores + routing_bias.float()
+        if method == RoutingMethodType.DeepSeekV3 and (n_group or 0) > 1:
+            # Keep the topk_group groups with the largest sum of their top two scores.
+            groups = select.view(logits.shape[0], n_group, -1)
+            picked = groups.topk(2, dim=-1).values.sum(-1).topk(topk_group, dim=-1)
+            keep = torch.zeros_like(groups[..., 0], dtype=torch.bool)
+            keep.scatter_(1, picked.indices, True)
+            select = groups.masked_fill(~keep[..., None], float("-inf")).flatten(1)
+        ids = select.topk(top_k, dim=-1).indices
+        weights = scores.gather(1, ids)
+        scale = 1.0 if routed_scaling_factor is None else routed_scaling_factor
+        return ids.int(), weights / (weights.sum(-1, keepdim=True) + 1e-20) * scale
+    if method == RoutingMethodType.Default:
+        logits = torch.softmax(logits, dim=-1)
+    elif method in (RoutingMethodType.SigmoidRenorm, RoutingMethodType.Sigmoid):
+        logits = torch.sigmoid(logits)
+    elif method == RoutingMethodType.Unspecified:
+        raise NotImplementedError(f"routing_method_type={method!r} is not supported.")
+    weights, ids = logits.topk(top_k, dim=-1)
+    if method in (RoutingMethodType.Renormalize, RoutingMethodType.RenormalizeNaive):
+        weights = torch.softmax(weights, dim=-1)
+    elif method in (RoutingMethodType.TopKSigmoid, RoutingMethodType.Llama4):
+        weights = torch.sigmoid(weights)
+    elif method == RoutingMethodType.SigmoidRenorm and norm_topk_prob:
+        weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
+    return ids.int(), weights
+
+
+def _trtllm_fp4_block_scale_moe_sw(
+    routing_input_mode: int,
+    routing_logits: Optional[torch.Tensor],
+    topk_ids: Optional[torch.Tensor],
+    topk_weights: Optional[torch.Tensor],
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm1_bias: Optional[torch.Tensor],
+    gemm1_lora_delta: Optional[torch.Tensor],
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    gemm2_bias: Optional[torch.Tensor],
+    output1_scale_scalar: Optional[torch.Tensor],
+    output1_scale_gate_scalar: Optional[torch.Tensor],
+    output2_scale_scalar: Optional[torch.Tensor],
+    per_token_scale: Optional[torch.Tensor],
+    num_experts: int,
+    top_k: int,
+    num_fused_shared_experts: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    num_local_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int,
+    do_finalize: bool,
+    enable_pdl: Optional[bool],
+    activation_type: int,
+    output: Optional[torch.Tensor],
+    tune_max_num_tokens: int,
+    norm_topk_prob: bool,
+    routing_replay_out: Optional[torch.Tensor],
+    valid_hidden_size: Optional[int],
+    valid_intermediate_size: Optional[int],
+    hidden_states_scale_layout: Optional[SfLayout],
+) -> List[torch.Tensor]:
+    """The FP4 block-scale MoE op below SM100, where the trtllm-gen routing and
+    GEMM kernels cannot run.
+
+    Routing runs in torch and both GEMMs in FP32 on BF16-dequantized operands,
+    directly on the shuffled weights: their row shuffle only permutes the
+    output columns, which are put back in order before the epilogue. The
+    epilogue requantizes the intermediate like the kernel: NVFP4 with a global
+    scale of one (per token with ``per_token_scale``), MXFP8, or BF16.
+    """
+    from ..grouped_mm.core import (
+        _dequantized_grouped_mm,
+        _e2m1_to_bf16,
+        _scale_rows_to_bf16,
+    )
+    from ..quantization.fp4_quantization import block_scale_interleave, nvfp4_quantize
+    from ..quantization.nvfp4_quantization_utils import (
+        nvfp4_e4m3_max,
+        resolve_nvfp4_4over6,
+    )
+    from ..trace.templates.moe import _trtllm_unshuffle_weight
+    from .cute_dsl.moe_utils import get_max_num_permuted_tokens
+    from .prepare import _quantize_mxfp8_rows, _quantize_nvfp4_rows
+    from .runners import _combine_rows, _layout_from_topk
+    from .shared.validation import resolve_moe_act_sf_layout
+
+    act = ActivationType(activation_type)
+    if act not in (
+        ActivationType.Swiglu,
+        ActivationType.Geglu,
+        ActivationType.SwigluStep,
+        ActivationType.Situ,
+        ActivationType.Relu2,
+        ActivationType.Identity,
+    ):
+        raise NotImplementedError(f"activation_type={act!r} is not supported.")
+    if hidden_states_scale is not None:
+        resolve_moe_act_sf_layout(hidden_states_scale_layout)
+    nvfp4 = hidden_states.dtype == torch.uint8
+    fp8 = hidden_states.dtype == torch.float8_e4m3fn and hidden_states_scale is None
+    hidden_size = hidden_states.shape[1] * (2 if nvfp4 else 1)
+    _check_valid_hidden_size_supports_finalize(
+        valid_hidden_size, do_finalize, hidden_size
+    )
+    if output is not None and valid_hidden_size not in (None, output.shape[1]):
+        raise ValueError(
+            f"output.shape[1] must equal valid_hidden_size={valid_hidden_size}, "
+            f"got {output.shape[1]}"
+        )
+    if not (nvfp4 or fp8):
+        # Like the kernels, MXFP8 and BF16 activations ignore the output scalars.
+        output1_scale_scalar = output1_scale_gate_scalar = output2_scale_scalar = None
+    num_tokens = hidden_states.shape[0]
+    device = hidden_states.device
+
+    if routing_logits is not None:
+        topk_ids, topk_weights = _route_trtllm_moe_torch(
+            routing_logits,
+            routing_bias,
+            routing_method_type,
+            top_k,
+            n_group,
+            topk_group,
+            routed_scaling_factor,
+            norm_topk_prob,
+        )
+        topk_weights = topk_weights.bfloat16()
+        if routing_replay_out is not None:
+            routing_replay_out[:num_tokens].copy_(topk_ids)
+    elif topk_weights is None:
+        # Packed ``expert_id << 16 | bf16 weight``; the cast keeps the low 16 bits.
+        topk_weights = topk_ids.to(torch.int16).view(torch.bfloat16)
+        topk_ids = topk_ids >> 16
+    if num_fused_shared_experts:
+        # Every token also goes to the shared experts, with weight one.
+        shared = torch.arange(
+            num_experts,
+            num_experts + num_fused_shared_experts,
+            dtype=torch.int32,
+            device=device,
+        )
+        topk_ids = torch.cat((topk_ids, shared.expand(num_tokens, -1)), dim=1)
+        topk_weights = torch.cat(
+            (topk_weights, topk_weights.new_ones(num_tokens, shared.numel())), dim=1
+        )
+        num_local_experts += num_fused_shared_experts
+
+    num_rows = get_max_num_permuted_tokens(
+        num_tokens, topk_ids.shape[1], num_local_experts, 128
+    )
+    layout = _layout_from_topk(
+        topk_ids.int(),
+        num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
+        num_rows=num_rows,
+        segment_alignment=128,
+    )
+    assert layout.row_to_token is not None
+    row_expert = layout.row_expert(num_rows)
+
+    def per_row(values: Optional[torch.Tensor], default: Any = 1.0) -> Any:
+        """``[rows, 1]`` FP32 of a per-local-expert tensor, ``default`` if absent."""
+        if values is None:
+            return default
+        return values.float().index_select(0, row_expert)[:, None]
+
+    def gemm(a, a_exp, weights, weights_scale, bias, gated):
+        """FP32 ``a @ weights[e].T + bias[e]`` with the output columns in order."""
+        num_weights, n = weights.shape[:2]
+        b, b_exp = _scale_rows_to_bf16(
+            _e2m1_to_bf16(weights),
+            weights_scale,
+            num_weights,
+            n,
+            weights.numel() * 2 // weights_scale.numel(),
+        )
+        if b_exp is not None and a_exp is None:  # BF16 activations
+            a_exp = torch.zeros(a.shape[0], dtype=torch.int32, device=device)
+        out = _dequantized_grouped_mm(
+            a, b, a_exp, b_exp, layout.m_indptr, None, None, torch.float32
+        )
+        if bias is not None:
+            out += bias.float().index_select(0, row_expert)
+        # The kernel's weight row shuffle permutes the output columns.
+        return _trtllm_unshuffle_weight(out.t()[None], gated)[0].t().contiguous()
+
+    a, a_exp = hidden_states, None
+    if hidden_states_scale is not None:
+        a, a_exp = _scale_rows_to_bf16(
+            _e2m1_to_bf16(a) if nvfp4 else a.bfloat16(),
+            block_scale_interleave(
+                hidden_states_scale.view(torch.uint8).reshape(num_tokens, -1)
+            ),
+            1,
+            num_tokens,
+            16 if nvfp4 else 32,
+        )
+        if a_exp is not None:
+            a_exp = a_exp.index_select(0, layout.row_to_token)
+    a = a.bfloat16().index_select(0, layout.row_to_token)
+    if valid_hidden_size is not None:
+        # Zero padding in one operand contracts only the valid region.
+        a[:, valid_hidden_size:] = 0
+    x = gemm(a, a_exp, gemm1_weights, gemm1_weights_scale, gemm1_bias, act.is_gated)
+    if gemm1_lora_delta is not None:
+        rows = layout.token_to_row[:, :top_k].reshape(-1).long()
+        delta = gemm1_lora_delta.reshape(rows.numel(), -1).float()
+        x.index_add_(0, rows.clamp(min=0), delta * (rows >= 0)[:, None])
+    if per_token_scale is not None:
+        x = x * per_token_scale.float().index_select(0, layout.row_to_token)[:, None]
+
+    # output1_scale_gate_scalar dequantizes the accumulator. output1_scale_scalar
+    # is the intermediate's quantization scale, times that dequantization for the
+    # gated activations other than SiTU.
+    gate_scale = per_row(output1_scale_gate_scalar)
+    out_scale = per_row(output1_scale_scalar)
+    limit = per_row(gemm1_clamp_limit, None)
+    if not act.is_gated:
+        x = x * gate_scale
+        y = x if act == ActivationType.Identity else torch.relu(x).square()
+    else:
+        # Linear (first) and gate (second) halves.
+        x0 = x[:, :intermediate_size] * gate_scale
+        x1 = x[:, intermediate_size:] * gate_scale
+        if act == ActivationType.Situ:
+            alpha, beta = per_row(gemm1_alpha), per_row(gemm1_beta)
+            if limit is not None:  # raw accumulator limit
+                limit = limit * gate_scale
+                x0, x1 = x0.clamp(-limit, limit), x1.clamp(max=limit)
+            y = beta * torch.tanh(x0 / beta) * alpha * torch.tanh(x1 / alpha)
+            y = y * torch.sigmoid(x1)
+        elif act == ActivationType.SwigluStep:
+            # A raw accumulator limit, physical 7 by default.
+            limit = 7.0 if limit is None else limit * gate_scale
+            y = torch.nn.functional.silu(x1).clamp(max=limit) * x0.clamp(-limit, limit)
+        elif act == ActivationType.Geglu:
+            y = torch.nn.functional.gelu(x1) * x0
+        else:
+            if limit is not None:
+                x0, x1 = x0.clamp(-limit, limit), x1.clamp(max=limit)
+            y = x1 * torch.sigmoid(per_row(gemm1_alpha) * x1)
+            y = y * (x0 + per_row(gemm1_beta, 0.0))
+        if act != ActivationType.Situ:
+            out_scale = out_scale / gate_scale
+    y = (y * out_scale).bfloat16()
+    if valid_intermediate_size is not None:
+        y[:, valid_intermediate_size:] = 0
+
+    out_scale = per_row(output2_scale_scalar)
+    if nvfp4:
+        if per_token_scale is None:
+            # GEMM1's fused epilogue quantizes with the standard recipe.
+            intermediate, scale, dequant = _quantize_nvfp4_rows(y, nvfp4_4over6=None)
+        else:
+            # Like the kernel: per-token requantization with the environment's
+            # recipe, whose E4M3 limit also sets the global scale.
+            recipe = resolve_nvfp4_4over6()
+            intermediate, scale, dequant = nvfp4_quantize(
+                y,
+                1.0 / (6.0 * nvfp4_e4m3_max(recipe)),
+                per_token_activation=True,
+                nvfp4_4over6=recipe,
+            )
+        y, y_exp = _scale_rows_to_bf16(
+            _e2m1_to_bf16(intermediate), scale, 1, num_rows, 16
+        )
+        out_scale = out_scale * dequant.reshape(-1, 1)
+    elif fp8:
+        # The FP8 per-tensor epilogue saturates to E4M3; the scalars carry the scale.
+        intermediate = y.clamp(-448, 448).to(torch.float8_e4m3fn)
+        y, y_exp = intermediate.bfloat16(), None
+    elif hidden_states_scale is not None:
+        intermediate, scale = _quantize_mxfp8_rows(y)
+        y, y_exp = _scale_rows_to_bf16(intermediate.bfloat16(), scale, 1, num_rows, 32)
+    else:
+        intermediate, y_exp = y, None
+    out = gemm(y, y_exp, gemm2_weights, gemm2_weights_scale, gemm2_bias, False)
+    out = out * out_scale
+
+    expanded_idx_to_permuted_idx = layout.token_to_row.reshape(-1)
+    if not do_finalize:
+        result = [out.bfloat16(), topk_weights, expanded_idx_to_permuted_idx]
+    else:
+        if output is None:
+            output = torch.empty(
+                num_tokens,
+                _trtllm_moe_output_width(out.shape[1], valid_hidden_size),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        _combine_rows(
+            out[:, : output.shape[1]], layout.token_to_row, topk_weights, out=output
+        )
+        result = [output, expanded_idx_to_permuted_idx]
+    if gemm1_lora_delta is None:
+        return result[:1] if do_finalize else result
+    return [*result, intermediate]
+
+
 @flashinfer_api(trace=trtllm_fp4_block_scale_moe_trace_dispatch)
 def trtllm_fp4_block_scale_moe(
     routing_logits: torch.Tensor,
@@ -6398,6 +6726,10 @@ def trtllm_fp4_block_scale_moe(
     hidden_states_scale_layout: Optional[SfLayout] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
+
+    Below SM100 the routing and both GEMMs run in software: the GEMMs
+    dequantize their operands to BF16 and multiply them in FP32 like
+    :func:`~flashinfer.grouped_mm.grouped_mm_fp4`.
 
     Parameters
     ----------
@@ -6588,7 +6920,12 @@ def trtllm_fp4_block_scale_moe(
         top_k,
         num_tokens=hidden_states.shape[0],
     )
-    return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
+    moe_op = (
+        _trtllm_fp4_block_scale_moe_sw
+        if get_compute_capability(hidden_states.device)[0] < 10
+        else get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe
+    )
+    return moe_op(
         RoutingInputMode.FromLogits,
         routing_logits,
         None,
@@ -6680,6 +7017,8 @@ def trtllm_fp4_block_scale_routed_moe(
        id, low 16 bits = float16/bfloat16 weight, matching
        ``PackedScoreIdx`` in ``include/flashinfer/trtllm/fused_moe/RoutingKernel.h``).
     2. Unpacked format: ``topk_ids`` is a tuple ``(topk_ids, topk_weights)``.
+
+    Below SM100 this runs in software like :func:`trtllm_fp4_block_scale_moe`.
 
     Parameters
     ----------
@@ -6874,7 +7213,12 @@ def trtllm_fp4_block_scale_routed_moe(
             gemm1_lora_delta.to(torch.float32) * inv_dequant_ab[..., None]
         ).to(gemm1_lora_delta.dtype)
 
-    return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
+    moe_op = (
+        _trtllm_fp4_block_scale_moe_sw
+        if get_compute_capability(hidden_states.device)[0] < 10
+        else get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe
+    )
+    return moe_op(
         routing_mode,
         None,
         topk_ids_tensor,

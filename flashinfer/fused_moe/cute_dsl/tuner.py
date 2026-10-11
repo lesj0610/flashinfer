@@ -749,6 +749,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         can_implement methods using the actual problem dimensions from inputs.
         Supports both Blackwell and Rubin architectures.
         """
+        if inputs[0].is_cuda and get_compute_capability(inputs[0].device)[0] < 10:
+            return super().get_valid_tactics(inputs, profile)  # software path
         import cutlass
         from ...cute_dsl.utils import torch_to_cutlass_dtype
         from .moe_utils import get_max_num_permuted_tokens
@@ -1227,6 +1229,8 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[Tuple[Any, ...]]:
+        if inputs[0].is_cuda and get_compute_capability(inputs[0].device)[0] < 10:
+            return super().get_valid_tactics(inputs, profile)  # software path
         import cutlass
 
         from .moe_utils import get_max_num_permuted_tokens
@@ -1310,6 +1314,31 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             raise ValueError(
                 f"moe_output must have shape {(num_tokens, hidden_size)}, "
                 f"got {tuple(moe_output.shape)}"
+            )
+        if get_compute_capability(x.device)[0] < 10:
+            from .fused_moe import _moe_dequantized
+
+            return _moe_dequantized(
+                x,
+                None,
+                token_selected_experts,
+                token_final_scales,
+                w1_weight,
+                w1_weight_sf,
+                w1_alpha,
+                None,
+                w2_weight,
+                w2_weight_sf,
+                w2_alpha,
+                self.num_local_experts,
+                self.local_expert_offset,
+                moe_output,
+                activation_type=self.activation_type,
+                swiglu_alpha=self.swiglu_alpha,
+                swiglu_beta=self.swiglu_beta,
+                swiglu_limit=self.swiglu_limit,
+                situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta,
             )
         return launch_w4a16_moe(
             x=x,

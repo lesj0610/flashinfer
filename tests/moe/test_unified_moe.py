@@ -2549,12 +2549,15 @@ sm100_required = pytest.mark.skipif(
 )
 
 
-cute_dsl_sm100_required = pytest.mark.skipif(
+cute_dsl_arch_required = pytest.mark.skipif(
     not (
         torch.cuda.is_available()
-        and get_compute_capability(torch.device("cuda")) in ((10, 0), (10, 3), (10, 7))
+        and (
+            get_compute_capability(torch.device("cuda")) in ((10, 0), (10, 3), (10, 7))
+            or get_compute_capability(torch.device("cuda"))[0] in (8, 9)
+        )
     ),
-    reason="CuTeDSL unified MoE requires SM100, SM103, or SM107",
+    reason="CuTeDSL unified MoE requires SM80 to SM90, SM100, SM103, or SM107",
 )
 
 
@@ -2706,7 +2709,7 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
     )
 
 
-@cute_dsl_sm100_required
+@cute_dsl_arch_required
 @pytest.mark.parametrize(
     "quant",
     (

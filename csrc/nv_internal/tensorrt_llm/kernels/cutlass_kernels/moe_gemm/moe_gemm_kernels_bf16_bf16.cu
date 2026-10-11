@@ -19,5 +19,14 @@
 namespace tensorrt_llm::kernels::cutlass_kernels {
 #ifdef ENABLE_BF16
 template class MoeGemmRunner<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>;
+#if defined(FLASHINFER_FP4_SW_CVT)
+void moeGemmBf16Fp32Output(GroupedGemmInput<__nv_bfloat16, __nv_bfloat16, float, float> inputs,
+                           int sm_count) {
+  cutlass_kernels_oss::dispatchMoeGemmToCutlass<__nv_bfloat16, __nv_bfloat16, float,
+                                                cutlass::arch::Sm80,
+                                                cutlass_extensions::EpilogueOpDefault>(inputs,
+                                                                                       sm_count);
+}
+#endif
 #endif
 }  // namespace tensorrt_llm::kernels::cutlass_kernels
