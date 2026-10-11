@@ -33,6 +33,7 @@ from ..autotuner import AutoTuner
 from ..quantization.nvfp4_quantization_utils import _UNSET
 from ..utils import get_compute_capability
 from .api import (
+    _DEFAULT_BACKEND,
     BackendOptions,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -266,6 +267,13 @@ class MoELayer:
         rejected: List[str] = []
         for backend_cfg in config.backend:
             if not backend_cfg.supported(arch):
+                continue
+            # Below SM100 CuteDSL runs a software fallback: explicit selection only.
+            if (
+                arch < 100
+                and isinstance(backend_cfg, CuteDslConfig)
+                and config.backend is _DEFAULT_BACKEND
+            ):
                 continue
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
             if runner_cls is None:
