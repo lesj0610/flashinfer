@@ -199,6 +199,7 @@ def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
         supported_major_versions=[8]
     ) + [
         "-DENABLE_BF16",
+        "-DENABLE_FP8",
         "-DENABLE_FP4",
         "-DFLASHINFER_FP4_SW_CVT",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",

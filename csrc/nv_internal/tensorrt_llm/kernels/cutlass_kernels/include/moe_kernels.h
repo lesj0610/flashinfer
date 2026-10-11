@@ -626,6 +626,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 #endif
 
   static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
+  static constexpr bool dequantizable = MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType,
+                                                      IsMXFPX, Sm90Wfp4Afp8Mode>::dequantizable;
   static constexpr bool use_sm90_wfp4afp8 =
       use_wfp4afp8 && Sm90Wfp4Afp8Mode != Sm90Wfp4Afp8ScaleMode::kDisabled;
   static constexpr bool use_sm90_humming_pre_mma =
@@ -689,10 +691,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   // runner also reports the non-TMA (SM80/SM89-style) fallback configs.
   // Those paths cannot do FpX block scaling (they hard-assert
   // !use_block_scaling), so they must never be offered as tactics for an
-  // MXFP8 runner instantiation.
+  // MXFP8 runner instantiation, except below SM100 where they run dequantized.
   static std::vector<cutlass_extensions::CutlassGemmConfig> filterMxfp8Tactics(
       std::vector<cutlass_extensions::CutlassGemmConfig> configs) {
-    if constexpr (use_mxfp8) {
+    if constexpr (use_mxfp8 && !kDequantizedBelowSm100) {
       configs.erase(std::remove_if(configs.begin(), configs.end(),
                                    [](cutlass_extensions::CutlassGemmConfig const& config) {
                                      return !config.is_tma_warp_specialized;
@@ -943,10 +945,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
  private:
   bool mayHaveDifferentGEMMOutputType() const {
     // We just check if its supported because we need to know when calculating workspace size
-    // NVFP4 below SM100 runs its GEMMs dequantized, into the unquantized output type.
+    // Dequantized GEMMs below SM100 write the unquantized output type.
     return ((moe_gemm_runner_.supportsTmaWarpSpecialized() &&
              !std::is_same_v<T, UnfusedGemmOutputType>) ||
-            use_fp8 || use_fp4);
+            use_fp8 || dequantizable);
   }
 
   bool mayHaveFinalizeFused() const {
@@ -1179,7 +1181,7 @@ struct GemmProfilerBackend {
   }
 
   bool isNativeWfp4Afp8Family() const {
-    return mSM >= 100 && mDType == nvinfer1::DataType::kFP8 &&
+    return (mSM >= 100 || kDequantizedBelowSm100) && mDType == nvinfer1::DataType::kFP8 &&
            (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
   }
 

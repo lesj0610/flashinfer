@@ -115,7 +115,7 @@ def test_cutlass_bf16_config_architectures_and_registration():
     assert not CutlassW4A16Config.supported(100)
     assert not CutlassNvfp4Config.supported(75)
     assert not CutlassFp8BlockConfig.supported(100)
-    assert not CutlassMxfp8Config.supported(90)
+    assert not CutlassMxfp8Config.supported(75)
     assert not CutlassMxfp8Config.supported(110)
     assert not CutlassW4A8Config.supported(100)
     assert not CutlassHummingConfig.supported(100)
@@ -2712,17 +2712,17 @@ def _is_cutlass_mxfp8_runtime_supported() -> bool:
         return is_sm100a_supported(device)
     if arch == 107:
         return is_sm100f_supported(device)
-    return False
+    return arch < 100  # runs dequantized on SM80-SM90
 
 
 cutlass_mxfp8_mxfp4_required = pytest.mark.skipif(
-    not _is_cutlass_nvfp4_runtime_supported(),
-    reason="requires SM100/SM110/SM12x CUTLASS MXFP8xMXFP4 GPU and CUDA toolkit",
+    not _is_cutlass_nvfp4_runtime_supported(sw_fallback=True),
+    reason="requires SM80+ CUTLASS MXFP8xMXFP4 GPU and CUDA toolkit",
 )
 
 cutlass_mxfp8_required = pytest.mark.skipif(
     not _is_cutlass_mxfp8_runtime_supported(),
-    reason="requires SM100/SM103/SM107 CUTLASS MXFP8xMXFP8 GPU and CUDA toolkit",
+    reason="requires SM80-SM90 or SM100/SM103/SM107 CUTLASS MXFP8xMXFP8 GPU and CUDA toolkit",
 )
 
 cutlass_w4a8_required = pytest.mark.skipif(

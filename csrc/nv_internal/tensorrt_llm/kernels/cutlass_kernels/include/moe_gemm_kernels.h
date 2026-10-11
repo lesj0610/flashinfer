@@ -260,6 +260,13 @@ constexpr bool isGatedActivation(ActivationType activation_type) {
          activation_type == ActivationType::GegluTanh || activation_type == ActivationType::Situ;
 }
 
+// Modules built with FLASHINFER_FP4_SW_CVT (below SM100) run block-scaled GEMMs dequantized.
+#if defined(FLASHINFER_FP4_SW_CVT)
+inline constexpr bool kDequantizedBelowSm100 = true;
+#else
+inline constexpr bool kDequantizedBelowSm100 = false;
+#endif
+
 enum class Sm90Wfp4Afp8ScaleMode : uint8_t {
   // Native SM100+ FP8 x FP4 paths leave this SM90-only mode disabled.
   kDisabled = 0,
@@ -322,6 +329,9 @@ class MoeGemmRunner {
                 "FP8 activation x FP4 weight uses Sm90Wfp4Afp8ScaleMode, not generic IsMXFPX.");
 
   static constexpr bool use_sm90_mixed_input_gemm = use_w4afp8 || use_wfp4a16 || use_sm90_wfp4afp8;
+  // Block-scaled GEMMs that run dequantized below SM100 (see kDequantizedBelowSm100).
+  static constexpr bool dequantizable =
+      use_fp4 || use_mxfp8 || (use_wfp4afp8 && !use_sm90_wfp4afp8);
 
   void moeGemmBiasAct(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
                       TmaWarpSpecializedGroupedGemmInput hopper_inputs);

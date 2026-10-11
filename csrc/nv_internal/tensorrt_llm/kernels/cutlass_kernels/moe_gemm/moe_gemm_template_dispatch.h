@@ -574,17 +574,15 @@ std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<
   int const grouped_gemm_flag = CutlassGemmConfig::GROUPED_GEMM;
   int const enable_hopper = CutlassGemmConfig::NONE;
 
+  // Below SM100, block-scaled GEMMs are dequantized to the output type and run these configs.
+  constexpr bool dequantized = dequantizable && kDequantizedBelowSm100;
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
-      weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_hopper | fp8_only_flag);
+      dequantized
+          ? grouped_gemm_flag
+          : weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_hopper | fp8_only_flag);
 
-#if defined(FLASHINFER_FP4_SW_CVT)
-  // Below SM100, NVFP4 is dequantized to the output type and runs these configs.
-  constexpr bool ampere_fp4 = use_fp4;
-#else
-  constexpr bool ampere_fp4 = false;
-#endif
   if ((!tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>() &&
-       !ampere_fp4) ||
+       !dequantized) ||
       (use_w4afp8 && sm != 89) || use_wfp4a16) {
     return {};
   }
@@ -602,6 +600,9 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
               Sm90Wfp4Afp8Mode>::getTmaWarpSpecializedConfigs(int sm,
                                                               bool supports_finalize_fusion) {
   using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
+  if (dequantizable && kDequantizedBelowSm100 && sm < 100) {
+    return {};  // Dequantized below SM100, through the Ampere configs.
+  }
   static constexpr auto weight_only_flag =
       std::is_same<T, WeightType>::value ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
   static constexpr auto simt_only_flag =
