@@ -66,6 +66,14 @@ struct GroupedGemmInput {
   bool apply_alpha_scales = false;
 };
 
+// GEMM1 rows that a dequantized GEMM below SM100 reads in place: permuted row r is token
+// rows[r] % num_tokens of the routed input, with its scales in the input's 128x4 layout. Null rows
+// mean the expanded input.
+struct DequantizedInputRows {
+  int const* rows = nullptr;
+  int64_t num_tokens = 0;
+};
+
 struct TmaWarpSpecializedGroupedGemmInput {
   template <class Tag>
   using TransposeLayoutTag =
@@ -229,6 +237,7 @@ struct TmaWarpSpecializedGroupedGemmInput {
 
   uint8_t* gemm_workspace = nullptr;
   size_t gemm_workspace_size = 0;
+  DequantizedInputRows dequantized_input_rows;
   uint8_t* precomputed_scheduler_workspace = nullptr;
   size_t precomputed_scheduler_workspace_size = 0;
   int64_t precomputed_scheduler_total_routed_tokens = 0;

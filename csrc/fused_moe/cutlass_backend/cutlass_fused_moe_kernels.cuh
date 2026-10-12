@@ -1223,16 +1223,28 @@ float const** computeFP8DequantScale(float const** alpha_scale_ptr_array,
 // go back on the GEMM output together with alpha's exponent. That is exact unless a block's scale
 // is more than 2^124 below its row's largest one. Activation rows are grouped by
 // expert_first_token_offset and use the activation scale layout; weight rows use the weight one. A
-// null scale means a per-tensor operand.
+// null scale means a per-tensor operand. sf_offset is the row's scale base in the 128x4 layout and
+// source_row the row it reads, a token of the routed input when the rows are read in place.
 __device__ inline bool blockScaledRow(
     int64_t const row, int64_t const* expert_first_token_offset, int64_t const num_experts,
     int64_t const rows_per_expert, int64_t const cols,
-    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType const scaling_type, int64_t& sf_offset,
-    int64_t& local_row, int64_t& expert) {
+    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType const scaling_type,
+    DequantizedInputRows const& input, int64_t& sf_offset, int64_t& source_row, int64_t& local_row,
+    int64_t& expert) {
+  int const vecs_per_row = static_cast<int>(
+      cols / (scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+                  ? TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
+                  : TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize));
+  source_row = row;
   if (expert_first_token_offset) {
     if (row >= expert_first_token_offset[num_experts]) return false;
     expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts, row + 1) - 1;
     local_row = row - expert_first_token_offset[expert];
+    if (input.rows) {
+      source_row = input.rows[row] % input.num_tokens;
+      sf_offset = get_sf_out_offset_128x4(static_cast<int>(source_row), 0, vecs_per_row);
+      return true;
+    }
     sf_offset =
         getOffsetActivationSF(expert, expert_first_token_offset[expert], cols, scaling_type);
   } else {
@@ -1240,6 +1252,7 @@ __device__ inline bool blockScaledRow(
     local_row = row - expert * rows_per_expert;
     sf_offset = getOffsetWeightSF(expert, rows_per_expert, cols, scaling_type);
   }
+  sf_offset += get_sf_out_offset_128x4(static_cast<int>(local_row), 0, vecs_per_row);
   return true;
 }
 
@@ -1253,21 +1266,22 @@ __global__ void maxRowScaleKernel(int* row_max,
                                   TmaWarpSpecializedGroupedGemmInput::ElementSF const* sf,
                                   int64_t const* expert_first_token_offset, int64_t const* routed,
                                   int64_t const num_experts, int64_t const rows,
-                                  int64_t const rows_per_expert, int64_t const cols) {
+                                  int64_t const rows_per_expert, int64_t const cols,
+                                  DequantizedInputRows const input) {
   int const lane = threadIdx.x % 32;
   int const vecs_per_row =
       static_cast<int>(cols / TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize);
   int64_t const warps = int64_t(gridDim.x) * blockDim.x / 32;
   for (int64_t row = (blockIdx.x * int64_t(blockDim.x) + threadIdx.x) / 32; row < rows;
        row += warps) {
-    int64_t sf_offset, local_row, expert;
+    int64_t sf_offset, source_row, local_row, expert;
     if (!blockScaledRow(row, expert_first_token_offset, num_experts, rows_per_expert, cols,
-                        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, sf_offset,
-                        local_row, expert) ||
+                        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, input,
+                        sf_offset, source_row, local_row, expert) ||
         unroutedWeightRow(routed, expert)) {
       continue;
     }
-    auto const* sf_row = sf + sf_offset + get_sf_out_offset_128x4(local_row, 0, vecs_per_row);
+    auto const* sf_row = sf + sf_offset;
     int s = 0;
     for (int v = lane; v < vecs_per_row; v += 32) s = max(s, int(sf_row[(v >> 2) * 512 + (v & 3)]));
 #pragma unroll
@@ -1361,7 +1375,7 @@ __global__ void dequantizeBlockScaledRowsKernel(
     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType const scaling_type,
     int64_t const* expert_first_token_offset, int64_t const* routed, int64_t const num_experts,
     int64_t const rows, int64_t const rows_per_expert, int64_t const cols, int const* row_max,
-    bool const frag) {
+    bool const frag, DequantizedInputRows const input) {
   constexpr int kValues = 8;
   bool const nvfp4 = scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
   int const vec_shift = nvfp4 ? 4 : 5;
@@ -1370,18 +1384,18 @@ __global__ void dequantizeBlockScaledRowsKernel(
   int64_t const warps = int64_t(gridDim.x) * blockDim.x / 32;
   for (int64_t row = (blockIdx.x * int64_t(blockDim.x) + threadIdx.x) / 32; row < rows;
        row += warps) {
-    int64_t sf_offset, local_row, expert;
+    int64_t sf_offset, source_row, local_row, expert;
     if (!blockScaledRow(row, expert_first_token_offset, num_experts, rows_per_expert, cols,
-                        scaling_type, sf_offset, local_row, expert) ||
+                        scaling_type, input, sf_offset, source_row, local_row, expert) ||
         unroutedWeightRow(routed, expert)) {
       continue;
     }
     // The 128x4 layout splits into a row part and, per vector, (vec / 4) * 512 + vec % 4.
-    auto const* sf_row =
-        sf ? sf + sf_offset + get_sf_out_offset_128x4(local_row, 0, vecs_per_row) : nullptr;
+    auto const* sf_row = sf ? sf + sf_offset : nullptr;
     int const shift = row_max ? row_max[row] : 0;
     OutputType* out_row = out + row * cols;
-    uint8_t const* in_row = in + (std::is_same_v<InputType, Fp4Type> ? row * cols / 2 : row * cols);
+    uint8_t const* in_row =
+        in + (std::is_same_v<InputType, Fp4Type> ? source_row * cols / 2 : source_row * cols);
     constexpr bool kPaired = std::is_same_v<OutputType, __nv_bfloat16>;
     for (int col = lane * kValues; col < cols; col += 32 * kValues) {
       uint32_t s = 0;
@@ -1562,7 +1576,8 @@ __global__ void __launch_bounds__(128, 3)
                           TmaWarpSpecializedGroupedGemmInput::ElementSF const* weight_sf,
                           int const* act_row_max, float const* alpha,
                           int64_t const* expert_first_token_offset, int const num_experts,
-                          int64_t const act_tiles, int64_t const n, int64_t const k) {
+                          int64_t const act_tiles, int64_t const n, int64_t const k,
+                          DequantizedInputRows const input) {
   constexpr int kTilesM = 2, kWarpsK = 2, kWarpRows = 16 * kTilesM;
   constexpr bool kStage = !std::is_void_v<ActType>;
   static_assert(!kStage || kTilesT == 1);
@@ -1575,6 +1590,7 @@ __global__ void __launch_bounds__(128, 3)
   __shared__ int weight_row_max[kFusedRowsPerCta];
   __shared__ uint4 staged[kStage ? kStageChunks * 4 * 32 : 1];
   __shared__ int act_max[8];
+  __shared__ int64_t act_rows[8], act_sf_rows[8];  // a staged pass's source rows and scale bases
   // With fewer CTA rows than experts, CTA row y takes the y-th expert that has rows.
   int const expert = gridDim.y == num_experts
                          ? blockIdx.y
@@ -1642,20 +1658,28 @@ __global__ void __launch_bounds__(128, 3)
     for (int tt = 0; tt < kTilesT; ++tt) {
       boff[tt] = kStage ? 0 : (std::min(tile + tt, act_tiles - 1) - tile) * tile_stride;
     }
+    if constexpr (kStage) {
+      if (threadIdx.x < rows) {
+        int64_t const row = row0 + threadIdx.x;
+        int64_t const source = input.rows ? input.rows[row] % input.num_tokens : row;
+        act_rows[threadIdx.x] = source;
+        act_sf_rows[threadIdx.x] =
+            input.rows
+                ? get_sf_out_offset_128x4(static_cast<int>(source), 0, vecs_per_row)
+                : getOffsetActivationSF(expert, row_begin, k, scaling_type) +
+                      get_sf_out_offset_128x4(static_cast<int>(row - row_begin), 0, vecs_per_row);
+      }
+      __syncthreads();
+    }
     // Per-tensor activations count as E4M3 1.0 or E8M0 127 blocks.
-    int64_t const act_sf_expert =
-        kStage ? getOffsetActivationSF(expert, row_begin, k, scaling_type) : 0;
-    auto act_scale = [&](int64_t const row, int const vec) {
+    auto act_scale = [&](int const r, int const vec) {
       if (!act_sf) return kMx ? 127u : 0x38u;
-      return uint32_t(
-          act_sf[act_sf_expert +
-                 get_sf_out_offset_128x4(static_cast<int>(row - row_begin), 0, vecs_per_row) +
-                 (vec >> 2) * 512 + (vec & 3)]);
+      return uint32_t(act_sf[act_sf_rows[r] + (vec >> 2) * 512 + (vec & 3)]);
     };
     if constexpr (kStage && kMx) {
       for (int r = warp; r < rows; r += 4) {
         int s = 0;
-        for (int v = lane; v < vecs_per_row; v += 32) s = max(s, int(act_scale(row0 + r, v)));
+        for (int v = lane; v < vecs_per_row; v += 32) s = max(s, int(act_scale(r, v)));
 #pragma unroll
         for (int o = 16; o > 0; o /= 2) s = max(s, __shfl_xor_sync(0xFFFFFFFFu, s, o));
         if (lane == 0) act_max[r] = s;
@@ -1670,7 +1694,7 @@ __global__ void __launch_bounds__(128, 3)
       int const groups = std::min(seg_chunks, chunks - seg0) * 16;
       for (int idx = threadIdx.x; idx < rows * groups; idx += blockDim.x) {
         int const r = idx / groups;
-        int64_t const row = row0 + r;
+        int64_t const row = act_rows[r];
         int const kk = seg0 * 128 + idx % groups * 8;
         uint4 v;
         __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&v);
@@ -1689,7 +1713,7 @@ __global__ void __launch_bounds__(128, 3)
             bits[j] = magnitude << 4 | (y << 8 & 0x80008000u) |
                       ((magnitude + 0x00010001u) & 0x00800080u) * 0xFFu;
           }
-          scale = blockScaleBf16<true>(act_scale(row, kk / 32), act_max[r] + 6);
+          scale = blockScaleBf16<true>(act_scale(r, kk / 32), act_max[r] + 6);
         } else {
           uint32_t const word = *reinterpret_cast<uint32_t const*>(
               static_cast<uint8_t const*>(act) + row * (k / 2) + kk / 2);
@@ -1698,7 +1722,7 @@ __global__ void __launch_bounds__(128, 3)
             uint32_t const x = word >> (4 * j);
             bits[j] = (x << 6 & 0x01C001C0u) | (x << 12 & 0x80008000u);
           }
-          scale = blockScaleBf16<false>(act_scale(row, kk / 16), 0);
+          scale = blockScaleBf16<false>(act_scale(r, kk / 16), 0);
         }
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -2065,7 +2089,8 @@ void dequantizedGroupedGemm(
     float const* alpha, float const** alpha_scale_ptr_array, OutputType* output,
     int64_t const* expert_first_token_offset, int64_t const num_rows, int64_t const n,
     int64_t const k, int const num_experts, cutlass_extensions::CutlassGemmConfig const& config,
-    void* const workspace, size_t const workspace_size, cudaStream_t stream) {
+    void* const workspace, size_t const workspace_size, cudaStream_t stream,
+    DequantizedInputRows const& input_rows = {}) {
   if (num_rows == 0) return;  // no blocks to launch
   constexpr bool mx = !std::is_same_v<InputType, Fp4Type>;
   using GemmType = std::conditional_t<mx, __nv_bfloat16, OutputType>;
@@ -2112,12 +2137,13 @@ void dequantizedGroupedGemm(
   }
   if (act_row_max) {
     launch(maxRowScaleKernel, num_rows * 32, act_row_max, input_sf, expert_first_token_offset,
-           static_cast<int64_t const*>(nullptr), int64_t(num_experts), num_rows, num_rows, k);
+           static_cast<int64_t const*>(nullptr), int64_t(num_experts), num_rows, num_rows, k,
+           input_rows);
   }
   if (weight_row_max) {
     launch(maxRowScaleKernel, num_experts * n * 32, weight_row_max, weight_sf,
            static_cast<int64_t const*>(nullptr), expert_first_token_offset, int64_t(num_experts),
-           num_experts * n, n, k);
+           num_experts * n, n, k, DequantizedInputRows{});
   }
   if (fused) {
     // At most num_rows experts have rows, so fewer rows than experts launch only that many CTA
@@ -2127,17 +2153,18 @@ void dequantizedGroupedGemm(
     if (staged) {
       fusedSmallMGemmKernel<OutputType, mx, 1, InputType><<<grid, 128, 0, stream>>>(
           output, input, input_sf, static_cast<uint8_t const*>(weights), weight_sf, nullptr, alpha,
-          expert_first_token_offset, num_experts, 0, n, k);
+          expert_first_token_offset, num_experts, 0, n, k, input_rows);
       return;
     }
     launch(dequantizeBlockScaledRowsKernel<__nv_bfloat16, InputType>, num_rows * 32,
            static_cast<__nv_bfloat16*>(a), static_cast<uint8_t const*>(input), input_sf,
            scaling_type, expert_first_token_offset, static_cast<int64_t const*>(nullptr),
-           int64_t(num_experts), num_rows, num_rows, k, static_cast<int const*>(act_row_max), true);
+           int64_t(num_experts), num_rows, num_rows, k, static_cast<int const*>(act_row_max), true,
+           input_rows);
     if (num_rows <= 32 * num_experts) {
       fusedSmallMGemmKernel<OutputType, mx, 4><<<grid, 128, 0, stream>>>(
           output, a, nullptr, static_cast<uint8_t const*>(weights), weight_sf, act_row_max, alpha,
-          expert_first_token_offset, num_experts, a_rows / 8, n, k);
+          expert_first_token_offset, num_experts, a_rows / 8, n, k, DequantizedInputRows{});
     } else {
       fusedTiledGemmKernel<OutputType, mx><<<grid, 128, 0, stream>>>(
           output, static_cast<uint4 const*>(a), static_cast<uint8_t const*>(weights), weight_sf,
@@ -2148,11 +2175,12 @@ void dequantizedGroupedGemm(
   launch(dequantizeBlockScaledRowsKernel<GemmType, InputType>, num_rows * 32,
          static_cast<GemmType*>(a), static_cast<uint8_t const*>(input), input_sf, scaling_type,
          expert_first_token_offset, static_cast<int64_t const*>(nullptr), int64_t(num_experts),
-         num_rows, num_rows, k, static_cast<int const*>(act_row_max), false);
+         num_rows, num_rows, k, static_cast<int const*>(act_row_max), false, input_rows);
   launch(dequantizeBlockScaledRowsKernel<GemmType, WeightType>, num_experts * n * 32,
          static_cast<GemmType*>(b), static_cast<uint8_t const*>(weights), weight_sf, scaling_type,
          static_cast<int64_t const*>(nullptr), expert_first_token_offset, int64_t(num_experts),
-         num_experts * n, n, k, static_cast<int const*>(weight_row_max), false);
+         num_experts * n, n, k, static_cast<int const*>(weight_row_max), false,
+         DequantizedInputRows{});
   GroupedGemmInput<GemmType, GemmType, GemmOutputType, GemmOutputType> gemm_input{
       static_cast<GemmType*>(a),
       expert_first_token_offset + 1,
@@ -2214,7 +2242,8 @@ void dequantizedFcGemm(Fp4 const& fp4, Mxfp8Mxfp4 const& mxfp8_mxfp4, Fp8Mxfp4 c
   dequantizedGroupedGemm<OutputType, T, WeightType>(
       input, nvfp4 || mxfp8_act ? act_sf : nullptr, weights, static_cast<SF const*>(weight_sf),
       alpha, alpha_scale_ptr_array, output, expert_first_token_offset, num_rows, n, k, num_experts,
-      config, tma_ws_input.gemm_workspace, tma_ws_input.gemm_workspace_size, stream);
+      config, tma_ws_input.gemm_workspace, tma_ws_input.gemm_workspace_size, stream,
+      tma_ws_input.dequantized_input_rows);
 }
 #endif
 
@@ -5441,16 +5470,28 @@ void CutlassMoeFCRunner<
       humming_permuted_token_selected_experts = permuted_token_selected_experts_;
       act_fp8_token_scale_ptr_array = alpha_scale_ptr_array_fc1_;
     }
-    expandInputRowsKernelLauncher(
-        input_activations, gemm1_input_expand, token_topk_unpermuted_scales,
-        permuted_token_final_scales_, permuted_row_to_unpermuted_row_,
-        humming_permuted_token_selected_experts, num_rows, hidden_size, experts_per_token,
-        num_experts_per_node, quant_params, use_per_expert_act_scale, expert_first_token_offset_,
-        fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
-        (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr,
-        fp8_token_dequant_scale, fp8_expert_residual_scale, act_fp8_token_scale_ptr_array,
-        enable_pdl, stream);
-    auto const* gemm1_input = gemm1_input_expand;
+    // Below SM100, a GEMM1 on quantized input reads it in place instead of an expanded copy.
+    DequantizedInputRows input_rows{};
+    if constexpr (dequantizable && std::is_same_v<InputType, T>) {
+      if (moe_gemm_runner_.getSM() < 100 && swizzled_input_sf && !use_lora &&
+          !permuted_token_final_scales_) {
+        input_rows = {permuted_row_to_unpermuted_row_, num_rows};
+      }
+    }
+    if (!input_rows.rows) {
+      expandInputRowsKernelLauncher(
+          input_activations, gemm1_input_expand, token_topk_unpermuted_scales,
+          permuted_token_final_scales_, permuted_row_to_unpermuted_row_,
+          humming_permuted_token_selected_experts, num_rows, hidden_size, experts_per_token,
+          num_experts_per_node, quant_params, use_per_expert_act_scale, expert_first_token_offset_,
+          fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
+          (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr,
+          fp8_token_dequant_scale, fp8_expert_residual_scale, act_fp8_token_scale_ptr_array,
+          enable_pdl, stream);
+    }
+    auto const* gemm1_input =
+        input_rows.rows ? reinterpret_cast<T const*>(input_activations) : gemm1_input_expand;
+    auto const* gemm1_input_sf = input_rows.rows ? input_sf : fc1_fp4_act_scale_;
 
     sync_check_cuda_error(stream);
 
@@ -5460,6 +5501,7 @@ void CutlassMoeFCRunner<
         fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
         min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config,
         enable_pdl, stream);
+    gemm1_tma_ws_input.dequantized_input_rows = input_rows;
 
     auto* gemm1_result = fc1_result_;
     auto* gemm2_result = fc2_result_;
@@ -5492,7 +5534,7 @@ void CutlassMoeFCRunner<
 
     if constexpr (!use_w4afp8) {
       gemm1_input =
-          applyPrequantScale(smoothed_act_, permuted_data_, quant_params.groupwise.fc1.act_scales,
+          applyPrequantScale(smoothed_act_, gemm1_input, quant_params.groupwise.fc1.act_scales,
                              num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
     }
     sync_check_cuda_error(stream);
@@ -5501,7 +5543,7 @@ void CutlassMoeFCRunner<
                 humming_permuted_token_selected_experts, gemm1_tma_ws_input, fc1_expert_weights,
                 fc1_expert_biases, num_valid_tokens_ptr, fc1_int_scales, fc1_fp8_dequant,
                 use_wfp4afp8 ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant, act_fp8_token_scale_,
-                fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows,
+                gemm1_input_sf, fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows,
                 hidden_size, inter_size, num_experts_per_node, fc1_activation_type,
                 alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_, false, nullptr,
                 nullptr, enable_pdl);
