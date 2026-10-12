@@ -1233,7 +1233,8 @@ __device__ inline int64_t inputScaleRow(DequantizedInputRows const& input, int64
 // is more than 2^124 below its row's largest one. Activation rows are grouped by
 // expert_first_token_offset and use the activation scale layout; weight rows use the weight one. A
 // null scale means a per-tensor operand. sf_offset is the row's scale base and source_row the row
-// it reads, a token of the routed input when the rows are read in place.
+// it reads, a token of the routed input when the rows are read in place. The whole warp takes the
+// row: its lanes count the experts that end at or before an activation row together.
 __device__ inline bool blockScaledRow(
     int64_t const row, int64_t const* expert_first_token_offset, int64_t const num_experts,
     int64_t const rows_per_expert, int64_t const cols,
@@ -1247,10 +1248,14 @@ __device__ inline bool blockScaledRow(
   source_row = row;
   if (expert_first_token_offset) {
     if (row >= expert_first_token_offset[num_experts]) return false;
-    expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts, row + 1) - 1;
+    int ended = 0;
+    for (int64_t e = threadIdx.x % 32; e < num_experts; e += 32) {
+      ended += expert_first_token_offset[e + 1] <= row;
+    }
+    expert = __reduce_add_sync(0xFFFFFFFFu, ended);
     local_row = row - expert_first_token_offset[expert];
     if (input.rows) {
-      source_row = input.rows[row] % input.num_tokens;
+      source_row = input.rows[row] % static_cast<int>(input.num_tokens);
       sf_offset = inputScaleRow(input, source_row, vecs_per_row);
       return true;
     }
@@ -1360,6 +1365,17 @@ __device__ inline __nv_bfloat162 fusedScalePair(uint32_t const x) {
   return __hmul2(__hmul2(scale, two119), two119);
 }
 
+// E4M3 bytes j and j + 4 of x as a BF16 pair that reads 2^-120 * value: the bits go to the BF16
+// exponent and mantissa fields, subnormal values included, and 0x7F and 0xFF get an all-ones
+// exponent.
+__device__ inline uint32_t e4m3PairBits(uint2 const x, int const j) {
+  uint32_t y;
+  asm("prmt.b32 %0, %1, %2, %3;" : "=r"(y) : "r"(x.x), "r"(x.y), "r"(0x4400u + j * 0x1111u));
+  uint32_t const magnitude = y & 0x007F007Fu;
+  return magnitude << 4 | (y << 8 & 0x80008000u) |
+         ((magnitude + 0x00010001u) & 0x00800080u) * 0xFFu;
+}
+
 // Index (in 16-bit values) of the register that holds activation values k and k + 4 (k % 8 < 4) of
 // a row in the order fusedSmallMGemmKernel reads: per 8-row tile and pair of k16 steps, each lane
 // holds the b0/b1 registers of both steps in 16 bytes.
@@ -1404,7 +1420,9 @@ __global__ void dequantizeBlockScaledRowsKernel(
     // A scale is at the row's base plus, per vector, (vec / 4) * sf_group_stride + vec % 4.
     auto const* sf_row = sf ? sf + sf_offset : nullptr;
     int const shift = row_max ? row_max[row] : 0;
-    OutputType* out_row = out + row * cols;
+    OutputType* out_row =
+        frag ? out + fusedFragIndex(fusedPaddedRow(row, local_row, expert), 3, cols)
+             : out + row * cols;
     uint8_t const* in_row =
         in + (std::is_same_v<InputType, Fp4Type> ? source_row * cols / 2 : source_row * cols);
     constexpr bool kPaired = std::is_same_v<OutputType, __nv_bfloat16>;
@@ -1433,7 +1451,7 @@ __global__ void dequantizeBlockScaledRowsKernel(
         }
         __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&packed_out);
         __nv_bfloat162 const scale2 =
-            nvfp4 ? blockScaleBf16<false>(s, 0) : blockScaleBf16<true>(s, shift);
+            nvfp4 ? fusedScalePair(s * 0x101u) : blockScaleBf16<true>(s, shift);
         __nv_bfloat162 two8;
         *reinterpret_cast<uint32_t*>(&two8) = 0x43804380u;
 #pragma unroll
@@ -1451,27 +1469,21 @@ __global__ void dequantizeBlockScaledRowsKernel(
 #pragma unroll
         for (int j = 0; j < kValues / 2; ++j) pairs[j] = __hmul2(pairs[j], scale2);
       } else {
-        uint2 const packed = *reinterpret_cast<uint2 const*>(in_row + col);
-        OutputType values[kValues];
-#pragma unroll
-        for (int j = 0; j < kValues; j += 2) {
-          __nv_fp8x2_e4m3 pair;
-          pair.__x = (j < 4 ? packed.x : packed.y) >> (8 * (j % 4)) & 0xFFFF;
-          float2 const v = float2(pair);
-          values[j] = OutputType(v.x * scale);
-          values[j + 1] = OutputType(v.y * scale);
-        }
-        uint16_t const* v = reinterpret_cast<uint16_t const*>(values);
+        // E4M3 pairs (j, j + 4) as e4m3PairBits reads them, and the scale carries 2^120 (relative
+        // to the row's largest scale, if any), so the products are exact.
+        static_assert(kPaired, "E4M3 rows dequantize to BF16");
+        uint2 const x = *reinterpret_cast<uint2 const*>(in_row + col);
+        __nv_bfloat162 const scale2 = blockScaleBf16<true>(s, shift + 6);
+        __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&packed_out);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          words[j] =
-              kPaired ? v[j] | uint32_t(v[j + 4]) << 16 : v[2 * j] | uint32_t(v[2 * j + 1]) << 16;
+          words[j] = e4m3PairBits(x, j);
+          pairs[j] = __hmul2(pairs[j], scale2);
         }
       }
       if (frag) {
         // Pair j goes to register 3 - j of the same 16 bytes.
-        *reinterpret_cast<uint4*>(
-            out + fusedFragIndex(fusedPaddedRow(row, local_row, expert), col + 3, cols)) =
+        *reinterpret_cast<uint4*>(out_row + fusedFragIndex(0, col + 3, cols)) =
             make_uint4(words[3], words[2], words[1], words[0]);
       } else {
         *reinterpret_cast<uint4*>(out_row + col) = packed_out;
@@ -1743,15 +1755,7 @@ __global__ void __launch_bounds__(128, 3)
           uint2 const x =
               *reinterpret_cast<uint2 const*>(static_cast<uint8_t const*>(act) + row * k + kk);
 #pragma unroll
-          for (int j = 0; j < 4; ++j) {
-            uint32_t y;
-            asm("prmt.b32 %0, %1, %2, %3;"
-                : "=r"(y)
-                : "r"(x.x), "r"(x.y), "r"(0x4400u + j * 0x1111u));
-            uint32_t const magnitude = y & 0x007F007Fu;
-            bits[j] = magnitude << 4 | (y << 8 & 0x80008000u) |
-                      ((magnitude + 0x00010001u) & 0x00800080u) * 0xFFu;
-          }
+          for (int j = 0; j < 4; ++j) bits[j] = e4m3PairBits(x, j);
           scale = blockScaleBf16<true>(act_scale(r, kk / 32), act_max[r] + 6);
         } else {
           uint32_t const word = *reinterpret_cast<uint32_t const*>(
