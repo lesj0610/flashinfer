@@ -555,6 +555,11 @@ class CutlassMoeFCRunnerInterface {
       bool enable_pdl, cudaStream_t stream) = 0;
 
   virtual size_t getGemmWorkspaceSize(int num_experts_per_node) const = 0;
+  // The GEMM workspace of a dequantized GEMM below SM100 for num_rows rows of n x k, else 0.
+  virtual size_t getDequantizedGemmWorkspaceSize(int64_t num_rows, int64_t n, int64_t k,
+                                                 int num_experts_per_node) const {
+    return 0;
+  }
 
   bool is_profiler = false;
   bool use_fused_finalize_ = true;
@@ -838,6 +843,9 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   virtual size_t getGemmWorkspaceSize(int num_experts_per_node) const override {
     return moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
   }
+
+  size_t getDequantizedGemmWorkspaceSize(int64_t num_rows, int64_t n, int64_t k,
+                                         int num_experts_per_node) const override;
 
   std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
   computeStridesTmaWarpSpecializedDispatch(
