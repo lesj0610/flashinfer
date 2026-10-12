@@ -67,11 +67,13 @@ struct GroupedGemmInput {
 };
 
 // GEMM1 rows that a dequantized GEMM below SM100 reads in place: permuted row r is token
-// rows[r] % num_tokens of the routed input, with its scales in the input's 128x4 layout. Null rows
-// mean the expanded input.
+// rows[r] % num_tokens of the routed input, with its scales at that token's place in the input's
+// scale layout. A row's scale vectors go in groups of 4, sf_group_stride apart: 512 in the 128x4
+// layout, 4 in the linear one. Null rows mean the expanded input.
 struct DequantizedInputRows {
   int const* rows = nullptr;
   int64_t num_tokens = 0;
+  int sf_group_stride = 512;
 };
 
 struct TmaWarpSpecializedGroupedGemmInput {

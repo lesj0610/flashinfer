@@ -1215,6 +1215,15 @@ float const** computeFP8DequantScale(float const** alpha_scale_ptr_array,
 }
 
 #if defined(FLASHINFER_FP4_SW_CVT)
+// The scale base of a token of an in-place input. Linear rows hold their vectors rounded up to a
+// multiple of 4, as expandInputRows reads them.
+__device__ inline int64_t inputScaleRow(DequantizedInputRows const& input, int64_t const token,
+                                        int const vecs_per_row) {
+  return input.sf_group_stride == 4
+             ? token * ((vecs_per_row + 3) / 4 * 4)
+             : get_sf_out_offset_128x4(static_cast<int>(token), 0, vecs_per_row);
+}
+
 // Below SM100 a block-scaled GEMM dequantizes both operands and runs the SM80 grouped GEMM with the
 // per-expert alpha in its FP32 epilogue. Each value is an E2M1 or E4M3 code times an E4M3 or E8M0
 // block scale. NVFP4 values are exact in the output type. An E8M0 scale times its code can overflow
@@ -1223,8 +1232,8 @@ float const** computeFP8DequantScale(float const** alpha_scale_ptr_array,
 // go back on the GEMM output together with alpha's exponent. That is exact unless a block's scale
 // is more than 2^124 below its row's largest one. Activation rows are grouped by
 // expert_first_token_offset and use the activation scale layout; weight rows use the weight one. A
-// null scale means a per-tensor operand. sf_offset is the row's scale base in the 128x4 layout and
-// source_row the row it reads, a token of the routed input when the rows are read in place.
+// null scale means a per-tensor operand. sf_offset is the row's scale base and source_row the row
+// it reads, a token of the routed input when the rows are read in place.
 __device__ inline bool blockScaledRow(
     int64_t const row, int64_t const* expert_first_token_offset, int64_t const num_experts,
     int64_t const rows_per_expert, int64_t const cols,
@@ -1242,7 +1251,7 @@ __device__ inline bool blockScaledRow(
     local_row = row - expert_first_token_offset[expert];
     if (input.rows) {
       source_row = input.rows[row] % input.num_tokens;
-      sf_offset = get_sf_out_offset_128x4(static_cast<int>(source_row), 0, vecs_per_row);
+      sf_offset = inputScaleRow(input, source_row, vecs_per_row);
       return true;
     }
     sf_offset =
@@ -1283,7 +1292,9 @@ __global__ void maxRowScaleKernel(int* row_max,
     }
     auto const* sf_row = sf + sf_offset;
     int s = 0;
-    for (int v = lane; v < vecs_per_row; v += 32) s = max(s, int(sf_row[(v >> 2) * 512 + (v & 3)]));
+    for (int v = lane; v < vecs_per_row; v += 32) {
+      s = max(s, int(sf_row[(v >> 2) * input.sf_group_stride + (v & 3)]));
+    }
 #pragma unroll
     for (int o = 16; o > 0; o /= 2) s = max(s, __shfl_xor_sync(0xFFFFFFFFu, s, o));
     if (lane == 0) row_max[row] = s;
@@ -1390,7 +1401,7 @@ __global__ void dequantizeBlockScaledRowsKernel(
         unroutedWeightRow(routed, expert)) {
       continue;
     }
-    // The 128x4 layout splits into a row part and, per vector, (vec / 4) * 512 + vec % 4.
+    // A scale is at the row's base plus, per vector, (vec / 4) * sf_group_stride + vec % 4.
     auto const* sf_row = sf ? sf + sf_offset : nullptr;
     int const shift = row_max ? row_max[row] : 0;
     OutputType* out_row = out + row * cols;
@@ -1402,7 +1413,7 @@ __global__ void dequantizeBlockScaledRowsKernel(
       float scale = 1.0f;
       if (sf_row) {
         int const vec = col >> vec_shift;
-        s = sf_row[(vec >> 2) * 512 + (vec & 3)];
+        s = sf_row[(vec >> 2) * input.sf_group_stride + (vec & 3)];
         // E8M0 is 2^(s - 127) and s = 255 is NaN; the row's largest scale is taken out.
         scale = nvfp4      ? e4m3ToFloat(s)
                 : s == 255 ? __uint_as_float(0x7fc00000u)
@@ -1693,7 +1704,7 @@ __global__ void __launch_bounds__(128, 3)
         act_rows[threadIdx.x] = source;
         act_sf_rows[threadIdx.x] =
             input.rows
-                ? get_sf_out_offset_128x4(static_cast<int>(source), 0, vecs_per_row)
+                ? inputScaleRow(input, source, vecs_per_row)
                 : getOffsetActivationSF(expert, row_begin, k, scaling_type) +
                       get_sf_out_offset_128x4(static_cast<int>(row - row_begin), 0, vecs_per_row);
       }
@@ -1702,7 +1713,7 @@ __global__ void __launch_bounds__(128, 3)
     // Per-tensor activations count as E4M3 1.0 or E8M0 127 blocks.
     auto act_scale = [&](int const r, int const vec) {
       if (!act_sf) return kMx ? 127u : 0x38u;
-      return uint32_t(act_sf[act_sf_rows[r] + (vec >> 2) * 512 + (vec & 3)]);
+      return uint32_t(act_sf[act_sf_rows[r] + (vec >> 2) * input.sf_group_stride + (vec & 3)]);
     };
     if constexpr (kStage && kMx) {
       for (int r = warp; r < rows; r += 4) {
@@ -5607,9 +5618,8 @@ void CutlassMoeFCRunner<
     // Below SM100, a GEMM1 on quantized input reads it in place instead of an expanded copy.
     DequantizedInputRows input_rows{};
     if constexpr (dequantizable && std::is_same_v<InputType, T>) {
-      if (moe_gemm_runner_.getSM() < 100 && swizzled_input_sf && !use_lora &&
-          !permuted_token_final_scales_) {
-        input_rows = {permuted_row_to_unpermuted_row_, num_rows};
+      if (moe_gemm_runner_.getSM() < 100 && !use_lora && !permuted_token_final_scales_) {
+        input_rows = {permuted_row_to_unpermuted_row_, num_rows, swizzled_input_sf ? 512 : 4};
       }
     }
     if (!input_rows.rows) {
