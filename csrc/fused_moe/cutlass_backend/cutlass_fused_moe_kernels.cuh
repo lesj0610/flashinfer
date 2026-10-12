@@ -1921,9 +1921,10 @@ __global__ void __launch_bounds__(128, 3)
 }
 
 // More rows: a pass takes 64 of the expert's rows (8 tiles of fusedFragIndex order) for 64 weight
-// rows. Warp w takes weight rows 16 w + g and + 8 over all of K, one chunk ahead as above, and the
-// pass's activation tiles come through shared memory (cp.async, two buffers) for all 4 warps, so
-// each converted weight register feeds 16 mma. Each pass reads the CTA's weights again.
+// rows. Warp w takes weight rows 16 w + g and + 8 over all of K. The pass's activation tiles and
+// the CTA's weights and scales come through shared memory (cp.async, two buffers, one chunk ahead)
+// for all 4 warps, so each converted weight register feeds 16 mma. Each pass reads the CTA's
+// weights again.
 template <class OutputType, bool kMx>
 __global__ void __launch_bounds__(128, 3)
     fusedTiledGemmKernel(OutputType* out, uint4 const* act, uint8_t const* weights,
@@ -1934,6 +1935,8 @@ __global__ void __launch_bounds__(128, 3)
                          FusedActivation const epi) {
   constexpr int kTiles = 8;
   __shared__ uint4 tiles[2][kTiles][128];
+  __shared__ uint4 weight_chunk[2][kFusedRowsPerCta][4];  // a chunk's 64 bytes of each row
+  __shared__ uint32_t sf_chunk[2][kFusedRowsPerCta][2];   // and its scales (MX: the first word)
   __shared__ int weight_row_max[kFusedRowsPerCta];
   int const expert = gridDim.y == num_experts
                          ? blockIdx.y
@@ -1949,10 +1952,22 @@ __global__ void __launch_bounds__(128, 3)
   int64_t const row_bytes = k / 2;
   auto const scaling_type = kMx ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
                                 : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
-  int64_t const w_row = fusedWeightRow(epi, 16 * warp) + g;
-  uint8_t const* const w_base = weights + (expert * n + w_row) * row_bytes + 16 * t;
-  auto const* const sf_row0 = weight_sf + getOffsetWeightSF(expert, n, k, scaling_type) +
-                              get_sf_out_offset_128x4(static_cast<int>(w_row), 0, vecs_per_row);
+  auto const* const expert_sf = weight_sf + getOffsetWeightSF(expert, n, k, scaling_type);
+  auto row_sf = [&](int const lr) {
+    return expert_sf +
+           get_sf_out_offset_128x4(static_cast<int>(fusedWeightRow(epi, lr)), 0, vecs_per_row);
+  };
+  auto const* const sf_row0 = row_sf(16 * warp + g);
+  // Thread i copies 16 bytes of rows i / 4 and i / 4 + 32 per chunk, and the scales of row i / 2
+  // (MX: of row i, i < 64).
+  uint8_t const* w_src[2];
+#pragma unroll
+  for (int j = 0; j < 2; ++j) {
+    w_src[j] = weights + (expert * n + fusedWeightRow(epi, threadIdx.x / 4 + 32 * j)) * row_bytes +
+               threadIdx.x % 4 * 16;
+  }
+  auto const* const sf_src =
+      row_sf(kMx ? threadIdx.x % 64 : threadIdx.x / 2) + (kMx ? 0 : threadIdx.x % 2 * 512);
   int row_max[2] = {0, 0};
   if constexpr (kMx) {
 #pragma unroll
@@ -1968,19 +1983,10 @@ __global__ void __launch_bounds__(128, 3)
       if (t == 0) weight_row_max[16 * warp + 8 * h + g] = row_max[h];
     }
   }
-  // Thread t's scales: MX vec = 4c + t, NVFP4 vecs 8c + 2t and + 1, at (vec / 4) * 512 + vec % 4.
-  auto const* const sf_base = sf_row0 + (kMx ? t : t / 2 * 512 + 2 * t % 4);
-  constexpr int kSfStep = kMx ? 512 : 1024;
   int64_t const tile_stride = k / 32 * 32;
-  struct Chunk {
-    uint4 w[2];
-    uint32_t sf[2];
-  };
   for (int64_t row0 = row_begin; row0 < row_end; row0 += 8 * kTiles) {
     int64_t const tile = fusedPaddedRow(row0, row0 - row_begin, expert) / 8;
     float acc[kTiles][4] = {};
-    uint8_t const* wp = w_base;
-    auto const* sp = sf_base;
     // Chunk c of the pass's 8 tiles is 8 runs of 128 uint4; thread i copies element i of each.
     auto copy = [&](int const c, int const buf) {
 #pragma unroll
@@ -1991,26 +1997,38 @@ __global__ void __launch_bounds__(128, 3)
             static_cast<uint32_t>(__cvta_generic_to_shared(&tiles[buf][q][threadIdx.x]));
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src));
       }
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        uint32_t const dst = static_cast<uint32_t>(__cvta_generic_to_shared(
+            &weight_chunk[buf][threadIdx.x / 4 + 32 * j][threadIdx.x % 4]));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst),
+                     "l"(w_src[j] + c * 64));
+      }
+      // The 128x4 layout holds a row's 4 scales of a 4-vector group together, groups 512 apart.
+      if (!kMx || threadIdx.x < kFusedRowsPerCta) {
+        uint32_t const dst = static_cast<uint32_t>(
+            __cvta_generic_to_shared(kMx ? &sf_chunk[buf][threadIdx.x][0]
+                                         : &sf_chunk[buf][threadIdx.x / 2][threadIdx.x % 2]));
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(dst),
+                     "l"(sf_src + c * (kMx ? 512 : 1024)));
+      }
       asm volatile("cp.async.commit_group;");
     };
-    auto load = [&](Chunk& ch) {
-#pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        ch.w[h] = *reinterpret_cast<uint4 const*>(wp + 8 * h * row_bytes);
-        ch.sf[h] = kMx ? uint32_t(sp[8 * h * 16])
-                       : uint32_t(*reinterpret_cast<uint16_t const*>(sp + 8 * h * 16));
-      }
-      wp += 64;
-      sp += kSfStep;
-    };
-    auto compute = [&](Chunk const& ch, int const buf) {
+    // Thread t's weights are 16 bytes of its rows; its scales are MX vec 4c + t and NVFP4 vecs
+    // 8c + 2t and + 1.
+    auto compute = [&](int const buf) {
+      uint4 w[2];
       __nv_bfloat162 scale[2][2];
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
+        int const row = 16 * warp + 8 * h + g;
+        w[h] = weight_chunk[buf][row][t];
         if constexpr (kMx) {
-          scale[h][0] = scale[h][1] = blockScaleBf16<kMx>(ch.sf[h], row_max[h]);
+          uint32_t const sf = reinterpret_cast<uint8_t const*>(&sf_chunk[buf][row][0])[t];
+          scale[h][0] = scale[h][1] = blockScaleBf16<kMx>(sf, row_max[h]);
         } else {
-          __nv_bfloat162 const pair = fusedScalePair(ch.sf[h]);
+          __nv_bfloat162 const pair =
+              fusedScalePair(reinterpret_cast<uint16_t const*>(&sf_chunk[buf][row][0])[t]);
           scale[h][0] = __low2bfloat162(pair);
           scale[h][1] = __high2bfloat162(pair);
         }
@@ -2018,9 +2036,9 @@ __global__ void __launch_bounds__(128, 3)
 #pragma unroll
       for (int wi = 0; wi < 4; ++wi) {
         uint4 const lo =
-            fusedWeightValues(reinterpret_cast<uint32_t const*>(&ch.w[0])[wi], scale[0][wi / 2]);
+            fusedWeightValues(reinterpret_cast<uint32_t const*>(&w[0])[wi], scale[0][wi / 2]);
         uint4 const hi =
-            fusedWeightValues(reinterpret_cast<uint32_t const*>(&ch.w[1])[wi], scale[1][wi / 2]);
+            fusedWeightValues(reinterpret_cast<uint32_t const*>(&w[1])[wi], scale[1][wi / 2]);
         uint4 b[kTiles];
 #pragma unroll
         for (int tt = 0; tt < kTiles; ++tt) b[tt] = tiles[buf][tt][wi * 32 + lane];
@@ -2034,28 +2052,24 @@ __global__ void __launch_bounds__(128, 3)
         }
       }
     };
-    // Before chunk c's buffer is read, every warp waits for its copies and has left chunk c - 1,
-    // whose buffer then takes chunk c + 1.
-    Chunk c0, c1;
-    load(c0);
+    // Before chunk c's buffers are read, every warp waits for its copies and has left chunk c - 1,
+    // whose buffers then take chunk c + 1.
     copy(0, 0);
     int c = 0;
     for (; c + 1 < chunks; c += 2) {
-      load(c1);
       asm volatile("cp.async.wait_group 0;");
       __syncthreads();
       copy(c + 1, 1);
-      compute(c0, 0);
-      if (c + 2 < chunks) load(c0);
+      compute(0);
       asm volatile("cp.async.wait_group 0;");
       __syncthreads();
       if (c + 2 < chunks) copy(c + 2, 0);
-      compute(c1, 1);
+      compute(1);
     }
     if (c < chunks) {
       asm volatile("cp.async.wait_group 0;");
       __syncthreads();
-      compute(c0, 0);
+      compute(0);
     }
     __syncthreads();
     // The tiles' space holds the pass's sums for coalesced stores.
