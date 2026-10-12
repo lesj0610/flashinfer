@@ -2082,9 +2082,15 @@ __global__ void __launch_bounds__(128, 3)
       fusedActivationEpilogue<OutputType, kMx>(epi, result, row0, 8 * kTiles, valid_rows, row_begin,
                                                expert);
     } else {
-      for (int idx = threadIdx.x; idx < 8 * kTiles * kFusedRowsPerCta; idx += blockDim.x) {
-        int const r = idx / kFusedRowsPerCta, col = idx % kFusedRowsPerCta;
-        if (r < valid_rows) out[(row0 + r) * n + n_cta + col] = result(r, col);
+      // Each thread stores 4 adjacent outputs of a row at once.
+      for (int idx = threadIdx.x; idx < 2 * kTiles * kFusedRowsPerCta; idx += blockDim.x) {
+        int const r = idx / (kFusedRowsPerCta / 4), col = idx % (kFusedRowsPerCta / 4) * 4;
+        if (r < valid_rows) {
+          alignas(8) OutputType const v[4] = {result(r, col), result(r, col + 1),
+                                              result(r, col + 2), result(r, col + 3)};
+          *reinterpret_cast<uint2*>(out + (row0 + r) * n + n_cta + col) =
+              *reinterpret_cast<uint2 const*>(v);
+        }
       }
     }
     __syncthreads();
