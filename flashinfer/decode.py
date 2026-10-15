@@ -1851,7 +1851,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
                 args.append(0)  # num_colocated_ctas
-                args.append(q_len_per_req if q_len_per_req > 1 else 0)  # uniform_q_len
+                args.append(q_len_per_req)  # uniform_q_len
+                args.append(True)  # fixed_uniform_q_len
         else:
             if self._jit_module is not None:
                 module = self._jit_module
@@ -2489,7 +2490,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
                 args.append(0)  # num_colocated_ctas
-                args.append(q_len_per_req if q_len_per_req > 1 else 0)  # uniform_q_len
+                args.append(q_len_per_req)  # uniform_q_len
+                args.append(True)  # fixed_uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -5103,9 +5105,8 @@ def fast_decode_plan(
                     args.append(fixed_split_size)
                     args.append(disable_split_kv)
                     args.append(0)  # num_colocated_ctas
-                    args.append(
-                        q_len_per_req if q_len_per_req > 1 else 0
-                    )  # uniform_q_len
+                    args.append(q_len_per_req)  # uniform_q_len
+                    args.append(True)  # fixed_uniform_q_len
                 self._plan_info = self._cached_module.plan(
                     *args,
                 )
