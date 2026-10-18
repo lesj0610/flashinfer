@@ -111,14 +111,15 @@ inline __device__ void quantizeAndStore(QuantT* dstPtr, uint4 vec, T const clamp
 // FP4/MXFP8 Conversion Functions
 
 #if defined(FLASHINFER_FP4_SW_CVT)
-// cvt.rn.satfinite.e2m1x2.f32 for one value: ties-to-even against the E2M1 midpoints, NaN -> +6.
+// cvt.rn.satfinite.e2m1x2.f32 for one value: ties-to-even against the E2M1 midpoints, NaN -> +6. The code's
+// bits are three decisions on the magnitude: >= 1.75, then >= 3.5 or 0.75, then > 5, 2.5, 1.25 or 0.25.
 __device__ __forceinline__ uint32_t fp32_to_e2m1_sw(float x) {
   uint32_t const bits = __float_as_uint(x);
   uint32_t const mag = bits & 0x7FFFFFFFu;
-  uint32_t const code = (mag > 0x3E800000u) + (mag >= 0x3F400000u) + (mag > 0x3FA00000u) +
-                        (mag >= 0x3FE00000u) + (mag > 0x40200000u) + (mag >= 0x40600000u) +
-                        (mag > 0x40A00000u);
-  return (mag > 0x7F800000u ? 0u : bits >> 28 & 0x8u) | code;
+  uint32_t const hi = mag >= 0x3FE00000u;
+  uint32_t const mid = mag >= (hi ? 0x40600000u : 0x3F400000u);
+  uint32_t const lo = mag > (hi ? (mid ? 0x40A00000u : 0x40200000u) : (mid ? 0x3FA00000u : 0x3E800000u));
+  return (mag > 0x7F800000u ? 0u : bits >> 28 & 0x8u) | hi << 2 | mid << 1 | lo;
 }
 #endif
 
