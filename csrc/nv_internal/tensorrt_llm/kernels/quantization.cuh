@@ -231,7 +231,8 @@ quantize_with_block_size(
 #endif
     int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
     float const* SFScale, void* out, uint32_t* SFout, QuantizationSFLayout layout) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000 || (defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ >= 800))
   // The elements per thread.
   static constexpr int ELTS_PER_THREAD =
       quantization_type == BlockScaleQuantizationType::FP8_TO_FP4 ? CVT_FP8_TO_FP4_ELTS_PER_THREAD
@@ -285,7 +286,9 @@ quantize_with_block_size(
   int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
   int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
+#if __CUDA_ARCH__ >= 900
   asm volatile("griddepcontrol.wait;");
+#endif
 
   // Input tensor batch/row/col loops.
   // Optimization: Iterate over actual rows first (hot path), then padding rows (cold path)
@@ -389,7 +392,9 @@ quantize_with_block_size(
       }
     }
   }
+#if __CUDA_ARCH__ >= 900
   asm volatile("griddepcontrol.launch_dependents;");
+#endif
 #endif
 }
 
@@ -406,7 +411,8 @@ quantize_with_block_size_tma(
     int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
     float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout,
     const __grid_constant__ CUtensorMap tensor_map) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000 || (defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ >= 900))
   using Traits = TmaKernelTraits<Type>;
   using SmemType = typename Traits::SmemType;
 
@@ -626,7 +632,8 @@ cvt_fp16_to_fp4_expert(
 #endif
     int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out,
     uint32_t* SFout, int32_t* mask, bool use_silu_and_mul, int n_experts) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000 || (defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ >= 800))
   using PackedVecT = PackedVec<Type, CVT_FP16_TO_FP4_ELTS_PER_THREAD>;
   // Packed fp4 output type: 8 fp4 elts fit in 32 bits, 16 fp4 elts in 64 bits.
   using PackedFp4OutT =
