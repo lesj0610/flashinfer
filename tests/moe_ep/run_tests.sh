@@ -278,7 +278,7 @@ run_oracle() {
   "${PY}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py -v \
-    -m arch_blackwell || rc=1
+    -k "test_split_bf16_kernel_matches_torch_reference or test_split_nvfp4_kernel_matches_torch_reference" || rc=1
 
   MEGA_NO_DIST=1 "${TORCHRUN}" --standalone --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \

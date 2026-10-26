@@ -37,19 +37,20 @@ namespace cutlass::gemm::collective {
 namespace detail {
 
 template <int capacity_bytes, class ElementA, class ElementB, class ElementScale, class ElementZero,
-          class TileShapeMNK, int alignment = 128, int stages>
+          class ElementActScale, class TileShapeMNK, int alignment = 128, int stages>
 constexpr int compute_stage_count_or_override_folded_weight_scale(cute::Int<stages> stage_count) {
   return stages;
 }
 
 template <int capacity_bytes, class ElementA, class ElementB, class ElementScale, class ElementZero,
-          class TileShapeMNK, int alignment = 128, int stages>
+          class ElementActScale, class TileShapeMNK, int alignment = 128, int stages>
 constexpr int compute_stage_count_or_override_folded_weight_scale(StageCount<stages> stage_count) {
   return stages;
 }
 
 template <int capacity_bytes_, class ElementA, class ElementB, class ElementScale,
-          class ElementZero, class TileShapeMNK, int alignment = 128, int carveout_bytes_>
+          class ElementZero, class ElementActScale, class TileShapeMNK, int alignment = 128,
+          int carveout_bytes_>
 constexpr int compute_stage_count_or_override_folded_weight_scale(
     StageCountAutoCarveout<carveout_bytes_> stage_count) {
   constexpr auto mainloop_pipeline_bytes =
@@ -66,6 +67,11 @@ constexpr int compute_stage_count_or_override_folded_weight_scale(
   constexpr auto scale_bytes = cutlass::bits_to_bytes(s_bits * size<0>(TileShapeMNK{}) *
                                                       size<2>(TileShapeMNK{}) / scale_group_size);
   constexpr auto zero_bytes = cutlass::bits_to_bytes(z_bits * size<0>(TileShapeMNK{}));
+  // Activation E8M0 arrives as whole 128-row atoms.
+  constexpr int act_scale_rows = cute::max(int(size<1>(TileShapeMNK{})), 128);
+  constexpr auto act_scale_bytes =
+      cutlass::bits_to_bytes(get_bits_for_possibly_void_element<ElementActScale>() *
+                             act_scale_rows * size<2>(TileShapeMNK{}) / scale_group_size);
   static_assert(scale_bytes % 16 == 0,
                 "Folded weight-scale bulk copy must be at least 16B aligned.");
   static_assert(zero_bytes % 128 == 0, "Zero bytes must be a multiple of 128");
@@ -73,11 +79,16 @@ constexpr int compute_stage_count_or_override_folded_weight_scale(
   constexpr int stage_bytes_ =
       cutlass::bits_to_bytes(a_bits * size<0>(TileShapeMNK{}) * size<2>(TileShapeMNK{})) +
       cutlass::bits_to_bytes(b_bits * size<1>(TileShapeMNK{}) * size<2>(TileShapeMNK{})) +
-      scale_bytes + zero_bytes;
+      scale_bytes + zero_bytes + act_scale_bytes;
 
   constexpr int stage_bytes =
       cutlass::round_up(stage_bytes_, alignment) + static_cast<int>(mainloop_pipeline_bytes);
-  constexpr int carveout_bytes = cutlass::round_up(carveout_bytes_, alignment);
+  // Exact block exponents also keep FP32 activation factors, two buffers per consumer warpgroup.
+  constexpr int act_factor_bytes = cute::is_void_v<ElementActScale>
+                                       ? 0
+                                       : 2 * 2 * size<1>(TileShapeMNK{}) * size<2>(TileShapeMNK{}) /
+                                             scale_group_size * static_cast<int>(sizeof(float));
+  constexpr int carveout_bytes = cutlass::round_up(carveout_bytes_ + act_factor_bytes, alignment);
   constexpr int capacity_bytes = capacity_bytes_ / alignment * alignment;
 
   constexpr int computed_stage_count = (capacity_bytes - carveout_bytes) / stage_bytes;
@@ -129,7 +140,7 @@ struct CollectiveBuilderMixedInput<
   using ElementA = detail::deduce_mixed_width_dtype_t<0, ElementA_>;
   using ElementB = detail::deduce_mixed_width_dtype_t<0, ElementB_>;
 
-  static_assert(!IsMixedInput ||
+  static_assert(!IsMixedInput || ScaleMode == MixedInputScaleMode::kExactBlockE8M0 ||
                     (cute::is_tuple<ElementA_>::value ^ cute::is_tuple<ElementB_>::value ||
                      (NeitherIsTuple &&
                       (sizeof_bits<ElementA>::value != sizeof_bits<ElementB>::value))),
@@ -206,9 +217,18 @@ struct CollectiveBuilderMixedInput<
                                             KernelPtrArrayTmaWarpSpecializedCooperative>,
                           Layout<Shape<_2, _1, _1>>, Layout<Shape<_1, _1, _1>>>;
 
+  // Exact block exponents keep a warpgroup's FP32 accumulator and FP8 partial within 192
+  // registers: an N tile up to 128 wide takes one 64xN MMA, a wider one 64x64 MMAs.
+  static constexpr int ExactMmaAtomN =
+      size<1>(TileShape_MNK{}) <= 128 ? int(size<1>(TileShape_MNK{})) : 64;
+  using MmaAtomShape_MNK =
+      cute::conditional_t<ScaleMode == MixedInputScaleMode::kExactBlockE8M0,
+                          Shape<decltype(get<0>(TileShape_MNK{})), cute::Int<ExactMmaAtomN>,
+                                decltype(get<2>(TileShape_MNK{}))>,
+                          TileShape_MNK>;
   using TiledMma = decltype(cute::make_tiled_mma(
       cute::GMMA::rs_op_selector<RealElementAMma, RealElementBMma, ElementAccumulator,
-                                 TileShape_MNK, GMMA::Major::K, GMMA::Major::K>(),
+                                 MmaAtomShape_MNK, GMMA::Major::K, GMMA::Major::K>(),
       AtomLayoutMNK{}));
 
   using GmemTiledCopyA =
@@ -242,15 +262,19 @@ struct CollectiveBuilderMixedInput<
           ? (IsArrayOfPointersGemm
                  ? detail::compute_stage_count_or_override_folded_weight_scale<
                        Sm90ReducedSmemCapacityBytes, RealElementA, RealElementB, ElementScale,
-                       ElementZero, TileShape_MNK, SmemAlignment>(StageCountType{})
+                       ElementZero, ScaleB, TileShape_MNK, SmemAlignment>(StageCountType{})
                  : detail::compute_stage_count_or_override_folded_weight_scale<
                        detail::sm90_smem_capacity_bytes, RealElementA, RealElementB, ElementScale,
-                       ElementZero, TileShape_MNK, SmemAlignment>(StageCountType{}))
+                       ElementZero, ScaleB, TileShape_MNK, SmemAlignment>(StageCountType{}))
           : detail::compute_stage_count_or_override<detail::sm90_smem_capacity_bytes, ElementAMma,
                                                     ElementBMma, TileShape_MNK, SmemAlignment>(
                 StageCountType{});
 
-  static constexpr bool UseFusedE8M0PreMmaScale = ScaleMode == MixedInputScaleMode::kPreMmaE8M0;
+  static constexpr bool UseFusedE8M0PreMmaScale = ScaleMode == MixedInputScaleMode::kPreMmaE8M0 ||
+                                                  ScaleMode == MixedInputScaleMode::kExactBlockE8M0;
+  static_assert((ScaleMode == MixedInputScaleMode::kExactBlockE8M0) ==
+                    (!cute::is_void_v<ScaleA> && !cute::is_void_v<ScaleB>),
+                "Only the exact block-exponent mode scales both operands.");
   static_assert(
       !UseFusedE8M0PreMmaScale || (IsArrayOfPointersGemm && IsATransformed &&
                                    cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&

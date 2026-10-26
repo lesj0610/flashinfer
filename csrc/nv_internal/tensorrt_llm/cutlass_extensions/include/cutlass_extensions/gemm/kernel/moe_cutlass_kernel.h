@@ -95,6 +95,10 @@ struct MoeFCGemm {
   using ElementA = typename MapArguments::ElementA;
   using LayoutA = typename MapArguments::LayoutA;
   using ElementB = typename MapArguments::ElementB;
+  // Weights that carry scales: INT8, INT4 and E2M1 (NVFP4, in groups of 16).
+  static constexpr bool kE2m1B = platform::is_same<float_e2m1_t, ElementB>::value;
+  static constexpr bool kScaledB = platform::is_same<uint8_t, ElementB>::value ||
+                                   platform::is_same<uint4b_t, ElementB>::value || kE2m1B;
   using LayoutB = typename MapArguments::LayoutB;
   using ElementC = typename Epilogue::OutputTileIterator::Element;
   using LayoutC = typename MapArguments::LayoutC;
@@ -162,6 +166,9 @@ struct MoeFCGemm {
     // Included so we can use Gemm Universal
     int batch_stride_D = 0;
 
+    // E2M1 weights with per-token activations: FP32 scale per row of A, padded by a tile.
+    float const* row_scales = nullptr;
+
     //
     // Methods
     //
@@ -210,8 +217,7 @@ struct MoeFCGemm {
           gemm_n(gemm_n),
           gemm_k(gemm_k),
           host_problem_sizes(nullptr) {
-      if (platform::is_same<uint8_t, ElementB>::value ||
-          platform::is_same<uint4b_t, ElementB>::value) {
+      if (kScaledB) {
         assert(weight_scales);
       }
       this->gather_A_indices = nullptr;
@@ -245,6 +251,7 @@ struct MoeFCGemm {
     int const* gather_A_indices;
     int const* gather_B_indices;
     int const* scatter_D_indices;
+    float const* row_scales = nullptr;
 
     //
     // Methods
@@ -279,7 +286,8 @@ struct MoeFCGemm {
           C_is_broadcast(args.C_is_broadcast),
           gather_A_indices(args.gather_A_indices),
           gather_B_indices(args.gather_B_indices),
-          scatter_D_indices(args.scatter_D_indices) {}
+          scatter_D_indices(args.scatter_D_indices),
+          row_scales(args.row_scales) {}
 
     CUTLASS_HOST_DEVICE
     void update(Arguments const& args, void* workspace = nullptr, int tile_count = 0) {
@@ -298,6 +306,7 @@ struct MoeFCGemm {
       gather_A_indices = args.gather_A_indices;
       gather_B_indices = args.gather_B_indices;
       scatter_D_indices = args.scatter_D_indices;
+      row_scales = args.row_scales;
     }
   };
 
@@ -322,8 +331,7 @@ struct MoeFCGemm {
   }
 
   static Status can_implement(Arguments const& args) {
-    if constexpr (platform::is_same<uint8_t, ElementB>::value ||
-                  platform::is_same<uint4b_t, ElementB>::value) {
+    if constexpr (kScaledB) {
       if (args.weight_scales == nullptr) {
         CUTLASS_TRACE_HOST(
             "MoeFCGemm::can_implement() - weight scales are required for uint8_t and uint4b_t");
@@ -395,7 +403,8 @@ struct MoeFCGemm {
       }
 
       if constexpr (isFinegrained(Mma::QuantOp)) {
-        if (args.group_size != 128 && args.group_size != args.gemm_k) {
+        if (kE2m1B ? args.group_size != 16
+                   : args.group_size != 128 && args.group_size != args.gemm_k) {
           return Status::kErrorNotSupported;
         }
       }
@@ -571,6 +580,27 @@ struct MoeFCGemm {
         mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, iterator_scale, accumulators);
       } else {
         mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
+      }
+
+      if constexpr (kE2m1B) {
+        if (params.row_scales) {
+          // Each accumulator row times its FP32 scale, read in the accumulators' own fragment
+          // layout: a column-major view with zero column stride repeats row_scales[row].
+          using IteratorC = typename Mma::Operator::IteratorC;
+          using IteratorRowScale = warp::MmaTensorOpAccumulatorTileIterator<
+              typename IteratorC::Shape, float, layout::ColumnMajor,
+              typename IteratorC::InstructionShape, typename IteratorC::OpDelta>;
+          int const warp_m =
+              warp_idx % (Mma::WarpCount::kM * Mma::WarpCount::kN) % Mma::WarpCount::kM;
+          float* row_scale = const_cast<float*>(params.row_scales) + rows_to_jump +
+                             threadblock_offset.m() + warp_m * IteratorC::Shape::kRow;
+          typename IteratorRowScale::Fragment scales;
+          IteratorRowScale({row_scale, layout::ColumnMajor(0)}, lane_idx).load(scales);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < scales.size(); ++i) {
+            accumulators[i] *= scales[i];
+          }
+        }
       }
 
       //

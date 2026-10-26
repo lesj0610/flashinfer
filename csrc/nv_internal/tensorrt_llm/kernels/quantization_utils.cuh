@@ -111,14 +111,16 @@ inline __device__ void quantizeAndStore(QuantT* dstPtr, uint4 vec, T const clamp
 // FP4/MXFP8 Conversion Functions
 
 #if defined(FLASHINFER_FP4_SW_CVT)
-// cvt.rn.satfinite.e2m1x2.f32 for one value: ties-to-even against the E2M1 midpoints, NaN -> +6. The code's
-// bits are three decisions on the magnitude: >= 1.75, then >= 3.5 or 0.75, then > 5, 2.5, 1.25 or 0.25.
+// cvt.rn.satfinite.e2m1x2.f32 for one value: ties-to-even against the E2M1 midpoints, NaN -> +6.
+// The code's bits are three decisions on the magnitude: >= 1.75, then >= 3.5 or 0.75, then >
+// 5, 2.5, 1.25 or 0.25.
 __device__ __forceinline__ uint32_t fp32_to_e2m1_sw(float x) {
   uint32_t const bits = __float_as_uint(x);
   uint32_t const mag = bits & 0x7FFFFFFFu;
   uint32_t const hi = mag >= 0x3FE00000u;
   uint32_t const mid = mag >= (hi ? 0x40600000u : 0x3F400000u);
-  uint32_t const lo = mag > (hi ? (mid ? 0x40A00000u : 0x40200000u) : (mid ? 0x3FA00000u : 0x3E800000u));
+  uint32_t const lo =
+      mag > (hi ? (mid ? 0x40A00000u : 0x40200000u) : (mid ? 0x3FA00000u : 0x3E800000u));
   return (mag > 0x7F800000u ? 0u : bits >> 28 & 0x8u) | hi << 2 | mid << 1 | lo;
 }
 #endif
@@ -465,7 +467,7 @@ template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
           bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
     PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout,
-    float rowAmax = 0.0f) {
+    float rowAmax = 0.0f, uint8_t* SFlocal = nullptr) {
 #if defined(__CUDA_ARCH__) && \
     (__CUDA_ARCH__ >= 1000 || (defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ >= 800))
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
@@ -479,6 +481,16 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
                 "NVFP4 4over6 requires NVFP4 scale blocks");
 
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
+  // The block's scale goes to SFout (written by one of the block's threads) and, for callers that
+  // use it right away, to every thread's SFlocal.
+  auto const storeSF = [&](uint8_t sf) {
+    if (SFout) {
+      *SFout = sf;
+    }
+    if (SFlocal) {
+      *SFlocal = sf;
+    }
+  };
 
   // Get absolute maximum values among the local 8 values.
   auto localMax = cuda_abs(vec.elts[0]);
@@ -546,9 +558,7 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
   if constexpr (!UE8M0_SF && IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
 #if !(defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000)
     if (vecMax == 0.0f) {
-      if (SFout) {
-        *SFout = 0;
-      }
+      storeSF(0);
       return ReturnType{0};
     }
 #endif
@@ -620,9 +630,23 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     uint64_t const e2m1Bits6 = static_cast<uint64_t>(e2m1Vec6);
     float error4 = 0.0f;
     float error6 = 0.0f;
+#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
+    // A 16-element thread (the TMA kernel) sums its block as two halves of 8, the order of the
+    // 8-element threads and their shuffle: the 4/6 choice must not depend on the thread width.
+    float error4Lo = 0.0f;
+    float error6Lo = 0.0f;
+#endif
 
 #pragma unroll
     for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
+#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
+      if (CVT_ELTS_PER_THREAD == 16 && i == 4) {
+        error4Lo = error4;
+        error6Lo = error6;
+        error4 = 0.0f;
+        error6 = 0.0f;
+      }
+#endif
       uint32_t const byte4 = static_cast<uint32_t>((e2m1Bits4 >> (8 * i)) & 0xFF);
       uint32_t const byte6 = static_cast<uint32_t>((e2m1Bits6 >> (8 * i)) & 0xFF);
       if constexpr (NVFP4_4OVER6_CONFIG::errUseFastMath) {
@@ -683,31 +707,26 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
       error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 2));
     }
 #if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
+    if constexpr (CVT_ELTS_PER_THREAD == 16) {
+      error4 = __fadd_rn(error4Lo, error4);
+      error6 = __fadd_rn(error6Lo, error6);
+    }
     // A zero block returns only now: every lane in the warp must reach the full-mask shuffles.
     if (vecMax == 0.0f) {
-      if (SFout) {
-        *SFout = 0;
-      }
+      storeSF(0);
       return ReturnType{0};
     }
 #endif
 
     if (error4 < error6) {
-      if (SFout) {
-        *SFout = fp8SFVal4;
-      }
+      storeSF(fp8SFVal4);
       return e2m1Vec4;
     }
-    if (SFout) {
-      *SFout = fp8SFVal6;
-    }
+    storeSF(fp8SFVal6);
     return e2m1Vec6;
   }
 
-  if (SFout) {
-    // Write the SF to global memory (STG.8).
-    *SFout = fp8SFVal;
-  }
+  storeSF(fp8SFVal);
 
   // Convert the input to float.
   float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
@@ -896,11 +915,12 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
 #endif
 }
 
-// Quantizes the provided PackedVec into the uint64_t (8 e4m3) or uint4 (16 e4m3) output.
+// cvt_warp_fp16_to_mxfp8's scaling: writes the E8M0 SF to SFout and SFlocal (each if given) and
+// leaves the values over it, saturated to +/-448, in fp2Vals.
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD>
-__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_warp_fp16_to_mxfp8(
-    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout) {
-  using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t>;
+__device__ void scale_warp_fp16_for_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout,
+                                          uint8_t* SFlocal,
+                                          float2 (&fp2Vals)[CVT_ELTS_PER_THREAD / 2]) {
 #if defined(__CUDA_ARCH__) && \
     (__CUDA_ARCH__ >= 1000 || (defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ >= 800))
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
@@ -944,10 +964,12 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_wa
     // Write the SF to global memory (STG.8).
     *SFout = fp8SFVal;
   }
+  // Every thread's copy, for callers that use it right away.
+  if (SFlocal) {
+    *SFlocal = fp8SFVal;
+  }
 
   // Convert the input to float.
-  float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
-
 #pragma unroll
   for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
     if constexpr (std::is_same_v<Type, half>) {
@@ -962,6 +984,18 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_wa
     fp2Vals[i].x = fmaxf(fminf(fp2Vals[i].x, 448.0f), -448.0f);
     fp2Vals[i].y = fmaxf(fminf(fp2Vals[i].y, 448.0f), -448.0f);
   }
+#endif
+}
+
+// Quantizes the provided PackedVec into the uint64_t (8 e4m3) or uint4 (16 e4m3) output.
+template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD>
+__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_warp_fp16_to_mxfp8(
+    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout, uint8_t* SFlocal = nullptr) {
+  using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t>;
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 1000 || (defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ >= 800))
+  float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
+  scale_warp_fp16_for_mxfp8<Type, SF_VEC_SIZE, CVT_ELTS_PER_THREAD>(vec, SFout, SFlocal, fp2Vals);
 
   // Convert to e4m3 values. Overload selected by `fp2Vals` array length:
   // ELTS_PER_THREAD=8 -> uint64_t (8 e4m3); ELTS_PER_THREAD=16 -> uint4 (16 e4m3).

@@ -69,8 +69,8 @@ def require_supported_gpu():
     compute_capability = get_compute_capability(torch.device("cuda"))
     if compute_capability == (10, 7):
         pytest.skip("trtllm-gen routing is not implemented on SM107")
-    if compute_capability[0] not in (10, 12):
-        pytest.skip("trtllm-gen routing requires SM100/SM103/SM120/SM121")
+    if compute_capability[0] not in (8, 9, 10, 12):
+        pytest.skip("trtllm-gen routing requires SM80 to SM90, SM100/SM103/SM120/SM121")
 
 
 def stable_seed(*parts):

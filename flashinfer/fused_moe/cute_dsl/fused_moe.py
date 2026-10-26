@@ -80,8 +80,11 @@ from ...quantization.kernels.nvfp4_quantize import (
 from ...quantization.nvfp4_quantization_utils import (
     nvfp4_per_token_scale_inv,
     NVFP4_PER_TOKEN_SCALE_RTOL,
+    NVFP4_4OVER6_CODE_FROM_ENV,
+    NVFP4_4OVER6_CODE_STANDARD,
     _UNSET,
     NVFP44Over6Config,
+    nvfp4_4over6_code,
     nvfp4_e4m3_max,
     resolve_nvfp4_4over6,
 )
@@ -900,8 +903,8 @@ class CuteDslMoEWrapper:
     overlap during capture and replay. Auto-tuning is supported via the `tactic`
     parameter or `autotune()` context.
 
-    Supported architectures: SM100, SM103, and SM107. W4A8 is limited to
-    SM100 and SM103.
+    Supported architectures: SM80 to SM90 (on the SM80 kernels, without
+    tactics), SM100, SM103, and SM107. W4A8 is not supported on SM107.
 
     Attributes:
         num_experts: Total number of experts.
@@ -939,7 +942,7 @@ class CuteDslMoEWrapper:
         ...     output = moe.run(x, x_sf, topk_ids, topk_weights, w1, w1_sf, ...)
     """
 
-    @supported_compute_capability([100, 103, 107])
+    @supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107])
     @flashinfer_api
     def __init__(
         self,
@@ -1370,6 +1373,8 @@ class CuteDslMoEWrapper:
 
         if runner is None:
             raise RuntimeError(f"{self.quant_mode} runner was not initialized")
+        if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
+            return _cute_dsl_fused_moe_sm80(runner, inputs, tactic)
         if tactic is not None:
             return runner(inputs, tactic=tactic)
 
@@ -1499,7 +1504,83 @@ def _cute_dsl_fused_moe_impl(
     )
 
 
-@supported_compute_capability([100, 103, 107])
+def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
+    """Runs the tuner's ``runner`` on ``inputs`` on the CUTLASS SM80 kernels (W4A8 as W4A16, with
+    MXFP8 activations), converting the weights unless already SM80 operands (scales in the output
+    dtype). As from SM100 the GEMM2 input is standard NVFP4, or per token with the pinned 4over6
+    recipe, else the environment's."""
+    from ..core import get_cutlass_fused_moe_module
+    from ..prepare import cutlass_nvfp4_sm80_weights
+
+    w4a16 = isinstance(runner, CuteDslFusedMoEW4A16Runner)
+    w4a8 = getattr(runner, "quant_mode", None) == "w4a8"
+    situ = runner.situ_beta is not None
+    if not (w4a16 or w4a8 or runner.quant_mode == "w4a4") or tactic is not None:
+        raise NotImplementedError("Below SM100 CuTe-DSL MoE runs without tactics.")
+    if w4a16:  # no activation scales
+        x, experts, scales, w1, s1, alpha1, w2, s2, alpha2 = inputs[:9]
+    else:
+        x, x_sf, experts, scales, w1, s1, alpha1, fc2_scale, w2, s2, alpha2 = inputs[
+            :11
+        ]
+    out = inputs[-1]
+    if s1.dtype != out.dtype:
+        # The MMA-layout scales in byte order are the 128x4 swizzled scales.
+        mma_bytes = (5, 2, 4, 0, 1, 3)
+        _, gated = normalize_cute_dsl_moe_activation_type(runner.activation_type)
+        w1, s1, w2, s2 = cutlass_nvfp4_sm80_weights(
+            w1,
+            s1.permute(mma_bytes),
+            w2,
+            s2.permute(mma_bytes),
+            out.dtype,
+            gated,
+            mx=w4a8,
+        )
+    code = NVFP4_4OVER6_CODE_STANDARD
+    if w4a16:
+        quant_scales, x_sf = [s1, alpha1, s2, alpha2], None
+    elif w4a8:  # as W4A16, x_sf holding the MXFP8 scales
+        quant_scales = [s1, alpha1, s2, alpha2]
+    else:
+        one = torch.ones((), device=x.device)
+        quant_scales = [one, s1, alpha1, fc2_scale.reshape(()), s2, alpha2]
+        quant_scales += inputs[11:-1]  # per-token activation scales
+        x_sf = x_sf.view(x.shape[0], -1)
+        x_sf = torch.nn.functional.pad(x_sf, (0, -x_sf.shape[1] % 4))  # K padded to 64
+        if len(quant_scales) == 7:
+            code = NVFP4_4OVER6_CODE_FROM_ENV
+            if nvfp4_4over6 is not _UNSET:
+                recipe = resolve_nvfp4_4over6(nvfp4_4over6)
+                _check_gemm2_input_scale(fc2_scale, recipe)
+                code = nvfp4_4over6_code(recipe)
+    experts_here = runner.num_local_experts
+
+    def per_expert(v):
+        return None if v is None else torch.full((experts_here,), v, device=x.device)
+
+    swiglu = (runner.swiglu_alpha, runner.swiglu_beta, runner.swiglu_limit)
+    if swiglu == (DEFAULT_SWIGLU_ALPHA, DEFAULT_SWIGLU_BETA, DEFAULT_SWIGLU_LIMIT):
+        swiglu = (None, None, None)
+    major, minor = torch.cuda.get_device_capability(x.device)
+    with torch.cuda.device(x.device):
+        get_cutlass_fused_moe_module(f"{major * 10 + minor}").cutlass_fused_moe(
+            out, x, experts - runner.local_expert_offset, scales.float(),
+            w1.view(torch.int64), None,
+            w2.view(torch.int64), None, out.dtype, quant_scales, x_sf,
+            *map(per_expert, (None,) * 3 if situ else swiglu), None,  # SiTU takes none of them
+            per_expert(runner.situ_beta),
+            per_expert(runner.situ_linear_beta or (float("inf") if situ else None)), False,
+            # Local expert ids, as EP rank 0 of 2: ids outside the local experts are skipped.
+            ep_size=1 if experts_here == runner.num_experts else 2, ep_rank=0,
+            enable_pdl=runner.enable_pdl,
+            activation_type=ActivationType.Situ if situ else ActivationType(runner.activation_type),
+            use_mxfp8_act_scaling=w4a8, nvfp4_4over6_code=code,
+        )  # fmt: skip
+    return out
+
+
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107])
 @flashinfer_api(trace=cute_dsl_fused_moe_trace)
 def cute_dsl_fused_moe(
     x: torch.Tensor,
@@ -1543,8 +1624,9 @@ def cute_dsl_fused_moe(
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
-    Supported architectures: SM100, SM103, and SM107. W4A8 is limited to
-    SM100 and SM103. This is the simple functional API; for CUDA-graph support
+    Supported architectures: SM80 to SM90 (on the SM80 kernels, without
+    tactics), SM100, SM103, and SM107. W4A8 is not supported on SM107. This
+    is the simple functional API; for CUDA-graph support
     use :class:`CuteDslMoEWrapper` instead.
 
     Auto-tuning is controlled by the :func:`autotune` context manager::
@@ -1844,6 +1926,8 @@ def cute_dsl_fused_moe(
             f"quant_mode must be 'w4a4', 'w4a8', or 'w4a16' (got {quant_mode!r})."
         )
 
+    if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
+        return _cute_dsl_fused_moe_sm80(runners[0], inputs, tactic)
     if tactic is not None:
         return runners[0](inputs, tactic=tactic, aux_stream=aux_stream)
 
@@ -1860,7 +1944,7 @@ def cute_dsl_fused_moe(
     return best_runner(inputs, tactic=best_tactic, **call_kwargs)
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107])
 @flashinfer_api(trace=cute_dsl_fused_moe_trace)
 def cute_dsl_fused_moe_nvfp4(
     x: torch.Tensor,
@@ -1953,7 +2037,7 @@ def cute_dsl_fused_moe_nvfp4(
     )
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103])
 @flashinfer_api(trace=cute_dsl_fused_moe_mxfp8_mxfp4_trace)
 def cute_dsl_fused_moe_mxfp8_mxfp4(
     x: torch.Tensor,
@@ -2039,7 +2123,7 @@ class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
     instance to that call's CUDA stream; create one wrapper per stream.
     """
 
-    @supported_compute_capability([100, 103])
+    @supported_compute_capability([80, 86, 87, 89, 90, 100, 103])
     @flashinfer_api
     def __init__(
         self,

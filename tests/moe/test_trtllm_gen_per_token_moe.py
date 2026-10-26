@@ -87,8 +87,8 @@ def test_routed_fused_moe(
 ):
     device = torch.device("cuda:0")
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10]:
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    if compute_capability[0] not in [8, 9, 10]:
+        pytest.skip("These tests are only guaranteed to work on SM80 to SM103 GPUs.")
     enable_pdl = device_support_pdl(device)
 
     is_gated = activation_type.is_gated

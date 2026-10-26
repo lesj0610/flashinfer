@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _check,
-    _skip_if_not_sm100,
+    _skip_if_not_sm80,
 )
 
 
@@ -22,9 +22,7 @@ def test_mxfp4_quantize_reference_correctness(shape_kwargs):
     """
     import flashinfer
 
-    # fp4_quantize compiles on SM90+ but only produces correct output on
-    # SM100+ — on Hopper the kernel silently returns near-zero garbage.
-    _skip_if_not_sm100()
+    _skip_if_not_sm80()
     from flashinfer.trace.templates.quantize import mxfp4_quantize_trace
 
     inputs = mxfp4_quantize_trace.init(**shape_kwargs)

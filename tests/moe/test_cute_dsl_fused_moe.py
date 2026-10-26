@@ -152,7 +152,14 @@ sm100_required = pytest.mark.skipif(
     not is_sm100_family(),
     reason="Requires CuteDSL MoE target SM100, SM103 or SM107",
 )
-sm10x_required = sm100_required
+# The MoE APIs also run below SM100 (SM80 to SM90), on the CUTLASS SM80 kernels.
+sm10x_required = pytest.mark.skipif(
+    not is_sm100_family()
+    and not (
+        torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in (8, 9)
+    ),
+    reason="Requires CuteDSL MoE target SM80 to SM90, SM100, SM103 or SM107",
+)
 
 mxfp8_required = pytest.mark.skipif(
     not (
@@ -1711,11 +1718,14 @@ class TestAutotunerBucketConfig:
 
 
 @cute_dsl_available
-@sm100_required
+@sm10x_required
 class TestCuteDslMoeW4A16:
     pytestmark = _requires_dsl_arch
 
-    @pytest.mark.parametrize("use_wrapper", [False, True])
+    # The wrapper call pins a native W4A16 tactic.
+    @pytest.mark.parametrize(
+        "use_wrapper", [False, pytest.param(True, marks=sm100_required)]
+    )
     def test_weight_scale_update(self, use_wrapper: bool):
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
@@ -1775,6 +1785,7 @@ class TestCuteDslMoeW4A16:
         updated = run()
         torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
 
+    @sm100_required
     @pytest.mark.parametrize("scale_axis", ["row", "k"])
     @pytest.mark.parametrize(
         "rows,route_tile,tactic",
@@ -1856,6 +1867,7 @@ class TestCuteDslMoeW4A16:
         )
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
+    @sm100_required
     @pytest.mark.parametrize(
         "route_tile,gemm1_tactic,gemm2_tactic",
         [
@@ -2103,6 +2115,7 @@ class TestCuteDslFusedMoeFunctional:
             pytest.param("w4a16", False, True, (256, 384, 256), id="w4a16-fused"),
         ],
     )
+    @sm100_required
     def test_finalize_handles_cluster_padding_and_partial_tiles(
         self,
         quant_mode: str,
@@ -3029,6 +3042,7 @@ class TestCuteDslMoEWrapper:
         assert result.shape == (target_num_tokens, hidden_size)
         assert not torch.isnan(result).any()
 
+    @sm100_required
     def test_cuda_graph_wrapper_lifetime_after_autotune(self):
         """Dropped CUDA graph wrappers should not wait for cyclic GC,
         even after autotune profiling has populated the autotuner cache."""
@@ -3296,6 +3310,44 @@ class TestExpertParallelism:
             f"offset={local_expert_offset}): {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+    def test_uneven_shards_sum_to_whole(self):
+        """Shards of unequal size, at an offset no multiple of their size, sum to
+        the whole call."""
+        from flashinfer import cute_dsl_fused_moe
+
+        num_experts, top_k = 256, 8
+        tensors = create_moe_tensors(
+            num_tokens=256,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, "w4a4")
+        outputs = []
+        for lo, n in ((0, num_experts), (0, 96), (96, 160)):
+            # Expert axis: first for weights and alphas, last for the MMA-layout scales.
+            shard = {
+                k: tensors[k].narrow(-1 if k.endswith("_sf") else 0, lo, n)
+                for k in ("w1_weight", "w1_weight_sf", "w1_alpha")
+                + ("w2_weight", "w2_weight_sf", "w2_alpha")
+            }
+            out = cute_dsl_fused_moe(
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=n,
+                local_expert_offset=lo,
+                **shard,
+                **api_inputs,
+            )
+            outputs.append(out.float())
+        whole, first, second = outputs
+        atol = whole.abs().max().item() * 2**-5
+        torch.testing.assert_close(first + second, whole, rtol=0, atol=atol)
+
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize(
         "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
@@ -3381,7 +3433,7 @@ class TestExpertParallelism:
 
 
 @cute_dsl_available
-@sm10x_required
+@sm100_required
 class TestMoeSortBufferInitPoisoned:
     """Validate the invariant that the routing kernel writes every
     output entry that downstream code reads, by pre-poisoning the
@@ -3603,7 +3655,7 @@ class TestMoeSortBufferInitPoisoned:
 
 
 @cute_dsl_available
-@sm10x_required
+@sm100_required
 class TestAllValidTactics:
     """Test that every tactic returned by get_valid_tactics produces correct output.
 
@@ -4339,7 +4391,7 @@ class TestRubinMultiCtaTacticRejected:
 
 
 @cute_dsl_available
-@sm10x_required
+@sm100_required
 class TestOddTileCountBoundsContract:
     """Exercise the active-count bounds contract at an *odd* tile count.
 

@@ -353,9 +353,16 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                       int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput,
                                       uint8_t* scaleOutput, float* perTokenScaleOutput,
                                       QuantizationSFLayout sfLayout, NVFP4RecipeSpec const& recipe,
-                                      cudaStream_t stream, bool enable_pdl) {
+                                      cudaStream_t stream, bool enable_pdl,
+                                      float const* globalScaleInvPtr) {
   // Kernel packs 16 values per thread via PackedVec load/store.
   TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
+#if defined(FLASHINFER_FP4_SW_CVT)
+  // Below SM100 the fp16/bf16 kernel may read the inverse global scale from device memory.
+  TLLM_CHECK(!(globalScaleInvPtr && std::is_same_v<T, float>));
+#else
+  TLLM_CHECK(!globalScaleInvPtr);
+#endif
   // currently, nvfp4 per-token quantization kernel is only used on sm100f so always load 256bit.
   constexpr uint32_t ELTS_PER_THREAD = std::is_same_v<T, float> ? 8 : 16;
   constexpr uint32_t BLOCK_SIZE = 128;
@@ -390,7 +397,12 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                            decltype(disableFP4QuantFastMathTag)::value,
                                            decltype(nvfp4_4over6_config_tag)>,
           grid, block, smem_size, stream, m, n, input, globalScaleInv, expandedIdxToPermutedIdx,
-          weightOutput, scaleOutput, perTokenScaleOutput);
+          weightOutput, scaleOutput, perTokenScaleOutput
+#if defined(FLASHINFER_FP4_SW_CVT)
+          ,
+          globalScaleInvPtr
+#endif
+      );
     }
   };
 
@@ -413,18 +425,18 @@ template void invokeNvfp4QuantAndPerTokenScale<float>(
     uint32_t m, uint32_t n, float const* input, float globalScaleInv,
     int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput, uint8_t* scaleOutput,
     float* perTokenScaleOutput, QuantizationSFLayout sfLayout, NVFP4RecipeSpec const& recipe,
-    cudaStream_t stream, bool enable_pdl);
+    cudaStream_t stream, bool enable_pdl, float const* globalScaleInvPtr);
 template void invokeNvfp4QuantAndPerTokenScale<half>(
     uint32_t m, uint32_t n, half const* input, float globalScaleInv,
     int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput, uint8_t* scaleOutput,
     float* perTokenScaleOutput, QuantizationSFLayout sfLayout, NVFP4RecipeSpec const& recipe,
-    cudaStream_t stream, bool enable_pdl);
+    cudaStream_t stream, bool enable_pdl, float const* globalScaleInvPtr);
 #ifdef ENABLE_BF16
 template void invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
     uint32_t m, uint32_t n, __nv_bfloat16 const* input, float globalScaleInv,
     int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput, uint8_t* scaleOutput,
     float* perTokenScaleOutput, QuantizationSFLayout sfLayout, NVFP4RecipeSpec const& recipe,
-    cudaStream_t stream, bool enable_pdl);
+    cudaStream_t stream, bool enable_pdl, float const* globalScaleInvPtr);
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

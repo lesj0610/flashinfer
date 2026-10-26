@@ -737,11 +737,21 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // input
     uint32_t m, uint32_t n, T const* input, float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
     // output
-    uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput) {
+    uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput
+#if defined(FLASHINFER_FP4_SW_CVT)
+    ,
+    float const* globalScaleInvPtr  // below SM100, the inverse global scale in device memory
+#endif
+) {
   constexpr int SF_VEC_SIZE = 16;
   int rowIdx = blockIdx.x;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
+#endif
+#if defined(FLASHINFER_FP4_SW_CVT)
+  if (globalScaleInvPtr != nullptr) {
+    globalScaleInv = *globalScaleInvPtr;
+  }
 #endif
   if (rowIdx >= m) return;
   if (expandedIdxToPermutedIdx != nullptr) {

@@ -30,9 +30,11 @@ import torch
 
 from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.utils import (
+    get_compute_capability,
     is_sm100a_supported,
     is_sm110a_supported,
     is_sm12x_supported,
+    version_at_least,
 )
 
 K = 2688
@@ -54,13 +56,14 @@ def _enough_gpu_memory() -> bool:
 
 
 def _is_nvfp4_supported() -> bool:
-    """The per-token NVFP4 CuTe-DSL quantizer targets Blackwell (SM100+); skip on
-    older architectures (e.g. SM90/Hopper) where the kernel is unsupported."""
+    """The per-token NVFP4 CuTe-DSL quantizer needs SM80+ and CUDA >= 12.8."""
     if not torch.cuda.is_available():
         return False
     device = torch.device("cuda")
     return (
-        is_sm100a_supported(device)
+        get_compute_capability(device)[0] in (8, 9)
+        and version_at_least(torch.version.cuda, "12.8")
+        or is_sm100a_supported(device)
         or is_sm110a_supported(device)
         or is_sm12x_supported(device)
     )
@@ -68,7 +71,7 @@ def _is_nvfp4_supported() -> bool:
 
 @pytest.mark.skipif(
     not _is_nvfp4_supported(),
-    reason="per-token NVFP4 CuTe-DSL quantizer requires SM100+ (Blackwell) and CUDA >= 12.8",
+    reason="per-token NVFP4 CuTe-DSL quantizer requires SM80+ and CUDA >= 12.8",
 )
 @pytest.mark.skipif(not is_cute_dsl_available(), reason="CuteDSL not available")
 @pytest.mark.skipif(

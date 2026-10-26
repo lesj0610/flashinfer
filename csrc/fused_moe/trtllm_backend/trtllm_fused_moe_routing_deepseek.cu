@@ -582,9 +582,11 @@ void run(Data& data, void* stream) {
 
   // Step 2: Permutation pipeline (reads from mPtrTopKPacked written by step 1)
   if (data.mPtrPermutedIdxSize != nullptr) {
+    // Below SM90 (no clusters, no grid sync) the histogram kernels take every batch.
+    int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
     int numThreadsPerCluster = numThreadsHist * NumBlocksPerCluster;
     bool const useSingleCluster =
-        data.mNumTokens <= 1024 && data.mNumTokens * topK <= numThreadsPerCluster;
+        smMajor >= 9 && data.mNumTokens <= 1024 && data.mNumTokens * topK <= numThreadsPerCluster;
     if (!useSingleCluster) {
       FLASHINFER_CHECK(data.mPtrExpertCounts != nullptr,
                        "When #tokens is large, `mPtrExpertCounts` is a required input.");
@@ -600,7 +602,7 @@ void run(Data& data, void* stream) {
       int const numBlocksCoop = coopLaunchSMCounts.moeSms;
       int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
 
-      if (data.mNumTokens <= maxTokensCoop) {
+      if (smMajor >= 9 && data.mNumTokens <= maxTokensCoop) {
         logCoopLaunchSMCounts(coopLaunchSMCounts);
         launchCoopKernel(data, numBlocksCoop, numThreadsHist, stream);
       } else {
