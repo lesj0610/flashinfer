@@ -5266,12 +5266,18 @@ class CuteDslRunner(MoERunner):
                 f"{type(self.config.activation).__name__}; prepare the view with "
                 "the same typed activation."
             )
-        if self._below_sm100() and "sm80_fc1_expert_weights" in v:
+        keys = ("w1_weight", "w1_weight_sf", "w2_weight", "w2_weight_sf")
+        if self._below_sm100() and "sm90_fc1_expert_weights" in v:
+            # SM90 W4A8 reads the FP8 mixed-input GEMM's operands prepared with the view.
+            from .prepare import _CUTLASS_MXFP4_SM90_KEYS
+
+            sm90 = map(v.get, _CUTLASS_MXFP4_SM90_KEYS)
+            v = {**v, **dict(zip(keys, sm90, strict=True))}
+        elif self._below_sm100() and "sm80_fc1_expert_weights" in v:
             # Below SM100 the GEMMs read the SM80 operands prepared with the view; a view
             # without them is converted on every call.
             from .prepare import _CUTLASS_NVFP4_SM80_KEYS, _check_sm80_nvfp4_operands
 
-            keys = ("w1_weight", "w1_weight_sf", "w2_weight", "w2_weight_sf")
             sm80 = tuple(map(v.get, _CUTLASS_NVFP4_SM80_KEYS))
             device = act.hidden_states_q.device
             _check_sm80_nvfp4_operands(sm80, v["w1_weight"], v["w2_weight"], device)
@@ -6054,12 +6060,23 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             enable_pdl=self._enable_pdl,
         )
         if self._sm80:
-            from .prepare import _CUTLASS_NVFP4_SM80_KEYS as keys
-            from .prepare import _check_sm80_nvfp4_operands, trtllm_nvfp4_sm80_weights
+            from .prepare import (
+                _CUTLASS_MXFP4_SM90_KEYS,
+                _CUTLASS_NVFP4_SM80_KEYS,
+                _check_sm80_nvfp4_operands,
+                trtllm_nvfp4_sm80_weights,
+            )
 
             mx = self._pair[0] is QuantFormat.MXFP4
+            device = act.hidden_states_q.device
+            # SM90 runs MXFP4 x MXFP8 on the FP8 mixed-input GEMM, as CUTLASS MoE does.
+            sm90 = get_compute_capability(device)[0] == 9 and self._pair == (
+                QuantFormat.MXFP4,
+                QuantFormat.MXFP8,
+            )
+            keys = _CUTLASS_MXFP4_SM90_KEYS if sm90 else _CUTLASS_NVFP4_SM80_KEYS
             w1, w2 = v["gemm1_weights"], v["gemm2_weights"]
-            # The SM80 operands prepared with the view, else converted on every call.
+            # The operands prepared with the view, else converted on every call.
             static_kwargs["sm80_weights"] = sm80 = (
                 tuple(v[key] for key in keys)
                 if keys[0] in v
@@ -6070,9 +6087,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                     v["gemm2_weights_scale"],
                     self.config.activation.is_gated,
                     mx,
+                    sm90=sm90,
                 )
             )
-            _check_sm80_nvfp4_operands(sm80, w1, w2, act.hidden_states_q.device)
+            if not sm90:
+                _check_sm80_nvfp4_operands(sm80, w1, w2, device)
             return _TrtllmPackedInputs(
                 moe_inputs.to_list(),
                 tuning_config=TuningConfig(),

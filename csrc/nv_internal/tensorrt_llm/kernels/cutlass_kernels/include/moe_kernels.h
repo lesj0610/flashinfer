@@ -666,6 +666,9 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       use_sm90_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
   static constexpr bool use_native_wfp4afp8 =
       use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kDisabled;
+  // SM90 MXFP8 x MXFP4, which takes TRT-LLM's and CuTe-DSL's contracts as the restored runners do.
+  static constexpr bool use_sm90_mx =
+      use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act;
   static_assert(Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kDisabled || use_wfp4afp8,
                 "Sm90Wfp4Afp8ScaleMode is only valid for FP8 activation x FP4 weight.");
   static_assert(!use_sm90_wfp4afp8 || !IsMXFPX,

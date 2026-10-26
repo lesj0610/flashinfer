@@ -4350,7 +4350,8 @@ void CutlassMoeFCRunner<
       fp8_expert_residual_scale = quant_params.fp8_mxfp4.fc2.global_scale;
     }
 
-    doActivation<GatedActOutputType, UnfusedGemmOutputType>(
+    doActivation<GatedActOutputType, UnfusedGemmOutputType, ScaleBiasType,
+                 std::conditional_t<use_sm90_mx, ClampedSituAdaptor, SituAdaptor>>(
         reinterpret_cast<GatedActOutputType*>(output),
         static_cast<UnfusedGemmOutputType const*>(gemm_output), fc2_fp8_quant, fc1_expert_biases,
         bias_is_broadcast, expert_first_token_offset, permuted_token_selected_experts,
@@ -4627,16 +4628,20 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                       {}, false, nullptr, nullptr, nullptr, enable_pdl, stream);
     sync_check_cuda_error(stream);
   }
-  if (skip_finalize) {  // GEMM2's rows, with the FC2 biases
+  if (skip_finalize) {  // GEMM2's rows, with the FC2 biases, in final_output
     if (fc2_expert_biases) {
       doActivation<UnfusedGemmOutputType, UnfusedGemmOutputType, ScaleBiasType>(
-          static_cast<UnfusedGemmOutputType*>(gemm_output),
+          reinterpret_cast<UnfusedGemmOutputType*>(final_output),
           static_cast<UnfusedGemmOutputType const*>(gemm_output), nullptr, fc2_expert_biases, true,
           expert_first_token_offset, /*permuted_token_selected_experts=*/nullptr,
           num_experts_per_node, hidden_size, expanded_num_rows,
           ActivationParams(ActivationType::Identity), {}, false, nullptr, nullptr, nullptr,
           enable_pdl, stream);
       sync_check_cuda_error(stream);
+    } else if (gemm_output != final_output) {  // the TMA GEMM's output
+      TLLM_CUDA_CHECK(cudaMemcpyAsync(final_output, gemm_output,
+                                      expanded_num_rows * hidden_size * sizeof(OutputType),
+                                      cudaMemcpyDeviceToDevice, stream));
     }
     return;
   }
@@ -5314,10 +5319,11 @@ void CutlassMoeFCRunner<
         use_lora = false;
       }
     }
-    TLLM_CHECK_WITH_INFO(use_restored_fp4 || !(lora_params.fc1_deltas || lora_params.fc2_inputs),
-                         "Only the restored FP4 runners take TRT-LLM's LoRA");
+    TLLM_CHECK_WITH_INFO(
+        use_restored_fp4 || use_sm90_mx || !(lora_params.fc1_deltas || lora_params.fc2_inputs),
+        "Only the restored FP4 and SM90 MXFP8 x MXFP4 runners take TRT-LLM's LoRA");
 #if defined(ENABLE_FP4) && defined(FLASHINFER_FP4_SW_CVT)
-    if constexpr (use_restored_fp4) {
+    if constexpr (use_restored_fp4 || use_sm90_mx) {
       if (lora_params.fc1_deltas) {  // GEMM1's row biases, the (k, token) rows permuted
         expandInputRowsKernelLauncher(static_cast<ScaleBiasType const*>(lora_params.fc1_deltas),
                                       static_cast<ScaleBiasType*>(lora_params.fc1_row_biases),
@@ -5353,6 +5359,13 @@ void CutlassMoeFCRunner<
         enable_pdl);
     sync_check_cuda_error(stream);
 #if defined(ENABLE_FP4) && defined(FLASHINFER_FP4_SW_CVT)
+    if constexpr (use_sm90_mx) {
+      if (lora_params.fc2_inputs) {  // GEMM2's inputs, MXFP8 codes in the permuted rows
+        TLLM_CUDA_CHECK(cudaMemcpyAsync(lora_params.fc2_inputs, gemm1_result,
+                                        expanded_num_rows * inter_size * sizeof(T),
+                                        cudaMemcpyDeviceToDevice, stream));
+      }
+    }
     if constexpr (use_restored_fp4) {
       if (lora_params.fc2_inputs) {
         // GEMM2's inputs in the permuted rows: NVFP4 or MXFP8 codes, else (W4A16, per-token
@@ -5396,15 +5409,16 @@ void CutlassMoeFCRunner<
         applyPrequantScale(smoothed_act_, gemm1_result, quant_params.groupwise.fc2.act_scales,
                            num_valid_tokens_ptr, expanded_num_rows, inter_size, use_awq, stream);
     sync_check_cuda_error(stream);
-    TLLM_CHECK_WITH_INFO(
-        !skip_finalize || (use_restored_fp4 && std::is_same_v<OutputType, UnfusedGemmOutputType>),
-        "Only the restored FP4 runners skip finalize, into their GEMM output type");
+    TLLM_CHECK_WITH_INFO(!skip_finalize || ((use_restored_fp4 || use_sm90_mx) &&
+                                            std::is_same_v<OutputType, UnfusedGemmOutputType>),
+                         "Only the restored FP4 and SM90 MXFP8 x MXFP4 runners skip finalize, "
+                         "into their GEMM output type");
     Self::gemm2(
         moe_gemm_runner_, blockscale_gemm_runner, gemm2_input,
-        skip_finalize ? final_output : gemm2_result, final_output, expert_first_token_offset_,
-        gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases, fc2_int_scales, fc2_fp8_dequant,
-        fc2_fp4_act_scale_, quant_params, token_topk_unpermuted_scales,
-        permuted_token_final_scales_, unpermuted_row_to_permuted_row,
+        skip_finalize && use_restored_fp4 ? final_output : gemm2_result, final_output,
+        expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
+        fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params,
+        token_topk_unpermuted_scales, permuted_token_final_scales_, unpermuted_row_to_permuted_row,
         permuted_row_to_unpermuted_row_, token_selected_experts, num_valid_tokens_ptr, num_rows,
         expanded_num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
         experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,

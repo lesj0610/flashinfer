@@ -7348,6 +7348,9 @@ def trtllm_fp4_block_scale_routed_moe(
             gated,
             sf_vec == 32,
             fc1_rows,
+            # SM90 runs MXFP4 x MXFP8 on the FP8 mixed-input GEMM, as CUTLASS MoE does.
+            get_compute_capability(hidden_states.device)[0] == 9
+            and hidden_states.dtype == torch.float8_e4m3fn,
         )
         return _trtllm_fp4_routed_moe_sm80(
             topk_ids_tensor, topk_weights, hidden_states, hidden_states_scale,
@@ -7433,7 +7436,8 @@ def _trtllm_fp4_routed_moe_sm80(
     fc1_deltas=None, nvfp4_4over6=_UNSET,
 ) -> List[torch.Tensor]:  # fmt: skip
     """Runs TRT-LLM FP4 MoE on the CUTLASS SM80 kernels; ``sm80_weights`` are its weights' SM80
-    operands, cut to the FC1 rows ``fc1_rows`` (biases too) when the intermediate size is padded.
+    operands (SM90 ones for MXFP4 x MXFP8 on SM90's FP8 mixed-input GEMM), cut to the FC1 rows
+    ``fc1_rows`` (biases too) when the intermediate size is padded.
     The gate scalar dequantizes GEMM1; the FC1 output scalar is the GEMM2-input scale (NVFP4's FC2
     activation global scale, or with per-token scales a GEMM2 dequantization factor), over the
     gate scalar for gated activations other than SiTU. MXFP4 reads none of the output scalars. As
@@ -7448,6 +7452,8 @@ def _trtllm_fp4_routed_moe_sm80(
     # Local expert ids, as EP rank 0 of 2: ids outside the local experts are skipped.
     local = topk_ids - local_expert_offset
     w1, s1, w2, s2 = sm80_weights
+    if s1.dtype != torch.int32:  # the SM90 operands keep their uint8 weights
+        w1, w2 = w1.view(torch.int64), w2.view(torch.int64)
     mx = hidden_states.dtype != torch.uint8  # MXFP4 with MXFP8 or BF16 activations
     ones = torch.ones(w1.shape[0], device=hidden_states.device)  # shared experts too
     scalar = lambda s: ones if s is None or mx else s.float()
@@ -7548,8 +7554,8 @@ def _trtllm_fp4_routed_moe_sm80(
     with torch.cuda.device(hidden_states.device):
         get_cutlass_fused_moe_module(f"{major * 10 + minor}").cutlass_fused_moe(
             output, hidden_states, local.int().contiguous(),
-            topk_weights.float().contiguous(), w1.view(torch.int64), biases[0],
-            w2.view(torch.int64), biases[1], torch.bfloat16, quant_scales, x_sf, *swiglu, None,
+            topk_weights.float().contiguous(), w1, biases[0],
+            w2, biases[1], torch.bfloat16, quant_scales, x_sf, *swiglu, None,
             *situ, False, ep_size=1 if local_num_experts == num_experts else 2,
             ep_rank=0, enable_pdl=enable_pdl,
             activation_type=act, tune_max_num_tokens=tune_max_num_tokens,

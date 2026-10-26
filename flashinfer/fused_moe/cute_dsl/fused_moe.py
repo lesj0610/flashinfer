@@ -1507,9 +1507,9 @@ def _cute_dsl_fused_moe_impl(
 
 def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
     """Runs the tuner's ``runner`` on ``inputs`` on the CUTLASS SM80 kernels (W4A8 as W4A16, with
-    MXFP8 activations), converting the weights unless already SM80 operands (scales in the output
-    dtype). As from SM100 the GEMM2 input is standard NVFP4, or per token with the pinned 4over6
-    recipe, else the environment's."""
+    MXFP8 activations; on SM90 on the FP8 mixed-input GEMM), converting the weights unless already
+    their operands (scales in the output dtype, or SM90's int32). As from SM100 the GEMM2 input is
+    standard NVFP4, or per token with the pinned 4over6 recipe, else the environment's."""
     from ..core import get_cutlass_fused_moe_module
     from ..prepare import cutlass_nvfp4_sm80_weights
 
@@ -1525,7 +1525,8 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
             :11
         ]
     out = inputs[-1]
-    if s1.dtype != out.dtype:
+    major, minor = torch.cuda.get_device_capability(x.device)
+    if s1.dtype not in (out.dtype, torch.int32):  # int32: SM90 W4A8's operands
         # The MMA-layout scales in byte order are the 128x4 swizzled scales.
         mma_bytes = (5, 2, 4, 0, 1, 3)
         _, gated = normalize_cute_dsl_moe_activation_type(runner.activation_type)
@@ -1537,7 +1538,10 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
             out.dtype,
             gated,
             mx=w4a8,
+            sm90=w4a8 and major == 9,  # on the FP8 mixed-input GEMM, as CUTLASS MoE
         )
+    if s1.dtype != torch.int32:  # the SM90 operands keep their uint8 weights
+        w1, w2 = w1.view(torch.int64), w2.view(torch.int64)
     code = NVFP4_4OVER6_CODE_STANDARD
     if w4a16:
         quant_scales, x_sf = [s1, alpha1, s2, alpha2], None
@@ -1563,12 +1567,10 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
     swiglu = (runner.swiglu_alpha, runner.swiglu_beta, runner.swiglu_limit)
     if swiglu == (DEFAULT_SWIGLU_ALPHA, DEFAULT_SWIGLU_BETA, DEFAULT_SWIGLU_LIMIT):
         swiglu = (None, None, None)
-    major, minor = torch.cuda.get_device_capability(x.device)
     with torch.cuda.device(x.device):
         get_cutlass_fused_moe_module(f"{major * 10 + minor}").cutlass_fused_moe(
             out, x, experts - runner.local_expert_offset, scales.float(),
-            w1.view(torch.int64), None,
-            w2.view(torch.int64), None, out.dtype, quant_scales, x_sf,
+            w1, None, w2, None, out.dtype, quant_scales, x_sf,
             *map(per_expert, (None,) * 3 if situ else swiglu), None,  # SiTU takes none of them
             per_expert(runner.situ_beta),
             per_expert(runner.situ_linear_beta or (float("inf") if situ else None)), False,
