@@ -319,6 +319,10 @@ struct QuantParams {
 
     GemmInputs fc1;
     GemmInputs fc2;
+    // 4over6 recipe for both NVFP4 activation quantizations (GEMM1 input when
+    // the activations arrive unquantized, GEMM2 input), as the code decoded by
+    // resolveNVFP4Recipe(). The default reads FLASHINFER_NVFP4_4OVER6*.
+    int64_t nvfp4_4over6_code = kNVFP44Over6FromEnv;
   } fp4;
 
   // GPTQ/AWQ quantization params
@@ -421,14 +425,14 @@ struct QuantParams {
       float const* fc2_act_global_scale,
       TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF const* fc2_weight_block_scale,
       float const* fc2_global_scale,  //
-      bool fc1_use_per_expert_act_scale = false, bool fc2_use_per_expert_act_scale = false)
-
-  {
+      bool fc1_use_per_expert_act_scale = false, bool fc2_use_per_expert_act_scale = false,
+      int64_t nvfp4_4over6_code = kNVFP44Over6FromEnv) {
     QuantParams qp;
     qp.fp4.fc1 = {fc1_use_per_expert_act_scale, fc1_act_global_scale, fc1_weight_block_scale,
                   fc1_global_scale};
     qp.fp4.fc2 = {fc2_use_per_expert_act_scale, fc2_act_global_scale, fc2_weight_block_scale,
                   fc2_global_scale};
+    qp.fp4.nvfp4_4over6_code = nvfp4_4over6_code;
     return qp;
   }
 
@@ -505,12 +509,9 @@ class CutlassMoeFCRunnerInterface {
                       bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
                       bool use_mxfp8_act_scaling, bool min_latency_mode,
                       MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
-                      // Below SM100: per-token NVFP4 activation scales (num_rows,), the activation
-                      // quantizations' 4over6 recipe, and skip_finalize leaving GEMM2's rows (FC2
-                      // biases added) in final_output.
-                      float const* per_token_scale = nullptr,
-                      int64_t nvfp4_4over6_code = kNVFP44Over6FromEnv,
-                      bool skip_finalize = false) = 0;
+                      // Below SM100: per-token NVFP4 activation scales (num_rows,), and
+                      // skip_finalize leaving GEMM2's rows (FC2 biases added) in final_output.
+                      float const* per_token_scale = nullptr, bool skip_finalize = false) = 0;
 
   // Aliases for profiling the gemms
   virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -749,8 +750,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
               bool use_mxfp8_act_scaling, bool min_latency_mode,
               MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
-              float const* per_token_scale = nullptr,
-              int64_t nvfp4_4over6_code = kNVFP44Over6FromEnv, bool skip_finalize = false) override;
+              float const* per_token_scale = nullptr, bool skip_finalize = false) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
   static void gemm1(MoeGemmRunner<T, WeightType, BackBoneType, ScaleBiasType, IsMXFPX,
@@ -778,9 +778,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                     ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
                     bool bias_is_broadcast, cudaStream_t stream,
                     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-                    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
-                    // Below SM100: the 4over6 recipe of the NVFP4 activation quantizations.
-                    int64_t nvfp4_4over6_code);
+                    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl);
 
   static void gemm2(
       MoeGemmRunner<T, WeightType, BackBoneType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
@@ -833,7 +831,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                        quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
                        num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array,
                        bias_is_broadcast, stream, config, min_latency_mode, num_active_experts_per,
-                       active_expert_global_ids, enable_pdl, kNVFP44Over6FromEnv);
+                       active_expert_global_ids, enable_pdl);
   }
 
   void gemm2(void const* const input, void* const gemm_output, void* const final_output,

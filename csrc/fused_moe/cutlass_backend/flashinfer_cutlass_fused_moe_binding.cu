@@ -483,7 +483,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          parallelism_config, min_latency_mode, input.device(), workspace_buffer);
 
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
-                                             quant_scales, base_activation_type);
+                                             quant_scales, base_activation_type, nvfp4_4over6_code);
     // Below SM100 a 7th NVFP4 quant scale gives per-token activation scales, one per input row.
     float const* per_token_scale = nullptr;
     if (isNvfp4Quant() && quant_scales.value().size() == 7) {
@@ -494,10 +494,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << "per-token scale must be (num_rows,)";
       per_token_scale = static_cast<float const*>(token_scale.data_ptr());
     }
-#if !defined(FLASHINFER_FP4_SW_CVT)
-    TVM_FFI_ICHECK_EQ(nvfp4_4over6_code, tensorrt_llm::kernels::kNVFP44Over6FromEnv)
-        << "from SM100 the NVFP4 4over6 recipe comes from the environment";
-#endif
     kernels::MoeMinLatencyParams min_latency_params{};
 
     // TODO: support lora in the future
@@ -564,7 +560,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                                                     : workspace_info.src_to_dest_map),
         parallelism_config, enable_alltoall, use_lora, lora_params, mUseDeepSeekFP8BlockScaling,
         mUseMxfp8ActScaling, min_latency_mode, min_latency_params, enable_pdl, stream,
-        per_token_scale, nvfp4_4over6_code, skip_finalize);
+        per_token_scale, skip_finalize);
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -715,9 +711,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          parallelism_config, min_latency_mode, input.device(), workspace_buffer);
 
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
-                                             quant_scales, base_activation_type);
-    TVM_FFI_ICHECK_EQ(nvfp4_4over6_code, tensorrt_llm::kernels::kNVFP44Over6FromEnv)
-        << "min-latency mode reads the NVFP4 4over6 recipe from the environment";
+                                             quant_scales, base_activation_type, nvfp4_4over6_code);
 
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
@@ -1291,7 +1285,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   kernels::QuantParams getQuantParams(
       int64_t num_experts_on_rank, int64_t hidden_size, int64_t inter_size,
       Optional<Array<Tensor>> quant_scales,
-      ActivationType base_activation_type = ActivationType::Swiglu) const {
+      ActivationType base_activation_type = ActivationType::Swiglu,
+      int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv) const {
     if (isWMxfp8AMxfp8Quant()) {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       TVM_FFI_ICHECK(quant_scales.has_value())
@@ -1704,7 +1699,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           w4a16 ? nullptr : static_cast<float const*>(fc2_act_global.data_ptr()),
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
           static_cast<float const*>(fc2_global.data_ptr()), !w4a16 && fc1_act_global.ndim() == 1,
-          !w4a16 && fc2_act_global.ndim() == 1);
+          !w4a16 && fc2_act_global.ndim() == 1, nvfp4_4over6_code);
 #if defined(FLASHINFER_FP4_SW_CVT)
       params.groupwise = kernels::QuantParams::GroupWise(
                              TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize,

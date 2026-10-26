@@ -138,12 +138,12 @@ struct AbsMaxOp<__nv_bfloat16> {
   __device__ static float to_float(Accum value) { return __bfloat162float(value); }
 };
 
-// Selects the compile-time NVFP4 quantizer variant from the recipe code (resolveNVFP4Recipe();
-// the default reads FLASHINFER_NVFP4_4OVER6*). FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH stays an
-// environment knob.
+// Selects the compile-time NVFP4 quantizer variant from the recipe code
+// (resolveNVFP4Recipe(); the default code reads FLASHINFER_NVFP4_4OVER6*).
+// FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH stays a separate environment knob.
 template <typename Fn>
-auto dispatchNVFP44Over6Config(Fn&& fn, int64_t nvfp4_4over6_code = kNVFP44Over6FromEnv) {
-  auto const recipe = resolveNVFP4Recipe(nvfp4_4over6_code);
+auto dispatchNVFP44Over6Config(int64_t nvfp4_4over6_code, Fn&& fn) {
+  auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(nvfp4_4over6_code);
   bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
 
   auto dispatchDisableFastMath = [&](auto e4m3MaxTag, auto errModeTag, auto errUseFastMathTag) {
@@ -2536,6 +2536,7 @@ void expandInputRowsKernelLauncher(
                            "NVFP4 block scaling is expected for FP4xFP4");
       TLLM_CHECK_WITH_INFO(!prequant_scales, "NVFP4 is not supported for AWQ");
       return dispatchNVFP44Over6Config(
+          quant_params.fp4.nvfp4_4over6_code,
           [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
             return &expandInputRowsKernel<
                 InputActivationsType, ExpandedActivationsType,
@@ -2965,6 +2966,51 @@ struct ClampedSituAdaptor : SituAdaptor {
   }
 };
 
+// PowLU-GLU. The gate branch replaces
+// SiLU's linear factor by a self-adapting power, and the negative half is plain SiLU:
+//   PowLU(g) = g > 0 ? g^(m / (sqrt(g) + 1)) * sigmoid(g)
+//                    : g * sigmoid(g)
+//   out      = min(PowLU(gate), limit) * clamp(up, -limit, limit)
+// The two branches agree at g == 0 (both 0) and at g == 1, so PowLU is continuous.
+//
+// `alpha` carries the exponent numerator m. PowLU needs exactly one scalar besides `limit`, so it
+// reuses the generic per-expert swiglu_alpha/swiglu_limit slots instead of widening the
+// ActivationParams ABI -- the same trade SwigluStepAdaptor makes for `limit`. Per-expert
+// `swiglu_limit` covers split limits (routed experts vs. a fused shared expert).
+//
+// PowLU is bounded: for m == 2.5 it peaks at 4.02 (g ~= 12.9) and decays back toward 1 as g grows,
+// so a `limit` above that peak never clips the gate branch and only clamps `up`.
+struct PowLUAdaptor {
+  constexpr static bool IS_GLU = true;
+  float alpha = 2.5f;  // m
+  // Unused by the math; present so the generic setPerExpertActivationParams branch compiles.
+  float beta = 0.0f;
+  float limit = std::numeric_limits<float>::infinity();
+
+  template <class T>
+  __device__ T operator()(T const& gate, T const& linear) const {
+    // Element-wise rather than whole-Array: the gate needs a sign-dependent branch, which the
+    // cutlass::Array functors cannot express. T is always cutlass::Array<float, N> here (both
+    // dispatch sites call the adaptor with ComputeElem).
+    T out;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < T::kElements; ++i) {
+      float const g = gate[i];
+      // __expf overflows to +inf for very negative g, giving sigmoid == 0 exactly (not NaN).
+      float const sigmoid = 1.0f / (1.0f + __expf(-g));
+      // __powf(g, e) is exp2f(e * __log2f(g)). The Triton reference computes exp(e * log(g));
+      // the two agree to <= 6e-6 relative, far below bf16 resolution. Shared edge with that
+      // reference: an overflowed gate (g == inf) gives e == 0 and 0 * log(inf) == NaN, which the
+      // non-propagating fminf below turns into `limit` -- torch.pow(inf, 0) == 1 instead.
+      float act = g > 0.0f ? __powf(g, alpha / (sqrtf(g) + 1.0f)) * sigmoid : g * sigmoid;
+      act = fminf(act, limit);
+      float const u = fmaxf(fminf(linear[i], limit), -limit);
+      out[i] = act * u;
+    }
+    return out;
+  }
+};
+
 __device__ inline bool hasPerExpertActivationParams(ActivationParams const& params) {
   // clamped_relu2_limit applies model-wide and is consumed only by the fused GEMM1 epilogue.
   return params.swiglu_alpha || params.swiglu_beta || params.swiglu_limit || params.situ_beta ||
@@ -3060,6 +3106,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluStepAdaptor>
              : activation_type == ActivationType::Situ
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SituAdaptor>
+             : activation_type == ActivationType::PowLU
+                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, PowLUAdaptor>
                  : nullptr;
   TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
   fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size,
@@ -3322,8 +3370,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                   QuantParams const& quant_params, bool use_per_expert_act_scale,
                   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
                   float* fp8_token_dequant_scale, float const* fp8_expert_residual_scale,
-                  bool enable_pdl, cudaStream_t stream,
-                  int64_t nvfp4_4over6_code = kNVFP44Over6FromEnv) {
+                  bool enable_pdl, cudaStream_t stream) {
   TLLM_CHECK_WITH_INFO(
       (inter_size * std::min(sizeof_bits<T>::value, sizeof_bits<GemmOutputType>::value)) % 128 == 0,
       "inter_size %ld rows are not a multiple of 16B; doActivationKernel requires 16B-aligned rows",
@@ -3420,6 +3467,13 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                               decltype(disableFP4QuantFastMathTag)::value,
                               decltype(nvfp4_4over6_config_tag)>  // Situ
       };
+      // PowLU is CUTLASS-only and numbered after InvalidType (like ClampedRelu2), so it is
+      // outside the dense enum-indexed range of fn_list and dispatched here instead.
+      if (activation_type.activation_type == ActivationType::PowLU) {
+        return &doActivationKernel<
+            T, GemmOutputType, ScaleBiasType, PowLUAdaptor, decltype(block_scaling_type)::value,
+            decltype(disableFP4QuantFastMathTag)::value, decltype(nvfp4_4over6_config_tag)>;
+      }
       auto const activation_index = static_cast<size_t>(activation_type.activation_type);
       TLLM_CHECK_WITH_INFO(activation_index < fn_list.size(),
                            "Unsupported activation type in doActivation");
@@ -3441,6 +3495,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
       TLLM_CHECK_WITH_INFO(quant_params.fp4.fc2.weight_block_scale,
                            "NVFP4 block scaling is expected for FP4xFP4");
       return dispatchNVFP44Over6Config(
+          quant_params.fp4.nvfp4_4over6_code,
           [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
             return fn(NVFP4, disableFP4QuantFastMathTag, nvfp4_4over6_config_tag);
           });
@@ -3461,10 +3516,10 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
             return fn(MXFPX, std::false_type{}, std::false_type{});
           }
           return dispatchNVFP44Over6Config(
+              quant_params.fp4.nvfp4_4over6_code,
               [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
                 return fn(NVFP4, disableFP4QuantFastMathTag, nvfp4_4over6_config_tag);
-              },
-              nvfp4_4over6_code);
+              });
         }
       }
 #endif
@@ -4191,9 +4246,7 @@ void CutlassMoeFCRunner<
                    ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
                    bool bias_is_broadcast, cudaStream_t stream,
                    cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-                   int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
-                   // Below SM100: the 4over6 recipe of the NVFP4 activation quantizations.
-                   int64_t nvfp4_4over6_code) {
+                   int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
   if (fp8_blockscale_gemm_runner) {
     TLLM_CHECK(!min_latency_mode);
     Self::BlockScaleFC1(*fp8_blockscale_gemm_runner, input, output, intermediate_result,
@@ -4368,7 +4421,7 @@ void CutlassMoeFCRunner<
                 (use_restored_fp4 && !use_restored_mx && !quant_params.fp4.fc2.act_global_scale)
             ? nullptr
             : fc2_fp4_act_flat,
-        nullptr, nullptr, enable_pdl, stream, nvfp4_4over6_code);
+        nullptr, nullptr, enable_pdl, stream);
 
     sync_check_cuda_error(stream);
   } else if (!is_gated_activation) {
@@ -4571,8 +4624,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                       static_cast<ScaleBiasType const*>(fc2_lora), false, expert_first_token_offset,
                       /*permuted_token_selected_experts=*/nullptr, num_experts_per_node,
                       hidden_size, expanded_num_rows, ActivationParams(ActivationType::Identity),
-                      {}, false, nullptr, nullptr, nullptr, enable_pdl, stream,
-                      kNVFP44Over6FromEnv);
+                      {}, false, nullptr, nullptr, nullptr, enable_pdl, stream);
     sync_check_cuda_error(stream);
   }
   if (skip_finalize) {  // GEMM2's rows, with the FC2 biases
@@ -4583,7 +4635,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
           expert_first_token_offset, /*permuted_token_selected_experts=*/nullptr,
           num_experts_per_node, hidden_size, expanded_num_rows,
           ActivationParams(ActivationType::Identity), {}, false, nullptr, nullptr, nullptr,
-          enable_pdl, stream, kNVFP44Over6FromEnv);
+          enable_pdl, stream);
       sync_check_cuda_error(stream);
     }
     return;
@@ -4861,7 +4913,7 @@ void CutlassMoeFCRunner<
                     bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
                     bool use_mxfp8_act_scaling, bool min_latency_mode,
                     MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
-                    float const* per_token_scale, int64_t nvfp4_4over6_code, bool skip_finalize) {
+                    float const* per_token_scale, bool skip_finalize) {
   static constexpr bool int_scales_required = std::is_same<WeightType, uint8_t>::value ||
                                               std::is_same<WeightType, cutlass::uint4b_t>::value ||
                                               use_wfp4a16;
@@ -5065,7 +5117,7 @@ void CutlassMoeFCRunner<
                 quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
                 num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_, !use_lora,
                 stream, *gemm1_config_, true, min_latency_params.num_active_experts_per_node,
-                min_latency_params.active_expert_global_ids, enable_pdl, nvfp4_4over6_code);
+                min_latency_params.active_expert_global_ids, enable_pdl);
     sync_check_cuda_error(stream);
 
     auto gemm2_input =
@@ -5182,7 +5234,7 @@ void CutlassMoeFCRunner<
                 reinterpret_cast<int32_t*>(fc1_fp4_act_scale_), false,
                 QuantizationSFLayout::SWIZZLED_128x4,
                 tensorrt_llm::common::getMultiProcessorCount(), enable_pdl, false, false,
-                resolveNVFP4Recipe(nvfp4_4over6_code), stream);
+                resolveNVFP4Recipe(quant_params.fp4.nvfp4_4over6_code), stream);
             codes = permuted_data_;
             sf = fc1_fp4_act_scale_;
             swizzled = true;
@@ -5298,7 +5350,7 @@ void CutlassMoeFCRunner<
         fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
         num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_,
         !use_lora && !lora_params.fc1_deltas, stream, *gemm1_config_, false, nullptr, nullptr,
-        enable_pdl, nvfp4_4over6_code);
+        enable_pdl);
     sync_check_cuda_error(stream);
 #if defined(ENABLE_FP4) && defined(FLASHINFER_FP4_SW_CVT)
     if constexpr (use_restored_fp4) {
@@ -5320,11 +5372,12 @@ void CutlassMoeFCRunner<
         // Per token: GEMM2's input quantized per row (the FC2 activation global scale as
         // CuTe-DSL's fc2_input_scale), restored, and each row's GEMM2 scale set.
         auto* activations = reinterpret_cast<BackBoneType*>(gemm1_result);
-        invokeNvfp4QuantAndPerTokenScale(
-            expanded_num_rows, inter_size, activations, 1.0f, nullptr,
-            reinterpret_cast<uint8_t*>(glu_inter_result_), fc2_fp4_act_scale_, row_scales,
-            QuantizationSFLayout::SWIZZLED_128x4, resolveNVFP4Recipe(nvfp4_4over6_code), stream,
-            enable_pdl, quant_params.fp4.fc2.act_global_scale);
+        invokeNvfp4QuantAndPerTokenScale(expanded_num_rows, inter_size, activations, 1.0f, nullptr,
+                                         reinterpret_cast<uint8_t*>(glu_inter_result_),
+                                         fc2_fp4_act_scale_, row_scales,
+                                         QuantizationSFLayout::SWIZZLED_128x4,
+                                         resolveNVFP4Recipe(quant_params.fp4.nvfp4_4over6_code),
+                                         stream, enable_pdl, quant_params.fp4.fc2.act_global_scale);
         restoreNvfp4Rows(activations, glu_inter_result_, fc2_fp4_act_scale_, true, nullptr, 0,
                          expanded_num_rows, inter_size, stream);
         nvfp4RowScales(row_scales, row_scales, nullptr, 0, quant_params.fp4.fc2.global_scale,
