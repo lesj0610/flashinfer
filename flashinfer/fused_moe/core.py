@@ -1721,12 +1721,11 @@ def cutlass_fused_moe(
         )
     if (
         major < 10
-        and fc1_expert_weights.dtype == torch.int64
         and activation_type == ActivationType.Situ
         and swiglu_limit is not None
     ):
-        # As from SM100 this SiTU checks swiglu_limit and drops it; the SM80 kernels clamp SiTU
-        # by it only for TRT-LLM's MoE.
+        # As from SM100 this SiTU checks swiglu_limit and drops it; the SM80 kernels and SM90's
+        # MXFP8 x MXFP4 clamp SiTU by it only for TRT-LLM's MoE.
         check_shape_dtype_device(
             swiglu_limit,
             (fc2_expert_weights.shape[0],),
