@@ -2573,7 +2573,7 @@ def _is_cutlass_nvfp4_runtime_supported() -> bool:
 
 cutlass_nvfp4_required = pytest.mark.skipif(
     not _is_cutlass_nvfp4_runtime_supported(),
-    reason="requires SM100/SM110/SM12x CUTLASS NVFP4 GPU and CUDA toolkit",
+    reason="requires a supported CUTLASS NVFP4 GPU and CUDA toolkit",
 )
 
 
@@ -2865,7 +2865,7 @@ def _is_cutlass_mxfp8_runtime_supported() -> bool:
 
 cutlass_mxfp8_mxfp4_required = pytest.mark.skipif(
     not _is_cutlass_nvfp4_runtime_supported(),
-    reason="requires SM100/SM110/SM12x CUTLASS MXFP8xMXFP4 GPU and CUDA toolkit",
+    reason="requires a supported CUTLASS MXFP8xMXFP4 GPU and CUDA toolkit",
 )
 
 cutlass_mxfp8_required = pytest.mark.skipif(

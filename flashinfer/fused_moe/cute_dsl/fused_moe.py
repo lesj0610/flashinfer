@@ -1552,7 +1552,8 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
         quant_scales = [one, s1, alpha1, fc2_scale.reshape(()), s2, alpha2]
         quant_scales += inputs[11:-1]  # per-token activation scales
         x_sf = x_sf.view(x.shape[0], -1)
-        x_sf = torch.nn.functional.pad(x_sf, (0, -x_sf.shape[1] % 4))  # K padded to 64
+        if x_sf.shape[1] % 4 or not x_sf.is_contiguous():  # K padded to 64
+            x_sf = torch.nn.functional.pad(x_sf, (0, -x_sf.shape[1] % 4))
         if len(quant_scales) == 7:
             code = NVFP4_4OVER6_CODE_FROM_ENV
             if nvfp4_4over6 is not _UNSET:

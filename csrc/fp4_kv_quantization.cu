@@ -83,10 +83,11 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
   for (int i = 0; i < 8; ++i) {
     uint32_t const bits = __float_as_uint(i % 2 ? array[i / 2].y : array[i / 2].x);
     uint32_t const mag = bits & 0x7FFFFFFFu;
-    uint32_t const code = (mag > 0x3E800000u) + (mag >= 0x3F400000u) + (mag > 0x3FA00000u) +
-                          (mag >= 0x3FE00000u) + (mag > 0x40200000u) + (mag >= 0x40600000u) +
-                          (mag > 0x40A00000u);
-    val |= ((mag > 0x7F800000u ? 0u : bits >> 28 & 0x8u) | code) << (4 * i);
+    uint32_t const hi = mag >= 0x3FE00000u;
+    uint32_t const mid = mag >= (hi ? 0x40600000u : 0x3F400000u);
+    uint32_t const lo =
+        mag > (hi ? (mid ? 0x40A00000u : 0x40200000u) : (mid ? 0x3FA00000u : 0x3E800000u));
+    val |= ((mag > 0x7F800000u ? 0u : bits >> 28 & 0x8u) | hi << 2 | mid << 1 | lo) << (4 * i);
   }
   return val;
 #else

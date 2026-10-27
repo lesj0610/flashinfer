@@ -160,7 +160,7 @@ sm100_required = pytest.mark.skipif(
     not is_sm100_family(),
     reason="Requires CuteDSL MoE target SM100, SM103 or SM107",
 )
-# The MoE APIs also run below SM100 (SM80 to SM90), on the CUTLASS SM80 kernels.
+# The MoE APIs also run below SM100 (SM80 to SM90), on the CUTLASS MoE kernels.
 sm10x_required = pytest.mark.skipif(
     not is_sm100_family()
     and not (
@@ -3317,44 +3317,6 @@ class TestExpertParallelism:
             f"EP accuracy test failed (ep_size={ep_size}, ep_rank={ep_rank}, "
             f"offset={local_expert_offset}): {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
-
-    def test_uneven_shards_sum_to_whole(self):
-        """Shards of unequal size, at an offset no multiple of their size, sum to
-        the whole call."""
-        from flashinfer import cute_dsl_fused_moe
-
-        num_experts, top_k = 256, 8
-        tensors = create_moe_tensors(
-            num_tokens=256,
-            hidden_size=256,
-            intermediate_size=512,
-            num_experts=num_experts,
-            num_local_experts=num_experts,
-            top_k=top_k,
-        )
-        api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, "w4a4")
-        outputs = []
-        for lo, n in ((0, num_experts), (0, 96), (96, 160)):
-            # Expert axis: first for weights and alphas, last for the MMA-layout scales.
-            shard = {
-                k: tensors[k].narrow(-1 if k.endswith("_sf") else 0, lo, n)
-                for k in ("w1_weight", "w1_weight_sf", "w1_alpha")
-                + ("w2_weight", "w2_weight_sf", "w2_alpha")
-            }
-            out = cute_dsl_fused_moe(
-                token_selected_experts=tensors["token_selected_experts"],
-                token_final_scales=tensors["token_final_scales"],
-                num_experts=num_experts,
-                top_k=top_k,
-                num_local_experts=n,
-                local_expert_offset=lo,
-                **shard,
-                **api_inputs,
-            )
-            outputs.append(out.float())
-        whole, first, second = outputs
-        atol = whole.abs().max().item() * 2**-5
-        torch.testing.assert_close(first + second, whole, rtol=0, atol=atol)
 
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize(

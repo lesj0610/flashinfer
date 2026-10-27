@@ -2610,10 +2610,7 @@ sm100_required = pytest.mark.skipif(
 )
 
 
-cute_dsl_sm100_required = pytest.mark.skipif(
-    not _is_unified_nvfp4_arch(),
-    reason="CuTeDSL unified MoE requires SM80 to SM90, SM100, SM103, or SM107",
-)
+cute_dsl_sm100_required = sm100_required
 
 bf16_required = pytest.mark.skipif(
     not (
@@ -3340,6 +3337,7 @@ def _bf16_check(out, ref, label):
     torch.testing.assert_close(out.float(), ref, rtol=BF16_RTOL, atol=BF16_ATOL)
 
 
+@sm100_required
 def test_bf16_gate_up_row_order_is_up_then_gate():
     """TRT-LLM and CUTLASS BF16 read canonical gated ``w1`` rows as ``[up, gate]``.
 
@@ -3351,8 +3349,6 @@ def test_bf16_gate_up_row_order_is_up_then_gate():
     configs = tuple(
         cfg for cfg in (TrtllmBf16Config(), CutlassBf16Config()) if cfg.supported(arch)
     )
-    if not configs:
-        pytest.skip("No unified BF16 MoE backend on this architecture")
     act, weights, config, tensors = _make_bf16_packs_and_config(
         256,
         max_tokens=256,

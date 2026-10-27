@@ -7449,7 +7449,7 @@ def _trtllm_fp4_routed_moe_sm80(
         pairs = topk_ids.view(torch.int16).view(*topk_ids.shape, 2)
         topk_weights, topk_ids = pairs[..., 0].view(torch.bfloat16), pairs[..., 1]
     # Local expert ids, as EP rank 0 of 2: ids outside the local experts are skipped.
-    local = topk_ids - local_expert_offset
+    local = topk_ids - local_expert_offset if local_expert_offset else topk_ids
     w1, s1, w2, s2 = sm80_weights
     if s1.dtype != torch.int32:  # the SM90 operands keep their uint8 weights
         w1, w2 = w1.view(torch.int64), w2.view(torch.int64)
@@ -7476,7 +7476,7 @@ def _trtllm_fp4_routed_moe_sm80(
     fc2_scale = scalar(output1_scale_scalar)
     if act.is_gated and act != ActivationType.Situ:
         # A zero gate scalar zeroes the FC1 output, whatever the GEMM2-input scale.
-        fc2_scale = fc2_scale / fc1_dequant.masked_fill(fc1_dequant == 0, 1.0)
+        fc2_scale = fc2_scale / torch.where(fc1_dequant == 0, 1.0, fc1_dequant)
     fc2_dequant = scalar(output2_scale_scalar)
     biases = (None, None)
     if gemm1_bias is not None or gemm2_bias is not None:
@@ -7528,11 +7528,11 @@ def _trtllm_fp4_routed_moe_sm80(
             x_sf = hidden_states_scale.view(torch.uint8).reshape(num_tokens, -1)
     else:
         quant_scales = [
-            torch.ones((), device=hidden_states.device), s1, fc1_dequant, fc2_scale, s2,
-            fc2_dequant,
+            ones[0], s1, fc1_dequant, fc2_scale, s2, fc2_dequant,
         ] + ([] if per_token_scale is None else [per_token_scale.float().contiguous()])  # fmt: skip
         x_sf = hidden_states_scale.view(torch.uint8).reshape(num_tokens, -1)
-        x_sf = torch.nn.functional.pad(x_sf, (0, -x_sf.shape[1] % 4))
+        if x_sf.shape[1] % 4 or not x_sf.is_contiguous():
+            x_sf = torch.nn.functional.pad(x_sf, (0, -x_sf.shape[1] % 4))
     rows = fc2_inputs = None
     if not do_finalize or fc1_deltas is not None:  # each (k, token)'s row
         rows = topk_ids.new_empty(topk_ids.shape[::-1], dtype=torch.int32)

@@ -3207,10 +3207,10 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
 
     using BiasElem = cutlass::Array<ScaleBiasType, ACTIVATION_ELEM_PER_THREAD>;
     using GemmResultElem = cutlass::Array<GemmOutputType, ACTIVATION_ELEM_PER_THREAD>;
-    using OutputElem = std::conditional_t < IsNVFP4 && !IsRestoredNVFP4, uint32_t,
-          std::conditional_t < IsMXFP8 && !IsRestoredMXFP8, uint64_t, cutlass::Array < T,
-          ACTIVATION_ELEM_PER_THREAD >>>
-        ;
+    using OutputElem =
+        std::conditional_t<(IsNVFP4 && !IsRestoredNVFP4), uint32_t,
+                           std::conditional_t<(IsMXFP8 && !IsRestoredMXFP8), uint64_t,
+                                              cutlass::Array<T, ACTIVATION_ELEM_PER_THREAD>>>;
     using ComputeElem = cutlass::Array<float, ACTIVATION_ELEM_PER_THREAD>;
     // Aliases gemm_result for non-gated, non-fp8 cases
     auto gemm_result_vec =

@@ -61,7 +61,7 @@ def _sm100_family() -> bool:
     ) in ((10, 0), (10, 3), (10, 7))
 
 
-# Also below SM100 (SM80 to SM90), on the CUTLASS SM80 kernels.
+# Also below SM100 (SM80 to SM90), on the CUTLASS MoE kernels.
 pytestmark = pytest.mark.skipif(
     not _sm100_family()
     and not (

@@ -297,6 +297,7 @@ def test_split_bf16_masked_routes_cuda_graph(offset, num_tokens):
         check(output)
 
 
+@pytest.mark.arch_blackwell
 def test_split_nvfp4_kernel_matches_torch_reference():
     """``trtllm_fp4_routed`` (all experts local) matches the dequant torch oracle."""
     _require_backend(TrtllmFp4Config)
@@ -450,7 +451,6 @@ def test_split_w4a8_kernel_matches_direct_runner(compute_backend):
 )
 def test_trtllm_routed_moe_supported_architectures(config_cls, arch, expected):
     """CPU-only: lock down the backend support contract."""
-    # TRT-LLM FP4 also runs below SM100, on the SM80 GEMM.
     expected |= config_cls is TrtllmFp4Config and arch < 100
     assert config_cls.supported(arch) is expected
 

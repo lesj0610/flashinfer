@@ -311,7 +311,7 @@ def skip_checks(
     # Check moe_impl class by name to avoid circular imports
     is_fp4_moe = type(moe_impl).__name__ == "FP4Moe"
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    # TRT-LLM FP4 also runs below SM100 (SM80 to SM90), on the CUTLASS SM80 kernels.
+    # TRT-LLM FP4 also runs below SM100 (SM80 to SM90), on the CUTLASS MoE kernels.
     if compute_capability[0] not in [10] and not (
         is_fp4_moe
         and compute_capability[0] in [8, 9]

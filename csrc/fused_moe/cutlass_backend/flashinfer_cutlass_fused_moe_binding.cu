@@ -496,11 +496,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     }
     kernels::MoeMinLatencyParams min_latency_params{};
 
-    // TODO: support lora in the future
+    // Not the LoRA plugin (use_lora stays false): only TRT-LLM MoE's FC1 deltas and GEMM2 inputs.
     ::tensorrt_llm::kernels::LoraParams lora_params{};
-    // HACK Define default values for parameters we don't have good values for
-    // Finalize writes each row's leading output.size(1) columns, in 16-byte vectors. The rest
-    // serves TRT-LLM's MoE below SM100 (see cutlass_fused_moe in flashinfer/fused_moe/core.py).
+    // Finalize writes each row's leading output.size(1) columns, in 16-byte vectors.
     CHECK_DIM(2, output);
     int64_t const unpadded_hidden_size = output.size(1);
     int64_t const expanded_rows = num_rows * experts_per_token;
