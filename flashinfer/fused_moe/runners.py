@@ -2593,7 +2593,7 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
             from .prepare import _CUTLASS_NVFP4_SM80_KEYS, _check_sm80_nvfp4_operands
 
             sm80 = tuple(view[k] for k in _CUTLASS_NVFP4_SM80_KEYS)
-            _check_sm80_nvfp4_operands(sm80, w1, w2, self.device)
+            _check_sm80_nvfp4_operands(sm80, w1.shape, w2.shape, self.device)
             w1, w1_scale, w2, w2_scale = sm80
         # Flat NVFP4 CUTLASS selects the kernel from weight dtype int64.
         return [
@@ -2838,7 +2838,7 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
             from .prepare import _CUTLASS_NVFP4_SM80_KEYS, _check_sm80_nvfp4_operands
 
             sm80 = tuple(view[k] for k in _CUTLASS_NVFP4_SM80_KEYS)
-            _check_sm80_nvfp4_operands(sm80, w1, w2, self.device)
+            _check_sm80_nvfp4_operands(sm80, w1.shape, w2.shape, self.device)
             w1, w1_scale, w2, w2_scale = sm80
         return [
             w1.view(torch.int64),
@@ -5280,7 +5280,9 @@ class CuteDslRunner(MoERunner):
 
             sm80 = tuple(map(v.get, _CUTLASS_NVFP4_SM80_KEYS))
             device = act.hidden_states_q.device
-            _check_sm80_nvfp4_operands(sm80, v["w1_weight"], v["w2_weight"], device)
+            _check_sm80_nvfp4_operands(
+                sm80, v["w1_weight"].shape, v["w2_weight"].shape, device
+            )
             v = {**v, **dict(zip(keys, sm80, strict=True))}
 
         pair = self.config.quant.pair
@@ -6090,8 +6092,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                     sm90=sm90,
                 )
             )
-            if not sm90:
-                _check_sm80_nvfp4_operands(sm80, w1, w2, device)
+            _check_sm80_nvfp4_operands(sm80, w1.shape, w2.shape, device, sm90)
             return _TrtllmPackedInputs(
                 moe_inputs.to_list(),
                 tuning_config=TuningConfig(),

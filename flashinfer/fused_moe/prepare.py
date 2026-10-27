@@ -2191,29 +2191,60 @@ def cutlass_mxfp4_sm90_weights(
 
 def _check_sm80_nvfp4_operands(
     operands: Tuple[torch.Tensor, ...],
-    w1: torch.Tensor,
-    w2: torch.Tensor,
+    w1_shape: Tuple[int, ...],
+    w2_shape: Tuple[int, ...],
     device: torch.device,
+    sm90: bool = False,
 ) -> None:
-    """Checks a view's SM80 operands against its packed uint8 FP4 weights ``w1`` and ``w2``:
-    the layout ``cutlass_nvfp4_sm80_weights`` returns, with BF16 scales."""
-    (num_experts, rows, half_k1), (_, hidden_size, half_k2) = w1.shape, w2.shape
+    """Checks operands against the shapes of their packed uint8 FP4 weights: the layout
+    ``cutlass_nvfp4_sm80_weights`` returns, with BF16 scales, or with ``sm90`` MXFP4's SM90 one."""
+    (num_experts, rows, half_k1), (_, hidden_size, half_k2) = w1_shape, w2_shape
     k1, k2 = round_up(half_k1 * 2, 64), round_up(half_k2 * 2, 64)
-    layouts = (  # each expert's dtype, shape and row stride
-        (torch.uint8, rows, half_k1, k1 // 2),
-        (torch.bfloat16, k1 // 16, rows, rows),
-        (torch.uint8, hidden_size, half_k2, k2 // 2),
-        (torch.bfloat16, k2 // 16, hidden_size, hidden_size),
+    layouts = (  # each expert's dtype, shape and strides
+        (torch.uint8, (rows, half_k1), (k1 // 2, 1)),
+        (torch.bfloat16, (k1 // 16, rows), (rows, 1)),
+        (torch.uint8, (hidden_size, half_k2), (k2 // 2, 1)),
+        (torch.bfloat16, (k2 // 16, hidden_size), (hidden_size, 1)),
     )
+    if sm90:
+        # Interleaved weights; each 64-row x 128-K block's E8M0 scales as [16, 4] int32.
+        layouts = tuple(
+            layout
+            for m, half_k in ((rows, half_k1), (hidden_size, half_k2))
+            for layout in (
+                (torch.uint8, (m, half_k), (half_k, 1)),
+                (torch.int32, (m // 64, half_k // 64, 16, 4), (half_k, 64, 4, 1)),
+            )
+        )
     expected = [
-        (device, dtype, (num_experts, m, n), (m * stride, stride, 1))
-        for dtype, m, n, stride in layouts
+        (device, dtype, (num_experts, *shape), (shape[0] * strides[0], *strides))
+        for dtype, shape, strides in layouts
     ]
     got = [(t.device, t.dtype, tuple(t.shape), t.stride()) for t in operands]
     if got != expected:
         raise ValueError(
-            f"Below SM100 the SM80 operands must be {expected}, got {got}."
+            f"Below SM100 the prepared operands must be {expected}, got {got}."
         )
+
+
+def _trtllm_fc1_rows(
+    valid_intermediate_size: Optional[int],
+    inter: int,
+    gated: bool,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """The FC1 rows TRT-LLM MoE keeps of the padded intermediate size ``inter``: the leading
+    roundUp(valid_intermediate_size, 128), of both halves when gated."""
+    if valid_intermediate_size is None:
+        return None
+    if not 0 < valid_intermediate_size <= inter:
+        raise ValueError(
+            f"valid_intermediate_size must be in (0, {inter}], got {valid_intermediate_size}"
+        )
+    rows = torch.arange(
+        min(round_up(valid_intermediate_size, 128), inter), device=device
+    )
+    return torch.cat([rows, rows + inter]) if gated else rows
 
 
 def trtllm_nvfp4_sm80_weights(
@@ -2223,13 +2254,16 @@ def trtllm_nvfp4_sm80_weights(
     s2: torch.Tensor,
     gated: bool,
     mx: bool = False,
-    fc1_rows: Optional[torch.Tensor] = None,
+    valid_intermediate_size: Optional[int] = None,
     sm90: bool = False,
 ) -> Tuple[torch.Tensor, ...]:
     """The SM80 operands (BF16 output) of TRT-LLM NVFP4 or MXFP4 weights: rows shuffled for its
     128-row epilogue (gated FC1 rows also interleaved) and block scales interleaved. GEMM1's K is
-    the FC2 rows; ``fc1_rows`` (padded intermediate sizes) are the FC1 rows kept, GEMM2's K too.
-    ``sm90`` returns MXFP4's SM90 operands instead, for MXFP8 activations."""
+    the FC2 rows; a ``valid_intermediate_size`` keeps the FC1 rows used, GEMM2's K too.
+    ``sm90`` returns MXFP4's SM90 operands instead, for MXFP8 activations. Below SM100
+    ``trtllm_fp4_block_scale_moe`` and ``trtllm_fp4_block_scale_routed_moe`` convert their weights
+    on every call unless given these, prepared once, in place of the weights and their scales
+    (NVFP4 ones with NVFP4 activations, else MXFP4 ones)."""
     from .core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
@@ -2240,6 +2274,9 @@ def trtllm_nvfp4_sm80_weights(
     )
     p2 = get_w2_permute_indices_with_cache(
         _TRTLLM_PERMUTE_CACHE, w2[0].view(torch.uint8), 128, is_gated_act_gemm=gated
+    )
+    fc1_rows = _trtllm_fc1_rows(
+        valid_intermediate_size, w2.shape[2] * 2, gated, w1.device
     )
     rows1, k2 = p1.argsort(), None
     if fc1_rows is not None:

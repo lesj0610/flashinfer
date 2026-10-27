@@ -6708,6 +6708,9 @@ def trtllm_fp4_block_scale_moe(
         ``[num_experts, M, hidden_size // 2]`` packed FP4 FC1 weights, dtype
         ``uint8``.  ``M`` is ``2 * intermediate_size`` for gated activations and
         ``intermediate_size`` for non-gated ones (``6`` Relu2, ``9`` Identity).
+        Below SM100 the four weight and scale tensors may be the operands
+        :func:`~flashinfer.fused_moe.trtllm_nvfp4_sm80_weights` prepares once;
+        others are converted on every call.
     gemm1_weights_scale : torch.Tensor
         ``[num_experts, M, hidden_size // (32 if mxfp4 else 16)]`` FC1 weight
         block scales, dtype float8, with the same ``M`` as ``gemm1_weights``.
@@ -7044,6 +7047,9 @@ def trtllm_fp4_block_scale_routed_moe(
     gemm1_weights : torch.Tensor
         ``[num_experts, 2 * intermediate_size, hidden_size // 2]`` packed
         FP4 FC1 weights, ``uint8``.
+        Below SM100 the four weight and scale tensors may be the operands
+        :func:`~flashinfer.fused_moe.trtllm_nvfp4_sm80_weights` prepares once;
+        others are converted on every call.
     gemm1_weights_scale : torch.Tensor
         ``[num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]``
         FC1 weight block scales, float8.
@@ -7243,15 +7249,19 @@ def trtllm_fp4_block_scale_routed_moe(
     if sm80:
         # The SM100 launchers' checks, with their errors: NVFP4 (16-element blocks) or MXFP4
         # (32) weights by their scale count, and with fused shared experts each expert-major
-        # tensor's extent.
+        # tensor's extent. Operands from trtllm_nvfp4_sm80_weights (BF16 scales, int32 on SM90's
+        # GEMM) are checked and used as they are.
         experts = local_num_experts + _nfse
         hidden_size = hidden_states.shape[1] * (
             2 if hidden_states.dtype == torch.uint8 else 1
         )
         gated = ActivationType(activation_type).is_gated
+        prepared = gemm1_weights_scale.dtype in (torch.bfloat16, torch.int32)
         scales = experts * intermediate_size * (2 if gated else 1) * hidden_size
         sf_vec = 32 if scales // max(gemm1_weights_scale.numel(), 1) > 16 else 16
-        if gemm1_weights_scale.numel() < scales // sf_vec:
+        if prepared:
+            sf_vec = 16 if hidden_states.dtype == torch.uint8 else 32
+        elif gemm1_weights_scale.numel() < scales // sf_vec:
             raise RuntimeError(
                 f"weight scale tensor too small: numel={gemm1_weights_scale.numel()} but "
                 f"expected at least {scales // sf_vec} for sf_vec_size={sf_vec}"
@@ -7299,7 +7309,11 @@ def trtllm_fp4_block_scale_routed_moe(
             )
         if hidden_states_scale is not None:  # the linear layout, as above SM100
             resolve_moe_act_sf_layout(hidden_states_scale_layout)
-        from .prepare import trtllm_nvfp4_sm80_weights
+        from .prepare import (
+            _check_sm80_nvfp4_operands,
+            _trtllm_fc1_rows,
+            trtllm_nvfp4_sm80_weights,
+        )
 
         # Padded sizes as above SM100: GEMM1's K is roundUp(valid_hidden_size, 128), the FC2
         # rows, and the intermediate size roundUp(valid_intermediate_size, 128) at most.
@@ -7312,20 +7326,13 @@ def trtllm_fp4_block_scale_routed_moe(
                 "gemm2_weights dim 1 must be GEMM2's output hidden size "
                 f"{output_hidden_size}, got {gemm2_weights.shape[1]}"
             )
-        fc1_rows = None
-        if valid_intermediate_size is not None:
-            inter = gemm2_weights.shape[2] * 2
-            if not 0 < valid_intermediate_size <= inter:
-                raise ValueError(
-                    f"valid_intermediate_size must be in (0, {inter}], "
-                    f"got {valid_intermediate_size}"
-                )
-            fc1_rows = torch.arange(
-                min(_round_up(valid_intermediate_size, 128), inter),
-                device=hidden_states.device,
-            )
-            if gated:
-                fc1_rows = torch.cat([fc1_rows, fc1_rows + inter])
+        # The FC1 rows kept, of the weights, biases and LoRA deltas alike.
+        fc1_rows = _trtllm_fc1_rows(
+            valid_intermediate_size,
+            intermediate_size if prepared else gemm2_weights.shape[2] * 2,
+            gated,
+            hidden_states.device,
+        )
         if not do_finalize:  # as above SM100, the unfinalized rows are allocated
             output = None
         elif output is None:
@@ -7339,21 +7346,29 @@ def trtllm_fp4_block_scale_routed_moe(
             _check_trtllm_moe_output(
                 output, num_tokens, hidden_size, valid_hidden_size, hidden_states.device
             )
-        sm80_weights = trtllm_nvfp4_sm80_weights(
-            gemm1_weights,
-            gemm1_weights_scale,
-            gemm2_weights,
-            gemm2_weights_scale,
-            gated,
-            sf_vec == 32,
-            fc1_rows,
-            # SM90 runs MXFP4 x MXFP8 on the FP8 mixed-input GEMM, as CUTLASS MoE does.
+        # SM90 runs MXFP4 x MXFP8 on the FP8 mixed-input GEMM, as CUTLASS MoE does.
+        sm90 = (
             get_compute_capability(hidden_states.device)[0] == 9
-            and hidden_states.dtype == torch.float8_e4m3fn,
+            and hidden_states.dtype == torch.float8_e4m3fn
         )
+        weights = gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale
+        if prepared:
+            rows1 = intermediate_size * (2 if gated else 1)
+            rows1 = rows1 if fc1_rows is None else fc1_rows.numel()
+            _check_sm80_nvfp4_operands(
+                weights,
+                (experts, rows1, output_hidden_size // 2),
+                (experts, output_hidden_size, rows1 // (2 if gated else 1) // 2),
+                hidden_states.device,
+                sm90,
+            )
+        else:
+            weights = trtllm_nvfp4_sm80_weights(
+                *weights, gated, sf_vec == 32, valid_intermediate_size, sm90
+            )
         return _trtllm_fp4_routed_moe_sm80(
             topk_ids_tensor, topk_weights, hidden_states, hidden_states_scale,
-            per_token_scale, sm80_weights, output1_scale_scalar, output1_scale_gate_scalar,
+            per_token_scale, weights, output1_scale_scalar, output1_scale_gate_scalar,
             output2_scale_scalar, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, num_experts,
             local_expert_offset, local_num_experts, activation_type, enable_pdl, output,
             tune_max_num_tokens,
