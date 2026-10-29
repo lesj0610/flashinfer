@@ -2714,6 +2714,10 @@ enum class ScaleMode : int {
 };
 
 constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
+// finalizeMoeRoutingKernel's shared memory holds the first this many k (48 KB), in batches of
+// FINALIZE_K_LOADS k rows loaded at once.
+constexpr static int FINALIZE_CACHED_K = 4096;
+constexpr static int FINALIZE_K_LOADS = 4;
 
 // Final kernel to unpermute and scale
 // This kernel unpermutes the original data, does the k-way reduction and performs the final skip
@@ -2736,13 +2740,15 @@ __global__ void finalizeMoeRoutingKernel(
   constexpr int64_t FINALIZE_ELEM_PER_THREAD =
       128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
 
-  int64_t const start_offset = threadIdx.x;
-  int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+  // The row's columns, split over gridDim.y CTAs when there are few rows.
+  int64_t const start_offset = threadIdx.x + blockIdx.y * blockDim.x;
+  int64_t const stride = blockDim.x * gridDim.y;
   int64_t const num_elems_in_padded_col = padded_cols / FINALIZE_ELEM_PER_THREAD;
   int64_t const num_elems_in_orig_col = unpadded_cols / FINALIZE_ELEM_PER_THREAD;
 
   using BiasElem = cutlass::Array<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
-  using InputElem = cutlass::Array<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
+  // GEMM2's rows are in the workspace, aligned for a thread's elements to load at once.
+  using InputElem = cutlass::AlignedArray<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
   using OutputElem = cutlass::Array<OutputType, FINALIZE_ELEM_PER_THREAD>;
   using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
   auto const* bias_v = reinterpret_cast<BiasElem const*>(bias);
@@ -2753,38 +2759,86 @@ __global__ void finalizeMoeRoutingKernel(
   cudaGridDependencySynchronize();
 #endif
 
-#pragma unroll
-  for (int elem_index = start_offset; elem_index < num_elems_in_orig_col; elem_index += stride) {
+  // Per k: the permuted row (-1 to skip it), its expert and its scale, read once into shared memory
+  // for the first FINALIZE_CACHED_K k, padded with skipped rows to whole batches, and where they
+  // are used for the rest.
+  struct Entry {
+    int row, expert;
+    float scale;
+  };
+  auto lookup = [&](int64_t const k_idx) {
+    int64_t const k_offset = original_row * experts_per_token + k_idx;
+    int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
+    int64_t expanded_permuted_row = -1;
+    float scale = 0.f;
+    if (expert_id >= 0 && expert_id < num_experts_per_node) {
+      expanded_permuted_row = unpermuted_row_to_permuted_row[original_row + k_idx * num_rows];
+      if (expanded_permuted_row >= num_rows * experts_per_token) {
+        expanded_permuted_row = -1;
+      }
+      scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+    }
+    return Entry{static_cast<int>(std::max<int64_t>(expanded_permuted_row, -1)),
+                 static_cast<int>(expert_id), scale};
+  };
+  constexpr int kLoads = FINALIZE_K_LOADS;
+  using KInts = cutlass::AlignedArray<int, kLoads>;
+  using KFloats = cutlass::AlignedArray<float, kLoads>;
+  int64_t const cached_k = std::min<int64_t>(experts_per_token, FINALIZE_CACHED_K);
+  int64_t const padded_k = tensorrt_llm::common::roundUp(cached_k, int64_t{kLoads});
+  extern __shared__ KInts finalize_smem[];
+  int* const finalize_rows = finalize_smem[0].data();
+  int* const finalize_experts = finalize_rows + padded_k;
+  float* const finalize_scales = reinterpret_cast<float*>(finalize_experts + padded_k);
+  for (int64_t k_idx = threadIdx.x; k_idx < padded_k; k_idx += blockDim.x) {
+    Entry const entry = k_idx < cached_k ? lookup(k_idx) : Entry{-1, 0, 0.f};
+    finalize_rows[k_idx] = entry.row;
+    finalize_experts[k_idx] = entry.expert;
+    finalize_scales[k_idx] = entry.scale;
+  }
+  __syncthreads();
+
+  // The k rows are loaded four at a time and added in k order.
+  for (int64_t elem_index = start_offset; elem_index < num_elems_in_orig_col;
+       elem_index += stride) {
     ComputeElem thread_output;
     thread_output.fill(0);
-    for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
-      int64_t const k_offset = original_row * experts_per_token + k_idx;
-      int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
-      if (expert_id < 0 || expert_id >= num_experts_per_node) {
-        continue;
+    for (int k0 = 0; k0 < experts_per_token; k0 += kLoads) {
+      Entry entries[kLoads];
+      InputElem expert_rows[kLoads];
+      if (k0 < padded_k) {  // a whole batch in shared memory, read without a branch per k
+        KInts const rows = reinterpret_cast<KInts const*>(finalize_rows)[k0 / kLoads];
+        KInts const experts = reinterpret_cast<KInts const*>(finalize_experts)[k0 / kLoads];
+        KFloats const k_scales = reinterpret_cast<KFloats const*>(finalize_scales)[k0 / kLoads];
+#pragma unroll
+        for (int j = 0; j < kLoads; ++j) {
+          entries[j] = Entry{rows[j], experts[j], k_scales[j]};
+        }
+      } else {
+#pragma unroll
+        for (int j = 0; j < kLoads; ++j) {
+          entries[j] = k0 + j < experts_per_token ? lookup(k0 + j) : Entry{-1, 0, 0.f};
+        }
       }
-
-      int64_t const expanded_original_row = original_row + k_idx * num_rows;
-      int64_t const expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
-
-      int64_t const expanded_rows = num_rows * experts_per_token;
-      if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
-        continue;
+#pragma unroll
+      for (int j = 0; j < kLoads; ++j) {
+        if (entries[j].row >= 0) {
+          expert_rows[j] =
+              expanded_permuted_rows_v[entries[j].row * num_elems_in_padded_col + elem_index];
+        }
       }
-
-      float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
-
-      auto const* expanded_permuted_rows_row_ptr =
-          expanded_permuted_rows_v + expanded_permuted_row * num_elems_in_padded_col;
-
-      ComputeElem expert_result =
-          arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
-      if (bias) {
-        auto const* bias_ptr = bias_v + expert_id * num_elems_in_padded_col;
-        expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+#pragma unroll
+      for (int j = 0; j < kLoads; ++j) {
+        if (entries[j].row < 0) {
+          continue;
+        }
+        ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(expert_rows[j]);
+        if (bias) {
+          auto const* bias_ptr = bias_v + entries[j].expert * num_elems_in_padded_col;
+          expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+        }
+        thread_output = thread_output + entries[j].scale * expert_result;
       }
-
-      thread_output = thread_output + row_scale * expert_result;
     }
 
     OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
@@ -2943,9 +2997,24 @@ void finalizeMoeRoutingKernelLauncher(
     // If all-gather reduce-scatter is used, finalizeMoeRouting must fill invalid output tokens with
     // zeros.
     int64_t const blocks = num_rows;
-    int64_t const threads = FINALIZE_THREADS_PER_BLOCK;
-    config.gridDim = blocks;
+    // With fewer rows than SMs, each row's columns are split over more CTAs, halved down to 64
+    // threads while every CTA still gets an SM of its own.
+    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int64_t const elem_per_thread =
+        128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
+    int64_t const vecs = unpadded_cols / elem_per_thread;
+    int64_t const sms_per_row = std::max<int64_t>(smCount / std::max<int64_t>(blocks, 1), 1);
+    int64_t threads = FINALIZE_THREADS_PER_BLOCK;
+    while (threads > 64 && tensorrt_llm::common::ceilDiv(vecs, threads / 2) <= sms_per_row) {
+      threads /= 2;
+    }
+    int64_t const splits = std::min(tensorrt_llm::common::ceilDiv(vecs, threads), sms_per_row);
+    config.gridDim = dim3(blocks, std::max<int64_t>(splits, 1));
     config.blockDim = threads;
+    config.dynamicSmemBytes =
+        tensorrt_llm::common::roundUp(std::min<int64_t>(experts_per_token, FINALIZE_CACHED_K),
+                                      int64_t{FINALIZE_K_LOADS}) *
+        (2 * sizeof(int) + sizeof(float));
     auto func = final_scales ? &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType,
                                                          ScaleMode::DEFAULT>
                              : &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType,
@@ -3335,8 +3404,9 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
     assert(reinterpret_cast<std::uintptr_t>(output_vec) % sizeof(OutputElem) == 0);
     assert(reinterpret_cast<std::uintptr_t>(bias_ptr_vec) % sizeof(BiasElem) == 0);
 
-    int64_t const start_offset = tid;
-    int64_t const stride = blockDim.x;
+    // The row's columns, split over gridDim.y CTAs when there are few rows.
+    int64_t const start_offset = tid + blockIdx.y * blockDim.x;
+    int64_t const stride = blockDim.x * gridDim.y;
     assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
     int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
     assert(gated_off % ACTIVATION_ELEM_PER_THREAD == 0);
@@ -3530,6 +3600,12 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
       tensorrt_llm::common::ceilDiv(int64_t{8} * MAX_ACTIVATION_THREADS_PER_BLOCK, threads));
   int64_t const blocks =
       std::min(smCount * blocks_per_sm, std::max(expanded_num_tokens, int64_t{1}));
+  // With fewer rows than that, each row's columns are split over more CTAs, except for the
+  // per-token FP8 quant, which reduces each row in one CTA.
+  int64_t const splits = fp8_token_dequant_scale != nullptr
+                             ? 1
+                             : std::min(tensorrt_llm::common::ceilDiv(loads_per_row, threads),
+                                        smCount * blocks_per_sm / blocks);
 
   auto fn = [&]() {
     auto fn = [&](auto block_scaling_type, auto disableFP4QuantFastMathTag,
@@ -3642,7 +3718,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
   }();
 
   cudaLaunchConfig_t config;
-  config.gridDim = blocks;
+  config.gridDim = dim3(blocks, splits);
   config.blockDim = threads;
   config.dynamicSmemBytes = 0;
   config.stream = stream;
