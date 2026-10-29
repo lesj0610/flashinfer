@@ -33,15 +33,15 @@ namespace tensorrt_llm::kernels::cutlass_kernels_oss {
 
 // The small-M grouped GEMM of the SM80 FP4 MoE on the operands of its CUTLASS kernels: weights
 // prepared as [E][N/4][K/64][4 columns][32 B] (word w = h*4 + j of a column's 32 B holds the
-// nibbles k = 32h + 2j + {0,1,8,9,16,17,24,25}), block scales [E][K/16][N] BF16, activations
-// restored to BF16 rows. A CTA computes up to 8 rows of one expert x 128 columns over K in stages
-// of 128 k with 256 threads: 2 N-warps of 64 columns x 4 K-warps of 32 k. The weights take
-// mma.m16n8k16's A slot (16 rows = 16 columns) and the activations its B slot, so one ldmatrix.x4
-// of weights feeds two HMMA; the K-warps' partials are summed through shared memory after the loop.
-// Output rows are scaled as the CUTLASS epilogue scales them: by their row scale, else by the
-// expert's alpha. Grid (N/128, m-blocks): an m-block is (expert, first row, up to 8 rows), numbered
-// expert by expert from the experts' row ranges; each CTA finds its own from them, so no launch or
-// workspace is added.
+// nibbles k = 32h + 2j + {0,1,8,9,16,17,24,25}), block scales [E][K/16][N] BF16, BF16 activation
+// rows (restored, or the token rows read in place). A CTA computes up to 8 rows of one expert x 128
+// columns over K in stages of 128 k with 256 threads: 2 N-warps of 64 columns x 4 K-warps of 32 k.
+// The weights take mma.m16n8k16's A slot (16 rows = 16 columns) and the activations its B slot, so
+// one ldmatrix.x4 of weights feeds two HMMA; the K-warps' partials are summed through shared memory
+// after the loop. Output rows are scaled by their row scale, else by expert_scales[e] when given,
+// else by their expert's alpha. Grid (N/128, m-blocks): an m-block is (expert, first row, up to 8
+// rows), numbered expert by expert from the experts' row ranges; each CTA finds its own from them,
+// so no launch or workspace is added.
 namespace sm80_fp4_small_m {
 
 constexpr int kThreads = 256, kTileN = 128, kTileK = 128, kMaxRows = 8, kStages = 4;
@@ -140,7 +140,8 @@ template <int kNumStages>
 __global__ void __launch_bounds__(kThreads, 1)
     kernel(uint8_t const* __restrict__ w, uint16_t const* __restrict__ s,
            float const* __restrict__ row_scales, float const* const* __restrict__ alpha,
-           __nv_bfloat16 const* __restrict__ act,
+           float const* __restrict__ expert_scales, __nv_bfloat16 const* __restrict__ act,
+           int const* __restrict__ act_rows, int act_tokens,
            int64_t const* __restrict__ total_tokens_including_expert,
            __nv_bfloat16* __restrict__ out, int N, int K, int num_experts) {
   extern __shared__ __align__(128) uint8_t smem[];
@@ -180,9 +181,9 @@ __global__ void __launch_bounds__(kThreads, 1)
     opred = true;
     ostep = static_cast<size_t>(8) * N * 2;
   } else {
-    int const r = (tid - 128) >> 4, ch = tid & 15;
+    int const r = (tid - 128) >> 4, ch = tid & 15, row = row0 + (r < rows ? r : 0);
     osrc = reinterpret_cast<uint8_t const*>(
-        act + static_cast<size_t>(row0 + (r < rows ? r : 0)) * K + ch * 8);
+        act + static_cast<size_t>(act_rows ? act_rows[row] % act_tokens : row) * K + ch * 8);
     odst = kWBytes + kSBytes + r * kActPitch + ch * 16;
     opred = r < rows;
     ostep = 256;
@@ -274,7 +275,10 @@ __global__ void __launch_bounds__(kThreads, 1)
 #pragma unroll
     for (int t = 0; t < 2; ++t) {
       int const token = 2 * c + t;
-      scale[t] = token < rows ? (row_scales ? row_scales[row0 + token] : alpha[e][0]) : 0.f;
+      scale[t] = token >= rows   ? 0.f
+                 : row_scales    ? row_scales[row0 + token]
+                 : expert_scales ? expert_scales[e]
+                                 : alpha[e][0];
     }
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
@@ -302,16 +306,24 @@ template <typename WeightType, typename ScaleBiasType>
 using Sm80FP4SmallMInput =
     cutlass_kernels::GroupedGemmInput<__nv_bfloat16, WeightType, ScaleBiasType, __nv_bfloat16>;
 
+// Whether the small-M kernel takes a GEMM of these sizes, also asked by the MoE runner before its
+// W4A16 GEMM1 reads the token rows in place of restored rows.
+inline bool sm80FP4SmallMSupportsShape(int64_t n, int64_t k, int64_t num_rows,
+                                       int64_t num_experts) {
+  using namespace sm80_fp4_small_m;
+  return n % kTileN == 0 && k % kTileK == 0 && num_rows > 0 && num_experts > 0 &&
+         max_blocks(num_rows, num_experts) <= 65535;
+}
+
 template <typename WeightType, typename ScaleBiasType>
 bool sm80FP4SmallMSupports(Sm80FP4SmallMInput<WeightType, ScaleBiasType> const& inputs) {
-  using namespace sm80_fp4_small_m;
   if (inputs.occupancy) {
     return true;
   }
-  return inputs.n % kTileN == 0 && inputs.k % kTileK == 0 && inputs.num_rows > 0 &&
-         inputs.num_experts > 0 && inputs.biases == nullptr && inputs.zeros == nullptr &&
-         (inputs.row_scales != nullptr || inputs.alpha_scales != nullptr) &&
-         max_blocks(inputs.num_rows, inputs.num_experts) <= 65535;
+  return sm80FP4SmallMSupportsShape(inputs.n, inputs.k, inputs.num_rows, inputs.num_experts) &&
+         inputs.biases == nullptr && inputs.zeros == nullptr &&
+         (inputs.row_scales != nullptr || inputs.alpha_scales != nullptr ||
+          inputs.expert_scales != nullptr);
 }
 
 template <typename WeightType, typename ScaleBiasType>
@@ -333,8 +345,9 @@ void sm80FP4SmallMGemm(Sm80FP4SmallMInput<WeightType, ScaleBiasType> const& inpu
                   static_cast<unsigned>(max_blocks(inputs.num_rows, inputs.num_experts)));
   kernel_fn<<<grid, kThreads, kSmemBytes, inputs.stream>>>(
       reinterpret_cast<uint8_t const*>(inputs.B), reinterpret_cast<uint16_t const*>(inputs.scales),
-      inputs.row_scales, inputs.alpha_scales, inputs.A, inputs.total_tokens_including_expert,
-      inputs.C, static_cast<int>(inputs.n), static_cast<int>(inputs.k), inputs.num_experts);
+      inputs.row_scales, inputs.alpha_scales, inputs.expert_scales, inputs.A, inputs.a_rows,
+      inputs.a_tokens, inputs.total_tokens_including_expert, inputs.C, static_cast<int>(inputs.n),
+      static_cast<int>(inputs.k), inputs.num_experts);
   result = cudaGetLastError();
   TLLM_CHECK_WITH_INFO(result == cudaSuccess,
                        "Fail to execute the small-M FP4 MoE kernel, cuda error %d", (int)(result));

@@ -361,6 +361,11 @@ struct QuantParams {
     int const* permuted_row_to_unpermuted_row = nullptr;
   } restored_mxfp8;
 
+  // Below SM100, BF16 W4A16 with both GEMMs on the small-M kernel: nothing restored, GEMM1 reading
+  // the token rows (GEMM row r takes token w4a16_token_rows[r] % the tokens) and both GEMMs scaling
+  // by their experts' global scales.
+  int const* w4a16_token_rows = nullptr;
+
   static QuantParams Int(void const* fc1_weight_scales, void const* fc2_weight_scales) {
     QuantParams qp;
     qp.wo = {fc1_weight_scales, fc2_weight_scales};

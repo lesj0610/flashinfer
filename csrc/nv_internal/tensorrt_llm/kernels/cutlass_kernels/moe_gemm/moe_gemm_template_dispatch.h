@@ -831,6 +831,8 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Af
           return;
         }
       }
+      TLLM_CHECK_WITH_INFO(!inputs.a_rows && !inputs.expert_scales,
+                           "Token rows and expert scales go to the small-M kernel only");
       cutlass_kernels_oss::dispatchMoeGemmToCutlass<OutputType, WeightType, ScaleBiasType,
                                                     cutlass::arch::Sm80, EpilogueTag>(
           restored, multi_processor_count_);
