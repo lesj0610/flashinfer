@@ -2132,6 +2132,7 @@ def _sm80_nvfp4_operands(
     )
 
 
+@flashinfer_api
 def cutlass_nvfp4_sm80_weights(
     w1: torch.Tensor,
     s1: torch.Tensor,
@@ -2144,14 +2145,39 @@ def cutlass_nvfp4_sm80_weights(
     k: Tuple[Optional[int], Optional[int]] = (None, None),
     sm90: bool = False,
 ) -> Tuple[torch.Tensor, ...]:
-    """The SM80 operands of CUTLASS NVFP4 weights (packed, any integer view) and their swizzled
-    block scales: weights in the shapes ``cutlass_fused_moe`` reads, stored with K padded to 64,
-    and scales in the output ``dtype`` (BF16 when ``mx`` converts MXFP4 weights, over 8: the MXFP8
-    activations' GEMMs take the 8 back, BF16 activations' from their global scales). ``interleaved``
-    FC1 rows alternate 64 up and 64 gate rows (CuTe-DSL); ``rows_from`` gives the stored row of
-    each FC1 and FC2 row; ``k`` gives their K when TRT-LLM stores them padded. ``sm90`` returns
-    MXFP4's SM90 operands instead (``cutlass_mxfp4_sm90_weights``). Below SM100
-    ``cutlass_fused_moe`` converts on every call unless given these."""
+    """The SM80 operands of CUTLASS NVFP4 or MXFP4 MoE weights and their block scales.
+
+    Below SM100 ``cutlass_fused_moe`` converts its weights on every call unless given these.
+
+    Parameters
+    ----------
+    w1, w2 : torch.Tensor
+        FC1 and FC2 weights, packed, in any integer view.
+    s1, s2 : torch.Tensor
+        Their swizzled block scales.
+    dtype : torch.dtype
+        The output dtype, which NVFP4 scales take. MXFP4 scales are BF16 whatever ``dtype``,
+        over 8: the MXFP8 activations' GEMMs take the 8 back, BF16 activations' from their
+        global scales. Unused with ``sm90``.
+    interleaved : bool
+        FC1 rows alternate 64 up and 64 gate rows (CuTe-DSL).
+    rows_from : Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]
+        The stored row of each FC1 and FC2 row, ``None`` for rows in order.
+    mx : bool
+        The weights are MXFP4, not NVFP4.
+    k : Tuple[Optional[int], Optional[int]]
+        FC1 and FC2's K when TRT-LLM stores them padded; the weights are cut to it. ``None``
+        takes FC1's K from FC2's rows and FC2's K from its stored width, and cuts nothing.
+    sm90 : bool
+        Return MXFP4's SM90 operands instead (``cutlass_mxfp4_sm90_weights``).
+
+    Returns
+    -------
+    Tuple[torch.Tensor, ...]
+        ``(w1, s1, w2, s2)``: weights in the shapes ``cutlass_fused_moe`` reads, stored with K
+        padded to 64, and scales in ``dtype`` (NVFP4) or BF16 (MXFP4). With ``sm90``, the SM90
+        mixed-input GEMM's uint8 weights and int32 scales, K not padded.
+    """
     hidden_size, inter_size = w2.shape[1], w2.shape[2] * w2.element_size() * 2
     if interleaved:
         rows = torch.arange(w1.shape[1], device=w1.device)
@@ -2247,6 +2273,7 @@ def _trtllm_fc1_rows(
     return torch.cat([rows, rows + inter]) if gated else rows
 
 
+@flashinfer_api
 def trtllm_nvfp4_sm80_weights(
     w1: torch.Tensor,
     s1: torch.Tensor,
@@ -2257,13 +2284,35 @@ def trtllm_nvfp4_sm80_weights(
     valid_intermediate_size: Optional[int] = None,
     sm90: bool = False,
 ) -> Tuple[torch.Tensor, ...]:
-    """The SM80 operands (BF16 output) of TRT-LLM NVFP4 or MXFP4 weights: rows shuffled for its
-    128-row epilogue (gated FC1 rows also interleaved) and block scales interleaved. GEMM1's K is
-    the FC2 rows; a ``valid_intermediate_size`` keeps the FC1 rows used, GEMM2's K too.
-    ``sm90`` returns MXFP4's SM90 operands instead, for MXFP8 activations. Below SM100
-    ``trtllm_fp4_block_scale_moe`` and ``trtllm_fp4_block_scale_routed_moe`` convert their weights
-    on every call unless given these, prepared once, in place of the weights and their scales
-    (NVFP4 ones with NVFP4 activations, else MXFP4 ones)."""
+    """The SM80 operands (BF16 output) of TRT-LLM NVFP4 or MXFP4 MoE weights.
+
+    Below SM100 ``trtllm_fp4_block_scale_moe`` and ``trtllm_fp4_block_scale_routed_moe`` convert
+    their weights on every call unless given these, prepared once, in place of the weights and
+    their scales (NVFP4 ones with NVFP4 activations, else MXFP4 ones).
+
+    Parameters
+    ----------
+    w1, w2 : torch.Tensor
+        FC1 and FC2 weights, rows shuffled for TRT-LLM's 128-row epilogue (gated FC1 rows also
+        interleaved). GEMM1's K is the FC2 rows.
+    s1, s2 : torch.Tensor
+        Their interleaved block scales.
+    gated : bool
+        FC1 holds a gated activation's up and gate rows.
+    mx : bool
+        The weights are MXFP4, not NVFP4.
+    valid_intermediate_size : Optional[int]
+        The intermediate size in use when the weights store it padded. FC1 keeps its leading
+        ``min(roundUp(valid_intermediate_size, 128), I)`` rows, of both halves when gated, and
+        GEMM2 as much of its K, ``I`` being the stored intermediate size. ``None`` keeps them all.
+    sm90 : bool
+        Return MXFP4's SM90 operands instead, for MXFP8 activations.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, ...]
+        ``(w1, s1, w2, s2)`` as ``cutlass_nvfp4_sm80_weights`` returns them with ``dtype`` BF16.
+    """
     from .core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
