@@ -56,6 +56,7 @@
 
 #include "../include/moe_gemm_kernels.h"
 #include "./launchers/fused_moe_gemm_launcher_sm80.h"
+#include "./launchers/moe_gemm_small_m_launcher_sm80.h"
 #include "./launchers/moe_gemm_tma_ws_launcher.h"
 #include "./launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
 #include "./moe_gemm_template_dispatch_tma_ws.h"
@@ -821,9 +822,18 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Af
     if constexpr (std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefault>) {
       using Restored = GroupedGemmInput<OutputType, WeightType, ScaleBiasType, OutputType>;
       static_assert(sizeof(Restored) == sizeof(inputs), "only the A pointer type differs");
+      auto const& restored = reinterpret_cast<Restored const&>(inputs);
+      if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+        // The CUDA-kernel tactic runs the small-M kernel on the inputs it supports.
+        if (inputs.gemm_config.enableCudaKernel &&
+            cutlass_kernels_oss::sm80FP4SmallMSupports(restored)) {
+          cutlass_kernels_oss::sm80FP4SmallMGemm(restored);
+          return;
+        }
+      }
       cutlass_kernels_oss::dispatchMoeGemmToCutlass<OutputType, WeightType, ScaleBiasType,
                                                     cutlass::arch::Sm80, EpilogueTag>(
-          reinterpret_cast<Restored const&>(inputs), multi_processor_count_);
+          restored, multi_processor_count_);
     } else {
       TLLM_THROW("NVFP4 below SM100 has no fused epilogue activation");
     }
