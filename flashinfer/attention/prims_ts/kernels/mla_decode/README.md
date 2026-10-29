@@ -14,6 +14,36 @@ Index lists use `-1` for holes and need no 128-entry padding.
 The kernel keeps source boundaries aligned to its KV tiles internally.
 The dense API contract below retains its 512-latent plus 64-RoPE layout.
 
+### Sparse MLA modes
+
+`BatchSparseMLADecodePagedTSWrapper` / `batch_sparse_mla_decode_with_paged_kv_cache`
+serve two modes, selected by `plan(kv_lora_rank=..., qk_rope_head_dim=...)`. Both
+take storage-row `indices` / `lengths` with `-1` holes.
+
+| Mode | Models | `plan()` | Q / KV rows | Pools and indices | Options |
+| --- | --- | --- | --- | --- | --- |
+| Two-source D512 | DeepSeek V4 / V4.1 | `kv_lora_rank=512, qk_rope_head_dim=0` (default) | BF16 or E4M3, 512 | Primary pool plus an optional extra KV cache with its own `extra_indices` / `extra_lengths` | Sinks, output quantization, RoPE fusion, skip correction |
+| D576 (DSA) | DeepSeek V3.2 / GLM-5.3 | `kv_lora_rank=512, qk_rope_head_dim=64` | E4M3, 576 (512 latent + 64 RoPE); V is the latent | One pool; the one-shot helper infers DSA from a 576-wide query | Skip correction; no extra pool, sinks or output quantization |
+
+D576 details:
+- **Kernel.** The 1CTA keeps-MMA-AB q64 schedule in a D576 sparse
+  configuration: one CTA per (token, 64 heads), with Gather4 loads of the
+  routed rows. H is 64 or 128.
+- **Split-KV below one wave.** `plan()` chooses the split from
+  `batch_size * max_seq_len_q` (`sparse_policy.select_sparse_mla_d576_split`),
+  so every run of a plan, and a CUDA graph captured from it, uses one compiled
+  kernel. While the split grid fits one wave, each top-k list is split into
+  S ∈ {16, 8, 4, 2} ranges of at least two 128-key tiles (trtllm-gen's rule;
+  one tile for a top-k of one tile pair); while the split grid fills at most a
+  half or a quarter of the SMs, the 512 V columns are split as well. A reducer merges the BF16 partials, so a split
+  launch is not bitwise equal to an unsplit one.
+- **Run time.** `lse` is the natural-log log-sum-exp, as for D512.
+  `softmax_scale` / `output_scale` are Python numbers, and a captured graph
+  keeps their capture-time values. The KV pool must be contiguous (no page
+  padding). A plan
+  covers at most 65535 query tokens (one grid-z slice each). Compiled
+  kernels are cached on disk with the other PrimTS MLA kernels.
+
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent
 Attention (MLA) decode kernels used by FlashInfer's experimental Blackwell
 paged-cache APIs. The implementation accepts the post-matrix-absorption MLA
@@ -76,6 +106,7 @@ metadata directly in `run()`.
 | Mask | Dense or bottom-right causal |
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection by kernel family and work shape |
 | Accumulation | FP32 QK/PV and softmax state |
+| Skip correction | Opt-in `softmax_rescale_threshold_log2` (binades), passed as `tuning=MLAAttentionTuning(...)` to `plan()` and the one-shot helpers; `0.0` rescales on every new row maximum, which is also what dense `None` (default) does. The name and the FP8 P scale follow the Prims-TS FMHA decode option of the same name; the bounds (8 for FP8, 32 for BF16) follow the trtllm-gen FMHA `skipCorrThreshold`. A positive value T keeps a row's anchor while a K tile raises its maximum by at most T binades, skipping that tile's O rescale. FP8 P is then quantized at `448 * 2**-T` instead of 448 (1.75 at T = 8, the trtllm-gen scale), so E4M3 P loses precision from about `10.3 - 0.69 * T` nats below the anchor and flushes to zero in the PV numerator below about `13 - 0.69 * T` nats (rows with an early attention sink and a long low-probability tail are the most exposed). Without split-KV the loss covers the whole row. Check model accuracy when enabling it for FP8. The value is compiled into the kernel. Both the 1CTA and 2CTA kernels support it, for dense and sparse attention. On the sparse API, `None` keeps each schedule's existing behavior (several BF16 schedules defer the maximum update by six binades); an explicit value, including `0.0`, replaces that on every schedule |
 
 Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but remains to be qualified.
@@ -315,11 +346,13 @@ compact, 16-byte-aligned `out` tensor to avoid allocation.
 
 ## Limitations
 
-- The latent/RoPE dimensions are fixed at 512/64.
+- The dense wrapper's latent/RoPE dimensions are fixed at 512/64.
 - Output is `torch.bfloat16` even when query/cache input is
   `torch.float8_e4m3fn`.
-- Only dense paged MLA cache addressing is exposed; sparse/indexed MLA,
-  sliding windows, attention sinks, and custom masks are not public features.
+- `BatchMLADecodePagedTSWrapper` exposes only dense paged MLA cache
+  addressing; sparse/indexed MLA is available through
+  `BatchSparseMLADecodePagedTSWrapper`. Sliding windows, attention sinks, and
+  custom masks are not public features of the dense wrapper.
 - Query and cache dtypes must match.
 - Automatic kernel selection is intentionally not user-selectable through the
   public wrapper.
@@ -334,6 +367,7 @@ graphs:
 
 ```bash
 pytest -q tests/attention/test_attention_ts_mla_decode.py
+pytest -q tests/attention/test_attention_ts_sparse_mla.py  # two-source D512 and D576
 pytest -q tests/trace/test_fi_trace_template_consistency.py
 ```
 

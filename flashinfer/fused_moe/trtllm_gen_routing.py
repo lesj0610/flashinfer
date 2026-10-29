@@ -31,9 +31,9 @@ from flashinfer.utils import (
     supported_compute_capability,
 )
 
-# The trtllm_gen_routing module is compiled for SM8x, SM90, SM100/SM103 and SM12x;
+# The trtllm_gen_routing module is compiled for SM8x, SM90, SM10x and SM12x;
 # below SM90 the routing skips its cluster and cooperative kernels.
-_TRTLLM_GEN_ROUTING_SUPPORTED_CC = [80, 86, 87, 89, 90, 100, 103, 120, 121]
+_TRTLLM_GEN_ROUTING_SUPPORTED_CC = [80, 86, 87, 89, 90, 100, 103, 107, 120, 121]
 
 
 def _max_num_ctas_in_batch_dim(
