@@ -637,25 +637,11 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     ReturnType const e2m1Vec6 = fp32_vec_to_e2m1(fp2Vals6);
     uint64_t const e2m1Bits4 = static_cast<uint64_t>(e2m1Vec4);
     uint64_t const e2m1Bits6 = static_cast<uint64_t>(e2m1Vec6);
-    float error4 = 0.0f;
-    float error6 = 0.0f;
-#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
-    // A 16-element thread (the TMA kernel) sums its block as two halves of 8, the order of the
-    // 8-element threads and their shuffle: the 4/6 choice must not depend on the thread width.
-    float error4Lo = 0.0f;
-    float error6Lo = 0.0f;
-#endif
+    float errors4[CVT_ELTS_PER_THREAD];
+    float errors6[CVT_ELTS_PER_THREAD];
 
 #pragma unroll
     for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
-#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
-      if (CVT_ELTS_PER_THREAD == 16 && i == 4) {
-        error4Lo = error4;
-        error6Lo = error6;
-        error4 = 0.0f;
-        error6 = 0.0f;
-      }
-#endif
       uint32_t const byte4 = static_cast<uint32_t>((e2m1Bits4 >> (8 * i)) & 0xFF);
       uint32_t const byte6 = static_cast<uint32_t>((e2m1Bits6 >> (8 * i)) & 0xFF);
       if constexpr (NVFP4_4OVER6_CONFIG::errUseFastMath) {
@@ -667,13 +653,13 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
         originalScaled.x = __fmul_rn(fp2Vals[i].x, SFScaleVal);
         originalScaled.y = __fmul_rn(fp2Vals[i].y, SFScaleVal);
         diff4 = __fsub_rn(candidate4.x, originalScaled.x);
-        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
+        errors4[2 * i] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4);
         diff6 = __fsub_rn(candidate6.x, originalScaled.x);
-        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
+        errors6[2 * i] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6);
         diff4 = __fsub_rn(candidate4.y, originalScaled.y);
-        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
+        errors4[2 * i + 1] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4);
         diff6 = __fsub_rn(candidate6.y, originalScaled.y);
-        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
+        errors6[2 * i + 1] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6);
       } else {
         float2 const e2m1Val4 = e2m1x2_byte_to_float2(byte4);
         float2 const e2m1Val6 = e2m1x2_byte_to_float2(byte6);
@@ -683,7 +669,7 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
                 ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val4.x, sfValue4), rowAmax), ERROR_DENOM)
                 : __fmul_rn(__fmul_rn(e2m1Val4.x, sfValue4), globalDecodeScale);
         diff4 = __fsub_rn(dequant4, fp2Vals[i].x);
-        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
+        errors4[2 * i] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4);
 
         float diff6;
         float dequant6 =
@@ -691,35 +677,53 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
                 ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val6.x, sfValue6), rowAmax), ERROR_DENOM)
                 : __fmul_rn(__fmul_rn(e2m1Val6.x, sfValue6), globalDecodeScale);
         diff6 = __fsub_rn(dequant6, fp2Vals[i].x);
-        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
+        errors6[2 * i] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6);
 
         dequant4 = rowAmax > 0.0f
                        ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val4.y, sfValue4), rowAmax), ERROR_DENOM)
                        : __fmul_rn(__fmul_rn(e2m1Val4.y, sfValue4), globalDecodeScale);
         diff4 = __fsub_rn(dequant4, fp2Vals[i].y);
-        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
+        errors4[2 * i + 1] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4);
 
         dequant6 = rowAmax > 0.0f
                        ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val6.y, sfValue6), rowAmax), ERROR_DENOM)
                        : __fmul_rn(__fmul_rn(e2m1Val6.y, sfValue6), globalDecodeScale);
         diff6 = __fsub_rn(dequant6, fp2Vals[i].y);
-        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
+        errors6[2 * i + 1] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6);
       }
     }
 
+    // Adds this thread's errors to error4 and error6 in element order.
+    auto const addErrors = [&](float& error4, float& error6) {
+#pragma unroll
+      for (int i = 0; i < CVT_ELTS_PER_THREAD; i++) {
+        error4 = __fadd_rn(error4, errors4[i]);
+        error6 = __fadd_rn(error6, errors6[i]);
+      }
+    };
+    float error4 = 0.0f;
+    float error6 = 0.0f;
+    addErrors(error4, error6);
     if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
+#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
+      // The block's errors add up in element order, as in a 16-element thread, so the 4/6 choice
+      // does not depend on the thread width: the pair's upper thread continues from the lower
+      // thread's sum, and both take its total.
+      error4 = __shfl_sync(uint32_t(-1), error4, 0, 2);
+      error6 = __shfl_sync(uint32_t(-1), error6, 0, 2);
+      addErrors(error4, error6);
+      error4 = __shfl_sync(uint32_t(-1), error4, 1, 2);
+      error6 = __shfl_sync(uint32_t(-1), error6, 1, 2);
+#else
       error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 1));
       error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 1));
+#endif
     }
     if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
       error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 2));
       error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 2));
     }
 #if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
-    if constexpr (CVT_ELTS_PER_THREAD == 16) {
-      error4 = __fadd_rn(error4Lo, error4);
-      error6 = __fadd_rn(error6Lo, error6);
-    }
     // A zero block returns only now: every lane in the warp must reach the full-mask shuffles.
     if (vecMax == 0.0f) {
       storeSF(0);
