@@ -409,6 +409,72 @@ void buildMinLatencyActiveExpertMaps(
                      smart_routing, cluster_rank, cluster_size, num_experts_smem);
 }
 
+constexpr static int SMALL_PROLOGUE_THREADS = 256;
+
+// One CTA sorts the expanded rows by expert when there is a thread per row: a row's permuted row
+// counts the rows ahead of it by (expert, row), and an expert's first row is searched in the
+// sorted experts.
+__global__ void smallBuildExpertMapsSortFirstTokenKernel(
+    int const* token_selected_experts, int* permuted_token_selected_experts,
+    int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row,
+    int64_t* expert_first_token_offset, int const num_tokens, int const experts_per_token,
+    int const num_experts_per_node, int const start_expert) {
+  // The rows' (expert, row) keys, num_experts_per_node for another node's expert and past the
+  // rows; then the local experts sorted.
+  __shared__ int4 keys[SMALL_PROLOGUE_THREADS / 4];
+  __shared__ int sorted[SMALL_PROLOGUE_THREADS];
+  int const num_rows = num_tokens * experts_per_token;
+  int const row = threadIdx.x;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+  int expert = num_experts_per_node;
+  if (row < num_rows) {
+    int const local = token_selected_experts[row] - start_expert;
+    expert = local >= 0 && local < num_experts_per_node ? local : num_experts_per_node;
+  }
+  int const key = expert * SMALL_PROLOGUE_THREADS + row;
+  reinterpret_cast<int*>(keys)[row] = key;
+  __syncthreads();
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
+  int before[4] = {};  // four rows at a time, counted apart
+  for (int i = 0; i < num_rows; i += 4) {
+    int4 const k = keys[i / 4];
+    before[0] += k.x < key;
+    before[1] += k.y < key;
+    before[2] += k.z < key;
+    before[3] += k.w < key;
+  }
+  if (expert < num_experts_per_node) {
+    int const permuted_row = before[0] + before[1] + before[2] + before[3];
+    int const unpermuted_row = row % experts_per_token * num_tokens + row / experts_per_token;
+    permuted_row_to_unpermuted_row[permuted_row] = unpermuted_row;
+    unpermuted_row_to_permuted_row[unpermuted_row] = permuted_row;
+    permuted_token_selected_experts[permuted_row] = expert;
+    sorted[permuted_row] = expert;
+  }
+  int const num_local = __syncthreads_count(expert < num_experts_per_node);
+  for (int64_t e = threadIdx.x; e <= num_experts_per_node; e += SMALL_PROLOGUE_THREADS) {
+    int first = 0;
+    for (int count = num_local; count > 0;) {  // the first sorted expert at least e
+      int const half = count / 2;
+      if (sorted[first + half] < e) {
+        first += half + 1;
+        count -= half + 1;
+      } else {
+        count = half;
+      }
+    }
+    expert_first_token_offset[e] = first;
+  }
+}
+
 template <int BLOCK_SIZE, int EXPERTS_PER_TOKEN, int LOG2_NUM_EXPERTS>
 __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
     int const* const token_selected_experts, int* const permuted_row_to_unpermuted_row,
@@ -929,7 +995,8 @@ void mergeExpertPrefixSum(int const* blocked_expert_counts, int const* blocked_e
 }
 
 // threeStepBuildExpertMapsSortFirstToken uses three kernels to achieve the sort of
-// token_selected_experts
+// token_selected_experts (one, smallBuildExpertMapsSortFirstTokenKernel, for at most
+// SMALL_PROLOGUE_THREADS expanded rows)
 
 // 1. blockExpertPrefixSumKernel launches [num_experts_per_node, num_blocks_per_seq] CTAs; each CTA
 // has num_tokens_per_block threads. blocked_row_to_unpermuted_row points to a 2D buffer of size
@@ -965,14 +1032,37 @@ void threeStepBuildExpertMapsSortFirstToken(
     int* blocked_expert_counts_cumsum, int* blocked_row_to_unpermuted_row, int64_t const num_tokens,
     int64_t const num_experts_per_node, int64_t const num_experts_per_token,
     int const start_expert_id, bool enable_pdl, cudaStream_t stream) {
+  if (num_tokens * num_experts_per_token <= SMALL_PROLOGUE_THREADS) {
+    cudaLaunchConfig_t config;
+    config.gridDim = 1;
+    config.blockDim = SMALL_PROLOGUE_THREADS;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, smallBuildExpertMapsSortFirstTokenKernel, token_selected_experts,
+                       permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+                       unpermuted_row_to_permuted_row, expert_first_token_offset,
+                       static_cast<int>(num_tokens), static_cast<int>(num_experts_per_token),
+                       static_cast<int>(num_experts_per_node), start_expert_id);
+    return;
+  }
   int64_t const num_tokens_per_block = computeNumTokensPerBlock(num_tokens, num_experts_per_node);
   int64_t const num_blocks_per_seq =
       tensorrt_llm::common::ceilDiv(num_tokens, num_tokens_per_block);
+  // The global scan's size sets num_tokens_per_block; when the tokens fit in one block, the
+  // per-expert blocks only need a power of two covering them.
+  int64_t block_threads = num_tokens_per_block;
+  if (num_blocks_per_seq == 1) {
+    while (block_threads > 32 && block_threads / 2 >= num_tokens) block_threads /= 2;
+  }
 
   blockExpertPrefixSum(token_selected_experts, blocked_expert_counts, blocked_row_to_unpermuted_row,
-                       num_tokens, num_experts_per_node, num_experts_per_token,
-                       num_tokens_per_block, num_blocks_per_seq, start_expert_id, enable_pdl,
-                       stream);
+                       num_tokens, num_experts_per_node, num_experts_per_token, block_threads,
+                       num_blocks_per_seq, start_expert_id, enable_pdl, stream);
   sync_check_cuda_error(stream);
 
   globalExpertPrefixSum(blocked_expert_counts, blocked_expert_counts_cumsum,
@@ -983,8 +1073,7 @@ void threeStepBuildExpertMapsSortFirstToken(
   mergeExpertPrefixSum(blocked_expert_counts, blocked_expert_counts_cumsum,
                        blocked_row_to_unpermuted_row, permuted_token_selected_experts,
                        permuted_row_to_unpermuted_row, unpermuted_row_to_permuted_row, num_tokens,
-                       num_experts_per_node, num_tokens_per_block, num_blocks_per_seq, enable_pdl,
-                       stream);
+                       num_experts_per_node, block_threads, num_blocks_per_seq, enable_pdl, stream);
 }
 
 // ============================== Infer GEMM sizes =================================
@@ -5172,7 +5261,12 @@ void CutlassMoeFCRunner<
     sync_check_cuda_error(stream);
   } else {
     bool fused_prologue_result = false;
-    if (!use_sm90_mixed_input_gemm) {
+    // Rows at most the experts sort faster in threeStepBuildExpertMapsSortFirstToken's one CTA,
+    // whose scan grows with the rows, than in the fused radix rank, whose scan grows with the
+    // experts.
+    if (!use_sm90_mixed_input_gemm &&
+        num_rows * experts_per_token >
+            std::min<int64_t>(SMALL_PROLOGUE_THREADS, num_experts_per_node)) {
       // WAR: fusedBuildExpertMapsSortFirstToken kernel will lead to illegal memory access for
       // W4AFP8
       fused_prologue_result = fusedBuildExpertMapsSortFirstToken(
