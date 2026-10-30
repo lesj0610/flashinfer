@@ -30,8 +30,8 @@ from flashinfer.utils import get_compute_capability
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or get_compute_capability(torch.device("cuda"))[0] not in (8, 9),
-    reason="QSA attention runs on SM80 through SM90",
+    or get_compute_capability(torch.device("cuda"))[0] not in (8, 9, 10, 11, 12),
+    reason="QSA attention runs on SM80 through SM12x",
 )
 FORMATS = (torch.uint8, torch.float8_e4m3fn, torch.bfloat16)  # NVFP4, FP8, BF16
 

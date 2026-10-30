@@ -14,6 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Experimental QSA sparse paged attention over an NVFP4 KV cache (SM80 through SM90).
+# Experimental QSA sparse paged attention over an NVFP4, FP8 or BF16 KV cache (SM80 through SM12x).
 # Reached only through flashinfer.sparse.qsa_sparse_paged_attention; nothing is imported here
 # so that importing flashinfer never builds or loads this package.
