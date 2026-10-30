@@ -745,14 +745,20 @@ __global__ void blockExpertPrefixSumKernel(int const* token_selected_experts,
 #endif
 
   int expanded_token_id = -1;
+  bool repeated = false;
   if (token_id < num_tokens) {
+    // One load at a time, as with the early exit; unrolled loads are slower at many tokens.
+#pragma unroll 1
     for (int i = 0; i < num_experts_per_token; i++) {
       // TODO(enweiz): Fix uncoalesced access with shared memory.
       int const expert_id =
           token_selected_experts[token_id * num_experts_per_token + i] - start_expert_id;
       if (expert_id == target_expert_id) {
-        expanded_token_id = i * num_tokens + token_id;
-        break;
+        if (expanded_token_id < 0) {
+          expanded_token_id = i * num_tokens + token_id;
+        } else {
+          repeated = true;
+        }
       }
     }
   }
@@ -762,8 +768,10 @@ __global__ void blockExpertPrefixSumKernel(int const* token_selected_experts,
   BlockScan(temp_storage).ExclusiveSum(has_matched, index);
 
   if (has_matched) {
+    // A token picking the expert again keeps its first k, with the bits flipped so that
+    // mergeExpertPrefixSumKernel maps the later k too.
     blocked_row_to_unpermuted_row[target_expert_id * num_tokens + block_id * kNumTokensPerBlock +
-                                  index] = expanded_token_id;
+                                  index] = repeated ? ~expanded_token_id : expanded_token_id;
   }
   if (threadIdx.x == kNumTokensPerBlock - 1) {
     blocked_expert_counts[target_expert_id * num_blocks_per_seq + block_id] = index + has_matched;
@@ -937,13 +945,12 @@ void globalExpertPrefixSum(int const* blocked_expert_counts, int* blocked_expert
   }
 }
 
-__global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts,
-                                           int const* blocked_expert_counts_cumsum,
-                                           int const* blocked_row_to_unpermuted_row,
-                                           int* permuted_token_selected_experts,
-                                           int* permuted_row_to_unpermuted_row,
-                                           int* unpermuted_row_to_permuted_row,
-                                           int const num_tokens) {
+__global__ void mergeExpertPrefixSumKernel(
+    int const* blocked_expert_counts, int const* blocked_expert_counts_cumsum,
+    int const* blocked_row_to_unpermuted_row, int const* token_selected_experts,
+    int* permuted_token_selected_experts, int* permuted_row_to_unpermuted_row,
+    int* unpermuted_row_to_permuted_row, int const num_tokens, int const num_experts_per_token,
+    int const start_expert_id) {
   int const target_expert_id = blockIdx.x;
   int const block_id = blockIdx.y;
   int const num_blocks_per_seq = gridDim.y;
@@ -956,12 +963,22 @@ __global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts,
   int const cnt = blocked_expert_counts[target_expert_id * num_blocks_per_seq + block_id];
   int const offset = blocked_expert_counts_cumsum[target_expert_id * num_blocks_per_seq + block_id];
   if (threadIdx.x < cnt) {
-    int const unpermuted_row =
-        blocked_row_to_unpermuted_row[target_expert_id * num_tokens + token_id];
+    int const blocked_row = blocked_row_to_unpermuted_row[target_expert_id * num_tokens + token_id];
+    int const unpermuted_row = blocked_row < 0 ? ~blocked_row : blocked_row;
     int const permuted_row = offset + threadIdx.x;
     permuted_row_to_unpermuted_row[permuted_row] = unpermuted_row;
     permuted_token_selected_experts[permuted_row] = target_expert_id;
     unpermuted_row_to_permuted_row[unpermuted_row] = permuted_row;
+    if (blocked_row < 0) {
+      // The token's later k of this expert take the same row; finalize adds their scales over it.
+      int const source_row = unpermuted_row % num_tokens;
+      for (int k = unpermuted_row / num_tokens + 1; k < num_experts_per_token; ++k) {
+        if (token_selected_experts[source_row * num_experts_per_token + k] - start_expert_id ==
+            target_expert_id) {
+          unpermuted_row_to_permuted_row[k * num_tokens + source_row] = permuted_row;
+        }
+      }
+    }
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -971,10 +988,12 @@ __global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts,
 
 void mergeExpertPrefixSum(int const* blocked_expert_counts, int const* blocked_expert_counts_cumsum,
                           int const* blocked_row_to_unpermuted_row,
-                          int* permuted_token_selected_experts, int* permuted_row_to_unpermuted_row,
-                          int* unpermuted_row_to_permuted_row, int64_t const num_tokens,
-                          int64_t const num_experts_per_node, int64_t const num_tokens_per_block,
-                          int64_t const num_blocks_per_seq, bool enable_pdl, cudaStream_t stream) {
+                          int const* token_selected_experts, int* permuted_token_selected_experts,
+                          int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row,
+                          int64_t const num_tokens, int64_t const num_experts_per_node,
+                          int64_t const num_experts_per_token, int64_t const num_tokens_per_block,
+                          int64_t const num_blocks_per_seq, int const start_expert_id,
+                          bool enable_pdl, cudaStream_t stream) {
   dim3 const blocks(num_experts_per_node, num_blocks_per_seq);
   dim3 const threads(num_tokens_per_block);
 
@@ -991,8 +1010,9 @@ void mergeExpertPrefixSum(int const* blocked_expert_counts, int const* blocked_e
 
   cudaLaunchKernelEx(&config, mergeExpertPrefixSumKernel, blocked_expert_counts,
                      blocked_expert_counts_cumsum, blocked_row_to_unpermuted_row,
-                     permuted_token_selected_experts, permuted_row_to_unpermuted_row,
-                     unpermuted_row_to_permuted_row, num_tokens);
+                     token_selected_experts, permuted_token_selected_experts,
+                     permuted_row_to_unpermuted_row, unpermuted_row_to_permuted_row, num_tokens,
+                     num_experts_per_token, start_expert_id);
 }
 
 // threeStepBuildExpertMapsSortFirstToken uses three kernels to achieve the sort of
@@ -1071,10 +1091,11 @@ void threeStepBuildExpertMapsSortFirstToken(
                         num_blocks_per_seq, enable_pdl, stream);
   sync_check_cuda_error(stream);
 
-  mergeExpertPrefixSum(blocked_expert_counts, blocked_expert_counts_cumsum,
-                       blocked_row_to_unpermuted_row, permuted_token_selected_experts,
-                       permuted_row_to_unpermuted_row, unpermuted_row_to_permuted_row, num_tokens,
-                       num_experts_per_node, block_threads, num_blocks_per_seq, enable_pdl, stream);
+  mergeExpertPrefixSum(
+      blocked_expert_counts, blocked_expert_counts_cumsum, blocked_row_to_unpermuted_row,
+      token_selected_experts, permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+      unpermuted_row_to_permuted_row, num_tokens, num_experts_per_node, num_experts_per_token,
+      block_threads, num_blocks_per_seq, start_expert_id, enable_pdl, stream);
 }
 
 // ============================== Infer GEMM sizes =================================
