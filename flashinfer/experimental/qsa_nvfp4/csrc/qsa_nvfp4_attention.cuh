@@ -312,7 +312,8 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
   constexpr uint32_t kQkTiles = kWarpTokens / 8;             // n8 tiles per warp
   extern __shared__ __align__(16) uint8_t smem_buffer[];
   SharedStorage<F>& smem = *reinterpret_cast<SharedStorage<F>*>(smem_buffer);
-  const int row = blockIdx.x, kv_head = blockIdx.y, split = blockIdx.z;
+  const int row = F == KvFormat::kNVFP4 ? blockIdx.y : blockIdx.x;
+  const int kv_head = F == KvFormat::kNVFP4 ? blockIdx.x : blockIdx.y, split = blockIdx.z;
   const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
   const int stride = p.num_splits;
   const int64_t indices_row = int64_t(row) * p.indices_stride_row;
@@ -815,8 +816,33 @@ template <KvFormat F>
 inline cudaError_t SparsePagedAttention(const Params& p, cudaStream_t stream) {
   cudaError_t status = PrepareKernel<F>();
   if (status != cudaSuccess) return status;
-  const dim3 grid(p.num_rows, p.num_qo_heads / p.group_size, p.num_splits);
-  SparsePagedAttentionKernel<F><<<grid, kNumThreads, sizeof(SharedStorage<F>), stream>>>(p);
+  const int num_kv_heads = p.num_qo_heads / p.group_size;
+  if constexpr (F == KvFormat::kNVFP4) {
+    // The KV head goes in grid x, so the KV heads of a row launch next to each other; in the NHD
+    // layout their scales share 32-byte sectors. Grid y holds at most 65535 rows, so larger
+    // batches launch in row chunks. num_rows stays the full count, the row pitch of the split
+    // partials.
+    constexpr int kMaxRows = 65535;
+    for (int row0 = 0; row0 < p.num_rows; row0 += kMaxRows) {
+      Params chunk = p;
+      chunk.q += row0 * p.q_stride_row;
+      chunk.indices += row0 * p.indices_stride_row;
+      chunk.token_to_req += row0;
+      chunk.gate += int64_t(row0) * p.num_qo_heads * kHeadDim;
+      chunk.out += row0 * p.out_stride_row;
+      if (p.num_splits > 1) {
+        chunk.partial_out += int64_t(row0) * p.num_qo_heads * kHeadDim;
+        chunk.partial_lse += int64_t(row0) * p.num_qo_heads;
+      }
+      const dim3 grid(num_kv_heads, min(p.num_rows - row0, kMaxRows), p.num_splits);
+      SparsePagedAttentionKernel<F><<<grid, kNumThreads, sizeof(SharedStorage<F>), stream>>>(chunk);
+      status = cudaGetLastError();
+      if (status != cudaSuccess) return status;
+    }
+  } else {
+    const dim3 grid(p.num_rows, num_kv_heads, p.num_splits);
+    SparsePagedAttentionKernel<F><<<grid, kNumThreads, sizeof(SharedStorage<F>), stream>>>(p);
+  }
   if (p.num_splits > 1) {
     const int warps = min(int(kMergeWarps<F>), (p.num_splits + kMergeDepth - 1) / kMergeDepth);
     const size_t acc_bytes = F == KvFormat::kNVFP4 ? 0 : warps * kHeadDim * sizeof(float);
