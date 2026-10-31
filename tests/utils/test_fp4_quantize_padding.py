@@ -10,9 +10,11 @@ from tests.test_helpers.utils_fp4 import pack_fp4_values, ref_fp4_quant
 
 from flashinfer import fp4_quantize
 from flashinfer.utils import (
+    get_compute_capability,
     is_sm100a_supported,
     is_sm110a_supported,
     is_sm12x_supported,
+    version_at_least,
 )
 
 DTYPES = [torch.float16, torch.bfloat16]
@@ -34,7 +36,9 @@ BLOCK_SIZE = 16
 
 def _is_fp4_supported(device: torch.device) -> bool:
     return (
-        is_sm100a_supported(device)
+        get_compute_capability(device)[0] in (8, 9)
+        and version_at_least(torch.version.cuda, "12.8")
+        or is_sm100a_supported(device)
         or is_sm110a_supported(device)
         or is_sm12x_supported(device)
     )

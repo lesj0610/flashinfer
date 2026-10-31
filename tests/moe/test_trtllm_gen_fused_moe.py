@@ -3494,8 +3494,14 @@ def test_fp4_block_scale_moe_fused_shared_experts_reject_routed_only_tensors():
     one tensor to the routed-only extent and expects the host-side reject.
     """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("These tests require TRTLLM FP4 MoE on SM100, SM103, or SM107.")
+    if compute_capability[0] not in [8, 9] and compute_capability not in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ):
+        pytest.skip(
+            "These tests require TRTLLM FP4 MoE on SM80 to SM90, SM100, SM103, or SM107."
+        )
 
     device = torch.device("cuda")
     num_tokens = 2
@@ -3956,6 +3962,8 @@ def test_moe_lora_delta(
       * "fake": zero vs constant delta, so the test fails if LoRA is silently dropped;
       * "real": regular 2-slice delta built by bgmv_moe_gemm1_lora_delta inside run_moe_test;
       * "performant": shared-A + horizontally-fused-B delta via 1D [E] w_ptr tables."""
+    if delta_mode == "real" and get_compute_capability(torch.device("cuda"))[0] < 9:
+        pytest.skip("BGMV MoE LoRA targets SM90 and newer")
     if delta_mode == "performant" and not (
         num_tokens == 128
         and weight_processing["layout"] == WeightLayout.BlockMajorK

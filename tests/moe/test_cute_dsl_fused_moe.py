@@ -160,7 +160,14 @@ sm100_required = pytest.mark.skipif(
     not is_sm100_family(),
     reason="Requires CuteDSL MoE target SM100, SM103 or SM107",
 )
-sm10x_required = sm100_required
+# The MoE APIs also run below SM100 (SM80 to SM90), on the CUTLASS MoE kernels.
+sm10x_required = pytest.mark.skipif(
+    not is_sm100_family()
+    and not (
+        torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in (8, 9)
+    ),
+    reason="Requires CuteDSL MoE target SM80 to SM90, SM100, SM103 or SM107",
+)
 
 mxfp8_required = pytest.mark.skipif(
     not (
@@ -260,9 +267,11 @@ def _compute_moe_quant_mode_reference(tensors, quant_mode, **kwargs):
 
 
 def _assert_moe_quant_mode_reference(actual, expected, quant_mode):
-    if quant_mode == "w4a16":
+    # Below SM100 W4A16 runs on the CUTLASS SM80 kernels, which round
+    # differently from the split kernel the W4A16 oracle follows.
+    if quant_mode == "w4a16" and is_sm100_family():
         assert_w4a16_bits(actual, expected)
-    elif quant_mode == "w4a4":
+    elif quant_mode in ("w4a4", "w4a16"):
         passed, percent_within, atol = check_accuracy(actual, expected)
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
@@ -1761,11 +1770,14 @@ class TestAutotunerBucketConfig:
 
 
 @cute_dsl_available
-@sm100_required
+@sm10x_required
 class TestCuteDslMoeW4A16:
     pytestmark = _requires_dsl_arch
 
-    @pytest.mark.parametrize("use_wrapper", [False, True])
+    # The wrapper call pins a native W4A16 tactic.
+    @pytest.mark.parametrize(
+        "use_wrapper", [False, pytest.param(True, marks=sm100_required)]
+    )
     def test_weight_scale_update(self, use_wrapper: bool):
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
@@ -1822,12 +1834,15 @@ class TestCuteDslMoeW4A16:
         # Weight scales are serving-owned tensors and may be updated in place.
         # Reuse the same allocation to ensure W4A16 reads the current contents.
         result = run()
-        assert_w4a16_bits(result, split_w4a16_reference_from_tensors(tensors))
+        _assert_moe_quant_mode_reference(
+            result, split_w4a16_reference_from_tensors(tensors), "w4a16"
+        )
         assert torch.count_nonzero(result).item() > 0
         tensors["w1_weight_sf"].zero_()
         updated = run()
         assert_w4a16_bits(updated, torch.zeros_like(updated))
 
+    @sm100_required
     @pytest.mark.parametrize("scale_axis", ["row", "k"])
     @pytest.mark.parametrize(
         "rows,route_tile,tactic",
@@ -1909,6 +1924,7 @@ class TestCuteDslMoeW4A16:
         )
         assert_w4a16_bits(output, expected)
 
+    @sm100_required
     @pytest.mark.parametrize(
         "route_tile,gemm1_tactic,gemm2_tactic",
         [
@@ -2130,6 +2146,7 @@ class TestCuteDslFusedMoeFunctional:
             pytest.param("w4a16", False, False, (256, 384, 256), id="w4a16-ordinary"),
         ],
     )
+    @sm100_required
     def test_finalize_handles_cluster_padding_and_partial_tiles(
         self,
         quant_mode: str,
@@ -2488,7 +2505,7 @@ class TestCuteDslFusedMoeFunctional:
                 swiglu_beta=1.0,
                 swiglu_limit=7.0,
             )
-            assert_w4a16_bits(result, reference)
+            _assert_moe_quant_mode_reference(result, reference, "w4a16")
 
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     def test_swiglu_oai_accuracy(self, quant_mode: str):
@@ -3092,6 +3109,7 @@ class TestCuteDslMoEWrapper:
         assert result.shape == (target_num_tokens, hidden_size)
         assert not torch.isnan(result).any()
 
+    @sm100_required
     def test_cuda_graph_wrapper_lifetime_after_autotune(self):
         """Dropped CUDA graph wrappers should not wait for cyclic GC,
         even after autotune profiling has populated the autotuner cache."""
@@ -3262,8 +3280,8 @@ class TestApiConsistency:
 
         if quant_mode == "w4a16":
             reference = split_w4a16_reference_from_tensors(tensors)
-            assert_w4a16_bits(result_functional, reference)
-            assert_w4a16_bits(result_wrapper, reference)
+            _assert_moe_quant_mode_reference(result_functional, reference, "w4a16")
+            _assert_moe_quant_mode_reference(result_wrapper, reference, "w4a16")
             assert_w4a16_bits(result_functional, result_wrapper)
         elif quant_mode == "w4a4":
             # Outputs may differ slightly because the APIs can autotune
@@ -3451,7 +3469,7 @@ class TestExpertParallelism:
 
 
 @cute_dsl_available
-@sm10x_required
+@sm100_required
 class TestMoeSortBufferInitPoisoned:
     """Validate the invariant that the routing kernel writes every
     output entry that downstream code reads, by pre-poisoning the
@@ -3673,7 +3691,7 @@ class TestMoeSortBufferInitPoisoned:
 
 
 @cute_dsl_available
-@sm10x_required
+@sm100_required
 class TestAllValidTactics:
     """Test that every tactic returned by get_valid_tactics produces correct output.
 
@@ -4609,7 +4627,7 @@ class TestRubinTwoCtaAndClusterNTacticsAccuracy:
 
 
 @cute_dsl_available
-@sm10x_required
+@sm100_required
 class TestOddTileCountBoundsContract:
     """Exercise the active-count bounds contract at an *odd* tile count.
 

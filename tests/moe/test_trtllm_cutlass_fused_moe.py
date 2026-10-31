@@ -46,6 +46,9 @@ from tests.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
 from . import utils as moe_utils
 
 _CUTLASS_MOE_SUPPORTED_ARCHES = {
+    (8, 0),
+    (8, 6),
+    (8, 7),
     (8, 9),
     (9, 0),
     (10, 0),
@@ -411,7 +414,12 @@ def compute_with_experts(
                 expert_inputs @ w3_expert.t()
             )
         output = inter @ w2_expert.t()
-        results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
+        # index_add_ accumulates a token that picks the expert in more than one slot.
+        results.index_add_(
+            0,
+            batch_idx,
+            (routing_weights[batch_idx, nth_expert, None] * output).to(results.dtype),
+        )
     return results.view_as(x)
 
 
@@ -971,20 +979,22 @@ def test_moe_gelu_tanh(batch_size, hidden_size, num_experts, top_k, intermediate
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("batch_size", [*BATCH_SIZES, 300])
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize("repeat_expert", [False, True])
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_unfused_finalize(
-    batch_size, hidden_size, num_experts, top_k, intermediate_size
+    batch_size, hidden_size, num_experts, top_k, intermediate_size, repeat_expert
 ):
     """``use_fused_finalize=False`` selects the non-fused finalize path.
 
     Unlike the fused GEMM2 epilogue (which reduces expert outputs via non-associative
     atomics), this path must be bit-wise reproducible run-to-run while still matching
-    the reference.
+    the reference. 300 tokens build the expert maps in three steps, and
+    ``repeat_expert`` sends every token to one expert from two of its slots.
     """
     if top_k > num_experts:
         pytest.skip(
@@ -1008,6 +1018,8 @@ def test_moe_unfused_finalize(
     )
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    if repeat_expert:
+        selected_experts[:, -1] = selected_experts[:, 0]
     ref_output = compute_with_experts(
         num_experts,
         x,
@@ -1050,6 +1062,10 @@ def test_moe_unfused_finalize(
     "activation_type",
     [ActivationType.Swiglu, ActivationType.SwigluStep, ActivationType.Situ],
     ids=["swiglu", "swiglustep", "situ"],
+)
+@pytest.mark.skipif(
+    get_compute_capability(torch.device("cuda")) < (8, 9),
+    reason="CUTLASS FP8 fused MoE requires SM89 or later",
 )
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_fp8(
@@ -1158,10 +1174,6 @@ def test_moe_fp8(
 @pytest.mark.parametrize("use_4over6", [False, True])
 # use_autotune=True is regression coverage for issue #4003 (NVFP4 autotune crash).
 @pytest.mark.parametrize("use_autotune", [False, True])
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
-)
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4(
     batch_size,
@@ -1401,10 +1413,6 @@ def _nvfp4_recipe_case(device):
         pytest.param(NVFP44Over6Config(), id="e4m3_max448"),
         pytest.param(NVFP44Over6Config(e4m3_max=256), id="e4m3_max256"),
     ],
-)
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
 )
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_pinned_recipe_matches_env(recipe, use_4over6):
@@ -2059,10 +2067,6 @@ def dequant_mxfp8_batches(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
 @pytest.mark.parametrize("use_autotune", [False, True])
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120/SM121",
-)
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_mxfp8_mxfp4(
     batch_size,
@@ -2732,7 +2736,8 @@ def test_moe_w4a8(
 
 
 @pytest.mark.skipif(
-    not is_sm100a_supported(torch.device("cuda")),
+    not is_sm100a_supported(torch.device("cuda"))
+    and torch.cuda.get_device_capability()[0] >= 10,
     reason="NVFP4 is only supported on SM100+",
 )
 @_CUTLASS_MOE_ARCH_SKIP
@@ -2890,7 +2895,8 @@ def test_moe_nvfp4_unswizzled_input_sf():
 @pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.skipif(
     not is_sm100a_supported(torch.device("cuda"))
-    and not is_sm12x_supported(torch.device("cuda")),
+    and not is_sm12x_supported(torch.device("cuda"))
+    and torch.cuda.get_device_capability()[0] >= 10,
     reason="NVFP4 is only supported on SM100+",
 )
 @_CUTLASS_MOE_ARCH_SKIP
@@ -3069,10 +3075,6 @@ NDIM_PADDING_INTERMEDIATE_SIZES = [768, 1024]
 @pytest.mark.parametrize("top_k", NDIM_PADDING_TOP_K)
 @pytest.mark.parametrize("intermediate_size", NDIM_PADDING_INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("quantized_input", [False, True])
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
-)
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_ndim_padding_safety(
     batch_size,
@@ -3228,10 +3230,6 @@ def test_moe_nvfp4_ndim_padding_safety(
 @pytest.mark.parametrize("num_experts", NDIM_PADDING_NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", NDIM_PADDING_TOP_K)
 @pytest.mark.parametrize("intermediate_size", NDIM_PADDING_INTERMEDIATE_SIZES)
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120/SM121",
-)
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_mxfp8_mxfp4_ndim_padding_safety(
     batch_size,

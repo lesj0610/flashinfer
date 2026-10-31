@@ -2599,24 +2599,36 @@ class TestRunnerBoundaryValidation:
 
 
 def _is_unified_nvfp4_arch() -> bool:
-    return torch.cuda.is_available() and get_compute_capability(
-        torch.device("cuda")
-    ) in ((10, 0), (10, 3), (10, 7))
+    # Also below SM100 (SM80 to SM90), on the CUTLASS SM80 kernels.
+    return torch.cuda.is_available() and (
+        get_compute_capability(torch.device("cuda"))[0] in (8, 9)
+        or get_compute_capability(torch.device("cuda")) in ((10, 0), (10, 3), (10, 7))
+    )
 
 
 sm100_required = pytest.mark.skipif(
     not _is_unified_nvfp4_arch(),
-    reason="Unified NVFP4 MoE requires SM100, SM103, or SM107",
+    reason="Unified NVFP4 MoE requires SM80 to SM90, SM100, SM103, or SM107",
 )
 
 
-cute_dsl_sm100_required = pytest.mark.skipif(
+cute_dsl_sm100_required = sm100_required
+
+bf16_required = pytest.mark.skipif(
     not (
         torch.cuda.is_available()
         and get_compute_capability(torch.device("cuda")) in ((10, 0), (10, 3), (10, 7))
     ),
-    reason="CuTeDSL unified MoE requires SM100, SM103, or SM107",
+    reason="Unified BF16 MoE tests require SM100, SM103, or SM107",
 )
+
+
+def _gate_bf16(specs):
+    # The bf16 specs keep the BF16 gate; the others follow their class marker.
+    return [
+        pytest.param(s, id=s.id, marks=bf16_required if s.id == "bf16" else ())
+        for s in specs
+    ]
 
 
 # Small-scale geometry for fast accuracy + dispatch tests.
@@ -2824,7 +2836,12 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
     runner = layer.runners[0]
     layer._select_winner = lambda *_: (runner, -1)
     actual = layer(act_pack, weight_pack)
-    if quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
+    # Below SM100 NVFP4 x BF16 runs on the CUTLASS SM80 kernels, which round
+    # differently from the split kernel the exact reference follows.
+    if (
+        quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16)
+        and get_compute_capability(torch.device("cuda"))[0] >= 10
+    ):
         from tests.test_helpers.w4a16_reference import (
             assert_w4a16_bits,
             split_w4a16_reference_from_tensors,
@@ -2872,7 +2889,10 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
         assert not torch.equal(
             actual.view(torch.int16), control_reference.view(torch.int16)
         ), f"{activation!r}: the exact fixture cannot distinguish the wrong formula"
-    elif quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+    elif quant.pair in (
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.NVFP4, QuantFormat.BF16),
+    ):
         reference = _compute_ref(act_pack, tensors, shape, activation)
         passed, pct, atol = check_accuracy(actual, reference)
         assert passed, (
@@ -3202,7 +3222,7 @@ def _make_bf16_packs_and_config(
     return act_pack, weight_pack, config, {"x": x, "w1": w1, "w2": w2}
 
 
-@sm100_required
+@bf16_required
 def test_trtllm_interleaved_real_packs_keep_their_launch_state():
     """A real later pack must not replace the kwargs paired with an earlier call."""
 
@@ -3262,7 +3282,7 @@ def test_trtllm_interleaved_real_packs_keep_their_launch_state():
         first.launch_state.static_kwargs["gemm1_weights"] = second_gemm1
 
 
-@sm100_required
+@bf16_required
 def test_trtllm_dual_stream_packed_calls_match_reference():
     """One runner may launch distinct packed calls concurrently on two streams."""
     cases = [
@@ -3426,7 +3446,7 @@ def test_bf16_gate_up_row_order_is_up_then_gate():
         _bf16_check(out, ref, runner.backend_key)
 
 
-@sm100_required
+@bf16_required
 @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
 def test_bf16_unpacked_routing_forwards_inputs_and_matches_reference(weights_dtype):
     from flashinfer.fused_moe.core import MoeRunnerInputs
@@ -3493,9 +3513,7 @@ _VARIANT_SPECS = (
     ),
 )
 
-_variant_params = pytest.mark.parametrize(
-    "spec", _VARIANT_SPECS, ids=[s.id for s in _VARIANT_SPECS]
-)
+_variant_params = pytest.mark.parametrize("spec", _gate_bf16(_VARIANT_SPECS))
 
 
 @sm100_required
@@ -3681,7 +3699,7 @@ _PACKING_SPECS = (
 )
 
 
-@sm100_required
+@bf16_required
 @pytest.mark.parametrize(
     ("mutation", "match"),
     (
@@ -3713,7 +3731,7 @@ def test_bf16_runner_rejects_malformed_activation_override(mutation, match):
 
 
 @sm100_required
-@pytest.mark.parametrize("spec", _PACKING_SPECS, ids=[s.id for s in _PACKING_SPECS])
+@pytest.mark.parametrize("spec", _gate_bf16(_PACKING_SPECS))
 class TestTrtllmRoutedPackingContract:
     """TRTLLM routed packing must keep GLOBAL expert ids.
 
@@ -4298,6 +4316,7 @@ class TestTrtllmFromLogitsPackingContract:
         return runner, inputs, MoeRunnerInputs.from_list(inputs), logits
 
     @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+    @bf16_required
     def test_bf16_expert_weights_buffer_is_bf16(self, logits_dtype):
         _runner, inputs, moe_inputs, logits = self._make_bf16_from_logits_inputs(
             logits_dtype
@@ -4316,6 +4335,7 @@ class TestTrtllmFromLogitsPackingContract:
         [RoutingMethodType.Default, RoutingMethodType.DeepSeekV3],
         ids=["default", "deepseek-v3"],
     )
+    @bf16_required
     def test_bf16_from_logits_matches_host_reference(
         self, routing_method, logits_dtype
     ):
@@ -4393,6 +4413,7 @@ class TestTrtllmFromLogitsPackingContract:
         )
 
     @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+    @bf16_required
     def test_bf16_cuda_graph_replay_matches_eager(self, logits_dtype):
         runner, inputs, _, _ = self._make_bf16_from_logits_inputs(logits_dtype)
         for _ in range(3):
@@ -4408,6 +4429,7 @@ class TestTrtllmFromLogitsPackingContract:
 
         torch.testing.assert_close(captured, eager)
 
+    @bf16_required
     def test_bf16_from_logits_with_local_expert_offset(self):
         act, weights, config, tensors = _make_bf16_packs_and_config(
             16,

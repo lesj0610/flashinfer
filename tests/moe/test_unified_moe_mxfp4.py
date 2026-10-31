@@ -61,9 +61,14 @@ def _sm100_family() -> bool:
     ) in ((10, 0), (10, 3), (10, 7))
 
 
+# Also below SM100 (SM80 to SM90), on the CUTLASS MoE kernels.
 pytestmark = pytest.mark.skipif(
-    not _sm100_family(),
-    reason="TRTLLM MXFP4 unified tests require SM100, SM103, or SM107",
+    not _sm100_family()
+    and not (
+        torch.cuda.is_available()
+        and get_compute_capability(torch.device("cuda"))[0] in (8, 9)
+    ),
+    reason="TRTLLM MXFP4 unified tests require SM80 to SM90, SM100, SM103, or SM107",
 )
 
 

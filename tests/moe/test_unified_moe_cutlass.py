@@ -123,9 +123,11 @@ def test_cutlass_bf16_config_architectures_and_registration():
         assert CutlassMxfp8Mxfp4Config.supported(arch)
     for arch in (100, 103, 107):
         assert CutlassMxfp8Config.supported(arch)
-    assert not CutlassBf16Config.supported(80)
+    for arch in (80, 86, 87):
+        assert CutlassBf16Config.supported(arch)
+        assert not CutlassFp8PerTensorConfig.supported(arch)
     assert not CutlassW4A16Config.supported(100)
-    assert not CutlassNvfp4Config.supported(90)
+    assert CutlassNvfp4Config.supported(90)
     assert not CutlassFp8BlockConfig.supported(100)
     assert not CutlassMxfp8Config.supported(90)
     assert not CutlassMxfp8Config.supported(110)
@@ -1856,7 +1858,7 @@ def _is_cutlass_bf16_runtime_supported() -> bool:
         return is_sm120a_supported(device)
     if arch == 121:
         return is_sm121a_supported(device)
-    return arch == 89
+    return arch in (80, 86, 87, 89)
 
 
 cutlass_bf16_required = pytest.mark.skipif(
@@ -2566,12 +2568,12 @@ def _is_cutlass_nvfp4_runtime_supported() -> bool:
         return is_sm110a_supported(device)
     if arch in (120, 121):
         return is_sm12x_supported(device)
-    return False
+    return arch < 100
 
 
 cutlass_nvfp4_required = pytest.mark.skipif(
     not _is_cutlass_nvfp4_runtime_supported(),
-    reason="requires SM100/SM110/SM12x CUTLASS NVFP4 GPU and CUDA toolkit",
+    reason="requires a supported CUTLASS NVFP4 GPU and CUDA toolkit",
 )
 
 
@@ -2829,7 +2831,10 @@ def test_cutlass_nvfp4_autotuned_compound_tactic_and_cuda_graph():
 
 
 def _is_cutlass_fp8_runtime_supported() -> bool:
-    return _is_cutlass_bf16_runtime_supported()
+    if not _is_cutlass_bf16_runtime_supported():
+        return False
+    major, minor = get_compute_capability(torch.device("cuda"))
+    return CutlassFp8PerTensorConfig.supported(major * 10 + minor)
 
 
 cutlass_fp8_required = pytest.mark.skipif(
@@ -2860,7 +2865,7 @@ def _is_cutlass_mxfp8_runtime_supported() -> bool:
 
 cutlass_mxfp8_mxfp4_required = pytest.mark.skipif(
     not _is_cutlass_nvfp4_runtime_supported(),
-    reason="requires SM100/SM110/SM12x CUTLASS MXFP8xMXFP4 GPU and CUDA toolkit",
+    reason="requires a supported CUTLASS MXFP8xMXFP4 GPU and CUDA toolkit",
 )
 
 cutlass_mxfp8_required = pytest.mark.skipif(

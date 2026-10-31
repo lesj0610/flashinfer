@@ -548,8 +548,8 @@ _TRTLLM_ROUTED_FP8_ARCHS = (100, 103, 107)
 _PRIMS_TS_ARCHS = (100, 103)
 
 # Dense BF16 follows the architecture dispatch already exposed by the flat
-# CUTLASS API.
-_CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
+# CUTLASS API (SM80 to SM87 on the SM80 module).
+_CUTLASS_BF16_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
 
 # W4A16 uses Hopper-specific mixed-input weight and scale layouts.
 _CUTLASS_W4A16_ARCHS = (90,)
@@ -573,20 +573,18 @@ _CUTILE_SUPPORTED_ACTIVATIONS = (
     ActivationType.Silu,
 )
 
-# NVFP4 CUTLASS fused MoE matches the flat-API skip: SM100/SM110/SM12x.
-# Major 10/11/12 covers SM100/103/107, SM110, and SM120/121.
-_CUTLASS_NVFP4_ARCHS = (100, 103, 107, 110, 120, 121)
+# NVFP4 CUTLASS fused MoE: SM100/SM110/SM12x natively, SM80 to SM90 on the SM80 kernels.
+_CUTLASS_NVFP4_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
 
-# Per-tensor FP8 follows the dense CUTLASS architecture list.
-_CUTLASS_FP8_ARCHS = _CUTLASS_BF16_ARCHS
+# Per-tensor FP8 needs FP8 MMA: the dense CUTLASS architectures from SM89.
+_CUTLASS_FP8_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
 
 # DeepSeek-style 128x128 FP8 block scaling is Hopper-only in the flat API.
 _CUTLASS_FP8_BLOCK_ARCHS = (90,)
 
-# MXFP8 activations x MXFP4 weights matches a *wider* flat-API skip than
-# MXFP8 x MXFP8: ``capability[0] not in [10, 11, 12]`` (SM100/103/107, SM110,
-# SM120/121). Do not collapse this to ``_CUTLASS_MXFP8_ARCHS``.
-_CUTLASS_MXFP8_MXFP4_ARCHS = (100, 103, 107, 110, 120, 121)
+# MXFP8 x MXFP4: SM100/SM110/SM12x natively, SM80 to SM90 on the SM80 kernels.
+# Wider than MXFP8 x MXFP8; do not collapse this to ``_CUTLASS_MXFP8_ARCHS``.
+_CUTLASS_MXFP8_MXFP4_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
 
 # MXFP8 x MXFP8 follows the narrower flat skip: ``capability[0] not in [10]``
 # (SM10x only, including B300 SM103). Not claimed on SM11x/SM12x.
@@ -614,12 +612,13 @@ class TrtllmFp4Config:
     ``supported(arch)`` reflects the routed-MoE cubin manifest. Variant-specific
     restrictions are applied by ``TrtllmFp4RoutedRunner.check_support()``:
     NVFP4/MXFP4 support SM100/SM103/SM107, while W4A16 supports SM100/SM107
-    and remains disabled on SM103.
+    and remains disabled on SM103. Below SM100 all of them run on the CUTLASS
+    SM80 kernels.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in _TRTLLM_ROUTED_ARCHS
+        return arch in (80, 86, 87, 89, 90, *_TRTLLM_ROUTED_ARCHS)
 
     @staticmethod
     def prepare_weights(
@@ -1487,8 +1486,7 @@ class TrtllmMxInt4Config:
 class CutlassBf16Config:
     """CUTLASS BF16 backend for the unified MoE API.
 
-    Architecture coverage follows the dense-BF16 legacy flat API. The unified
-    GPU tests currently exercise SM90.
+    Architecture coverage follows the dense-BF16 legacy flat API.
 
     This backend supports packed precomputed routing with all flat CUTLASS
     activation semantics and requires ``do_finalize=True``.
@@ -2578,7 +2576,8 @@ class CuteDslConfig:
     @classmethod
     def supported(cls, arch: int) -> bool:
         # SM100, SM103 (Blackwell) + SM107 (Rubin) — tighten when CuteDSL adds more targets
-        return arch in (100, 103, 107)
+        # SM80 to SM90 run on the CUTLASS SM80 kernels.
+        return arch in (80, 86, 87, 89, 90, 100, 103, 107)
 
     @staticmethod
     def prepare_weights(

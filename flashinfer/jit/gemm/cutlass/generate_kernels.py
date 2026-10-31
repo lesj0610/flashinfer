@@ -126,6 +126,7 @@ CudaTypeName = {
 MixedInputScaleModeTag = {
     "post_mma": "cutlass::gemm::collective::MixedInputScaleMode::kPostMma",
     "pre_mma_e8m0": "cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0",
+    "exact_block_e8m0": "cutlass::gemm::collective::MixedInputScaleMode::kExactBlockE8M0",
 }
 
 Sm90MixedInputKernelScheduleTag = {
@@ -806,6 +807,27 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
                     EpilogueScheduleType.TmaWarpSpecializedCooperative,
                     mixed_input_scale_mode="pre_mma_e8m0",
                     sm90_mixed_input_kernel_type=kernel_type,
+                )
+            )
+    # MXFP8 x MXFP4 exact block exponents use cooperative 128xNx128 tiles.
+    for dtype_combo in supported_dtypes_fp4:
+        if dtype_combo[0] != DataType.e4m3:
+            continue
+        for token_tile in [16, 32, 64, 128, 256]:
+            operations.append(
+                TrtLlm_GemmLauncher(
+                    GemmKind.Grouped,
+                    arch,
+                    *dtype_combo,
+                    TrtLlm_QuantOp.finegrained_scale_only,
+                    TrtLlm_EpilogueTag.epilogue_op_default,
+                    (128, token_tile, 128),
+                    warp_shape,
+                    stages,
+                    (1, 1, 1),
+                    KernelScheduleType.TmaWarpSpecializedCooperative,
+                    EpilogueScheduleType.TmaWarpSpecializedCooperative,
+                    mixed_input_scale_mode="exact_block_e8m0",
                 )
             )
     return operations
