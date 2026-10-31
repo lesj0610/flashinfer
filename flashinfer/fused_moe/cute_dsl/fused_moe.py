@@ -88,7 +88,7 @@ from ...quantization.nvfp4_quantization_utils import (
     nvfp4_e4m3_max,
     resolve_nvfp4_4over6,
 )
-from ...utils import supported_compute_capability
+from ...utils import device_support_pdl, supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
@@ -1622,7 +1622,7 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
             per_expert(runner.situ_linear_beta or (float("inf") if situ else None)), False,
             # Local expert ids, as EP rank 0 of 2: ids outside the local experts are skipped.
             ep_size=1 if experts_here == runner.num_experts else 2, ep_rank=0,
-            enable_pdl=runner.enable_pdl,
+            enable_pdl=runner.enable_pdl and device_support_pdl(x.device),
             activation_type=ActivationType.Situ if situ else ActivationType(runner.activation_type),
             use_mxfp8_act_scaling=w4a8, nvfp4_4over6_code=code,
         )  # fmt: skip
