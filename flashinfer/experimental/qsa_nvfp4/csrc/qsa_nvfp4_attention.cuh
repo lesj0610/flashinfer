@@ -336,13 +336,13 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
   const int first_head = kv_head * p.group_size;
 
   // Q in A-fragment order: k-step s, lane (g, t) holds rows g and g + 8 at dims qk_dim(s, t) .. +3.
-  // NVFP4 stores Q only after the first tile's copies are issued, so its page lookups never wait
-  // on Q; FP8 and BF16 store it at once. BF16 keeps the strided loop, which its split-1 shapes
-  // run faster with than the unrolled one.
+  // NVFP4 holds Q in registers until the first tile's copies are issued, so its page lookups never
+  // wait on Q stores. FP8 and BF16 keep the strided loop: unrolled, it slowed their large split-1
+  // shapes (BF16 on SM80, FP8 on SM90).
   constexpr bool kStoreQLate = F == KvFormat::kNVFP4;
   constexpr uint32_t kQLoads = kHeadDim / 16 * 32 / kNumThreads;
   uint2 q_lo[kQLoads], q_hi[kQLoads];
-  if constexpr (F == KvFormat::kBF16) {
+  if constexpr (!kStoreQLate) {
     for (uint32_t e = threadIdx.x; e < kHeadDim / 16 * 32; e += kNumThreads) {
       const uint32_t s = e / 32, eg = e % 32 / 4, et = e % 4;
       const nv_bfloat16* src = p.q + int64_t(row) * p.q_stride_row +
@@ -364,8 +364,6 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
       q_hi[i] = int(eg) + 8 < p.group_size
                     ? *reinterpret_cast<const uint2*>(src + 8 * p.q_stride_head)
                     : make_uint2(0, 0);
-      if constexpr (!kStoreQLate)
-        smem.q[s][e % 32] = make_uint4(q_lo[i].x, q_hi[i].x, q_lo[i].y, q_hi[i].y);
     }
   }
 
