@@ -59,9 +59,10 @@ enum class KvFormat { kNVFP4, kFP8, kBF16 };
 constexpr uint32_t kHeadDim = 256;
 constexpr uint32_t kNumWarps = 4;
 constexpr uint32_t kNumThreads = kNumWarps * 32;
-// Merge warps at most. NVFP4 keeps its four; BF16 and FP8 merge up to 65 splits in one pass.
+// Merge warps at most, kMergeDepth splits each: NVFP4 merges up to 64 splits in one pass, BF16
+// and FP8 up to 128.
 template <KvFormat F>
-constexpr uint32_t kMergeWarps = F == KvFormat::kNVFP4 ? 4 : 16;
+constexpr uint32_t kMergeWarps = F == KvFormat::kNVFP4 ? 8 : 16;
 constexpr int kMergeDepth = 8;            // splits in flight per merge warp
 constexpr float kMaskedScore = -1.0e20f;  // the Triton kernel's sentinel
 
@@ -253,20 +254,28 @@ __device__ __forceinline__ void copy_nvfp4(uint8_t* rows, const uint8_t* data, c
 
 // E2M1 x8 to BF16 times 2^120, and E4M3 x4 block scales to BF16 times 2^-120: both exact, and so
 // is their product, which skips the bias multiply of the E4M3 conversion.
+// PRMT as written: nvcc refolds a __byte_perm chain on constants into one more op per eight codes.
+__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
+  uint32_t r;
+  asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+  return r;
+}
+
 __device__ __forceinline__ void e2m1x8_to_bf16x8_x2p120(uint32_t packed, uint32_t* d) {
   constexpr uint32_t kHi0 = 0x7B7B7B00u, kHi1 = 0x7C7C7C7Cu;
   constexpr uint32_t kLo0 = 0xC0800000u, kLo1 = 0xC0804000u;
   const uint32_t mag = packed & 0x77777777u;
-  uint32_t hi_a = __byte_perm(kHi0, kHi1, mag);
-  uint32_t hi_b = __byte_perm(kHi0, kHi1, mag >> 16);
-  const uint32_t lo_a = __byte_perm(kLo0, kLo1, mag);
-  const uint32_t lo_b = __byte_perm(kLo0, kLo1, mag >> 16);
-  hi_a |= __byte_perm(packed << 4, packed, 0xD9C8u) & 0x80808080u;
-  hi_b |= __byte_perm(packed << 4, packed, 0xFBEAu) & 0x80808080u;
-  d[0] = __byte_perm(lo_a, hi_a, 0x5140u);
-  d[1] = __byte_perm(lo_a, hi_a, 0x7362u);
-  d[2] = __byte_perm(lo_b, hi_b, 0x5140u);
-  d[3] = __byte_perm(lo_b, hi_b, 0x7362u);
+  const uint32_t mag_b = prmt(mag, mag, 0x3232u);
+  uint32_t hi_a = prmt(kHi0, kHi1, mag);
+  uint32_t hi_b = prmt(kHi0, kHi1, mag_b);
+  const uint32_t lo_a = prmt(kLo0, kLo1, mag);
+  const uint32_t lo_b = prmt(kLo0, kLo1, mag_b);
+  hi_a |= prmt(packed << 4, packed, 0xD9C8u) & 0x80808080u;
+  hi_b |= prmt(packed << 4, packed, 0xFBEAu) & 0x80808080u;
+  d[0] = prmt(lo_a, hi_a, 0x5140u);
+  d[1] = prmt(lo_a, hi_a, 0x7362u);
+  d[2] = prmt(lo_b, hi_b, 0x5140u);
+  d[3] = prmt(lo_b, hi_b, 0x7362u);
 }
 
 // The same decode with nibbles 0, 2 / 1, 3 / 4, 6 / 5, 7 paired: given two tokens' bytes
@@ -275,16 +284,17 @@ __device__ __forceinline__ void e2m1x8_pairs_to_bf16x8_x2p120(uint32_t packed, u
   constexpr uint32_t kHi0 = 0x7B7B7B00u, kHi1 = 0x7C7C7C7Cu;
   constexpr uint32_t kLo0 = 0xC0800000u, kLo1 = 0xC0804000u;
   const uint32_t mag = packed & 0x77777777u;
-  uint32_t hi_a = __byte_perm(kHi0, kHi1, mag);
-  uint32_t hi_b = __byte_perm(kHi0, kHi1, mag >> 16);
-  const uint32_t lo_a = __byte_perm(kLo0, kLo1, mag);
-  const uint32_t lo_b = __byte_perm(kLo0, kLo1, mag >> 16);
-  hi_a |= __byte_perm(packed << 4, packed, 0xD9C8u) & 0x80808080u;
-  hi_b |= __byte_perm(packed << 4, packed, 0xFBEAu) & 0x80808080u;
-  d[0] = __byte_perm(lo_a, hi_a, 0x6240u);
-  d[1] = __byte_perm(lo_a, hi_a, 0x7351u);
-  d[2] = __byte_perm(lo_b, hi_b, 0x6240u);
-  d[3] = __byte_perm(lo_b, hi_b, 0x7351u);
+  const uint32_t mag_b = prmt(mag, mag, 0x3232u);
+  uint32_t hi_a = prmt(kHi0, kHi1, mag);
+  uint32_t hi_b = prmt(kHi0, kHi1, mag_b);
+  const uint32_t lo_a = prmt(kLo0, kLo1, mag);
+  const uint32_t lo_b = prmt(kLo0, kLo1, mag_b);
+  hi_a |= prmt(packed << 4, packed, 0xD9C8u) & 0x80808080u;
+  hi_b |= prmt(packed << 4, packed, 0xFBEAu) & 0x80808080u;
+  d[0] = prmt(lo_a, hi_a, 0x6240u);
+  d[1] = prmt(lo_a, hi_a, 0x7351u);
+  d[2] = prmt(lo_b, hi_b, 0x6240u);
+  d[3] = prmt(lo_b, hi_b, 0x7351u);
 }
 
 __device__ __forceinline__ uint2 e4m3x4_to_bf16x4_x2m120(uint32_t q) {
@@ -302,7 +312,8 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
   constexpr uint32_t kQkTiles = kWarpTokens / 8;             // n8 tiles per warp
   extern __shared__ __align__(16) uint8_t smem_buffer[];
   SharedStorage<F>& smem = *reinterpret_cast<SharedStorage<F>*>(smem_buffer);
-  const int row = blockIdx.x, kv_head = blockIdx.y, split = blockIdx.z;
+  const int row = F == KvFormat::kNVFP4 ? blockIdx.y : blockIdx.x;
+  const int kv_head = F == KvFormat::kNVFP4 ? blockIdx.x : blockIdx.y, split = blockIdx.z;
   const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
   const int stride = p.num_splits;
   const int64_t indices_row = int64_t(row) * p.indices_stride_row;
@@ -326,16 +337,35 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
   const int first_head = kv_head * p.group_size;
 
   // Q in A-fragment order: k-step s, lane (g, t) holds rows g and g + 8 at dims qk_dim(s, t) .. +3.
-  for (uint32_t e = threadIdx.x; e < kHeadDim / 16 * 32; e += kNumThreads) {
-    const uint32_t s = e / 32, eg = e % 32 / 4, et = e % 4;
-    const nv_bfloat16* src = p.q + int64_t(row) * p.q_stride_row +
-                             (first_head + int(eg)) * p.q_stride_head + qk_dim<F>(s, et);
-    const uint2 lo =
-        int(eg) < p.group_size ? *reinterpret_cast<const uint2*>(src) : make_uint2(0, 0);
-    const uint2 hi = int(eg) + 8 < p.group_size
-                         ? *reinterpret_cast<const uint2*>(src + 8 * p.q_stride_head)
-                         : make_uint2(0, 0);
-    smem.q[s][e % 32] = make_uint4(lo.x, hi.x, lo.y, hi.y);
+  // NVFP4 holds Q in registers until the first tile's copies are issued, so its page lookups never
+  // wait on Q stores. FP8 and BF16 keep the strided loop: unrolled, it slowed their large split-1
+  // shapes (BF16 on SM80, FP8 on SM90).
+  constexpr bool kStoreQLate = F == KvFormat::kNVFP4;
+  constexpr uint32_t kQLoads = kHeadDim / 16 * 32 / kNumThreads;
+  uint2 q_lo[kQLoads], q_hi[kQLoads];
+  if constexpr (!kStoreQLate) {
+    for (uint32_t e = threadIdx.x; e < kHeadDim / 16 * 32; e += kNumThreads) {
+      const uint32_t s = e / 32, eg = e % 32 / 4, et = e % 4;
+      const nv_bfloat16* src = p.q + int64_t(row) * p.q_stride_row +
+                               (first_head + int(eg)) * p.q_stride_head + qk_dim<F>(s, et);
+      const uint2 lo =
+          int(eg) < p.group_size ? *reinterpret_cast<const uint2*>(src) : make_uint2(0, 0);
+      const uint2 hi = int(eg) + 8 < p.group_size
+                           ? *reinterpret_cast<const uint2*>(src + 8 * p.q_stride_head)
+                           : make_uint2(0, 0);
+      smem.q[s][e % 32] = make_uint4(lo.x, hi.x, lo.y, hi.y);
+    }
+  } else {
+#pragma unroll
+    for (uint32_t i = 0; i < kQLoads; ++i) {
+      const uint32_t e = threadIdx.x + i * kNumThreads, s = e / 32, eg = e % 32 / 4, et = e % 4;
+      const nv_bfloat16* src = p.q + int64_t(row) * p.q_stride_row +
+                               (first_head + int(eg)) * p.q_stride_head + qk_dim<F>(s, et);
+      q_lo[i] = int(eg) < p.group_size ? *reinterpret_cast<const uint2*>(src) : make_uint2(0, 0);
+      q_hi[i] = int(eg) + 8 < p.group_size
+                    ? *reinterpret_cast<const uint2*>(src + 8 * p.q_stride_head)
+                    : make_uint2(0, 0);
+    }
   }
 
   // Selection index -> (physical page or -1, page offset), then -> byte offsets and valid bits.
@@ -402,6 +432,14 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
     next_src = gather_nvfp4(data_offset, sf_offset, next_valid, lane);
   lookup(index2, next_page, next_offset);
   int ahead_index = index3;
+
+  if constexpr (kStoreQLate) {
+#pragma unroll
+    for (uint32_t i = 0; i < kQLoads; ++i) {
+      const uint32_t e = threadIdx.x + i * kNumThreads;
+      smem.q[e / 32][e % 32] = make_uint4(q_lo[i].x, q_hi[i].x, q_lo[i].y, q_hi[i].y);
+    }
+  }
 
   float o[4][8] = {};  // n16 accumulators: tiles 2c (o[c][0..3]) and 2c + 1 (o[c][4..7])
   float m[2] = {kMaskedScore, kMaskedScore}, l[2] = {0.f, 0.f};  // rows g and g + 8
@@ -778,8 +816,33 @@ template <KvFormat F>
 inline cudaError_t SparsePagedAttention(const Params& p, cudaStream_t stream) {
   cudaError_t status = PrepareKernel<F>();
   if (status != cudaSuccess) return status;
-  const dim3 grid(p.num_rows, p.num_qo_heads / p.group_size, p.num_splits);
-  SparsePagedAttentionKernel<F><<<grid, kNumThreads, sizeof(SharedStorage<F>), stream>>>(p);
+  const int num_kv_heads = p.num_qo_heads / p.group_size;
+  if constexpr (F == KvFormat::kNVFP4) {
+    // The KV head goes in grid x, so the KV heads of a row launch next to each other; in the NHD
+    // layout their scales share 32-byte sectors. Grid y holds at most 65535 rows, so larger
+    // batches launch in row chunks. num_rows stays the full count, the row pitch of the split
+    // partials.
+    constexpr int kMaxRows = 65535;
+    for (int row0 = 0; row0 < p.num_rows; row0 += kMaxRows) {
+      Params chunk = p;
+      chunk.q += row0 * p.q_stride_row;
+      chunk.indices += row0 * p.indices_stride_row;
+      chunk.token_to_req += row0;
+      chunk.gate += int64_t(row0) * p.num_qo_heads * kHeadDim;
+      chunk.out += row0 * p.out_stride_row;
+      if (p.num_splits > 1) {
+        chunk.partial_out += int64_t(row0) * p.num_qo_heads * kHeadDim;
+        chunk.partial_lse += int64_t(row0) * p.num_qo_heads;
+      }
+      const dim3 grid(num_kv_heads, min(p.num_rows - row0, kMaxRows), p.num_splits);
+      SparsePagedAttentionKernel<F><<<grid, kNumThreads, sizeof(SharedStorage<F>), stream>>>(chunk);
+      status = cudaGetLastError();
+      if (status != cudaSuccess) return status;
+    }
+  } else {
+    const dim3 grid(p.num_rows, num_kv_heads, p.num_splits);
+    SparsePagedAttentionKernel<F><<<grid, kNumThreads, sizeof(SharedStorage<F>), stream>>>(p);
+  }
   if (p.num_splits > 1) {
     const int warps = min(int(kMergeWarps<F>), (p.num_splits + kMergeDepth - 1) / kMergeDepth);
     const size_t acc_bytes = F == KvFormat::kNVFP4 ? 0 : warps * kHeadDim * sizeof(float);
