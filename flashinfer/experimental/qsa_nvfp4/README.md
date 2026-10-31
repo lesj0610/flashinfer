@@ -1,13 +1,13 @@
 # Experimental QSA NVFP4 sparse paged attention
 
 `flashinfer.sparse.qsa_sparse_paged_attention` runs the main attention of the Qwen
-QSA layer over an NVFP4, FP8-e4m3 or BF16 KV cache on SM80 through SM90. It implements
+QSA layer over an NVFP4, FP8-e4m3 or BF16 KV cache on SM80 through SM12x. It implements
 the contract of vLLM's Triton `qsa_sparse_paged_attention` (same arguments, same order)
 and adds the NVFP4 block scales `k_sf` / `v_sf`.
 
 It is reached only through that experimental API: with `backend="default"`, with the
 entry's default `backend="auto"` for FP8 and BF16 caches, and for NVFP4 on a device
-the Cake package has no library for, where it reports the unsupported device (on every
+the Cake package has no library for, such as SM110 and SM121 (on every
 capability Cake exports, SM80 through SM90 included, `"auto"` runs NVFP4 on the Cake
 kernels of `flashinfer.experimental.cake_qsa_nvfp4`).
 No AOT packaging. The experimental
@@ -37,8 +37,8 @@ that adds the package.
 `csrc/qsa_nvfp4_attention.cuh` holds two kernels: a split-K kernel with one CTA per
 (row, KV head, split) over 64-token tiles (32 for BF16), templated on the cache format,
 and an LSE merge that also applies the gate when the selection is split. It uses SM80
-instructions only (cp.async, mma.sync m16n8k16), so one JIT build serves SM80 through
-SM90. K is decoded exactly to BF16 straight into MMA fragments; PV takes BF16 operands
+instructions only (cp.async, mma.sync m16n8k16), so the same source builds for SM80 through
+SM12x. K is decoded exactly to BF16 straight into MMA fragments; PV takes BF16 operands
 for NVFP4 and BF16 and FP16 operands for FP8, like the Triton kernel; both accumulate in
 FP32, with the global scales folded into the softmax scale and the output scale.
 
