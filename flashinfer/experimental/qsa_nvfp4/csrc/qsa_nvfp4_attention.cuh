@@ -59,9 +59,10 @@ enum class KvFormat { kNVFP4, kFP8, kBF16 };
 constexpr uint32_t kHeadDim = 256;
 constexpr uint32_t kNumWarps = 4;
 constexpr uint32_t kNumThreads = kNumWarps * 32;
-// Merge warps at most. NVFP4 keeps its four; BF16 and FP8 merge up to 65 splits in one pass.
+// Merge warps at most, kMergeDepth splits each: NVFP4 merges up to 64 splits in one pass, BF16
+// and FP8 up to 128.
 template <KvFormat F>
-constexpr uint32_t kMergeWarps = F == KvFormat::kNVFP4 ? 4 : 16;
+constexpr uint32_t kMergeWarps = F == KvFormat::kNVFP4 ? 8 : 16;
 constexpr int kMergeDepth = 8;            // splits in flight per merge warp
 constexpr float kMaskedScore = -1.0e20f;  // the Triton kernel's sentinel
 
@@ -253,20 +254,28 @@ __device__ __forceinline__ void copy_nvfp4(uint8_t* rows, const uint8_t* data, c
 
 // E2M1 x8 to BF16 times 2^120, and E4M3 x4 block scales to BF16 times 2^-120: both exact, and so
 // is their product, which skips the bias multiply of the E4M3 conversion.
+// PRMT as written: nvcc refolds a __byte_perm chain on constants into one more op per eight codes.
+__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
+  uint32_t r;
+  asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+  return r;
+}
+
 __device__ __forceinline__ void e2m1x8_to_bf16x8_x2p120(uint32_t packed, uint32_t* d) {
   constexpr uint32_t kHi0 = 0x7B7B7B00u, kHi1 = 0x7C7C7C7Cu;
   constexpr uint32_t kLo0 = 0xC0800000u, kLo1 = 0xC0804000u;
   const uint32_t mag = packed & 0x77777777u;
-  uint32_t hi_a = __byte_perm(kHi0, kHi1, mag);
-  uint32_t hi_b = __byte_perm(kHi0, kHi1, mag >> 16);
-  const uint32_t lo_a = __byte_perm(kLo0, kLo1, mag);
-  const uint32_t lo_b = __byte_perm(kLo0, kLo1, mag >> 16);
-  hi_a |= __byte_perm(packed << 4, packed, 0xD9C8u) & 0x80808080u;
-  hi_b |= __byte_perm(packed << 4, packed, 0xFBEAu) & 0x80808080u;
-  d[0] = __byte_perm(lo_a, hi_a, 0x5140u);
-  d[1] = __byte_perm(lo_a, hi_a, 0x7362u);
-  d[2] = __byte_perm(lo_b, hi_b, 0x5140u);
-  d[3] = __byte_perm(lo_b, hi_b, 0x7362u);
+  const uint32_t mag_b = prmt(mag, mag, 0x3232u);
+  uint32_t hi_a = prmt(kHi0, kHi1, mag);
+  uint32_t hi_b = prmt(kHi0, kHi1, mag_b);
+  const uint32_t lo_a = prmt(kLo0, kLo1, mag);
+  const uint32_t lo_b = prmt(kLo0, kLo1, mag_b);
+  hi_a |= prmt(packed << 4, packed, 0xD9C8u) & 0x80808080u;
+  hi_b |= prmt(packed << 4, packed, 0xFBEAu) & 0x80808080u;
+  d[0] = prmt(lo_a, hi_a, 0x5140u);
+  d[1] = prmt(lo_a, hi_a, 0x7362u);
+  d[2] = prmt(lo_b, hi_b, 0x5140u);
+  d[3] = prmt(lo_b, hi_b, 0x7362u);
 }
 
 // The same decode with nibbles 0, 2 / 1, 3 / 4, 6 / 5, 7 paired: given two tokens' bytes
@@ -275,16 +284,17 @@ __device__ __forceinline__ void e2m1x8_pairs_to_bf16x8_x2p120(uint32_t packed, u
   constexpr uint32_t kHi0 = 0x7B7B7B00u, kHi1 = 0x7C7C7C7Cu;
   constexpr uint32_t kLo0 = 0xC0800000u, kLo1 = 0xC0804000u;
   const uint32_t mag = packed & 0x77777777u;
-  uint32_t hi_a = __byte_perm(kHi0, kHi1, mag);
-  uint32_t hi_b = __byte_perm(kHi0, kHi1, mag >> 16);
-  const uint32_t lo_a = __byte_perm(kLo0, kLo1, mag);
-  const uint32_t lo_b = __byte_perm(kLo0, kLo1, mag >> 16);
-  hi_a |= __byte_perm(packed << 4, packed, 0xD9C8u) & 0x80808080u;
-  hi_b |= __byte_perm(packed << 4, packed, 0xFBEAu) & 0x80808080u;
-  d[0] = __byte_perm(lo_a, hi_a, 0x6240u);
-  d[1] = __byte_perm(lo_a, hi_a, 0x7351u);
-  d[2] = __byte_perm(lo_b, hi_b, 0x6240u);
-  d[3] = __byte_perm(lo_b, hi_b, 0x7351u);
+  const uint32_t mag_b = prmt(mag, mag, 0x3232u);
+  uint32_t hi_a = prmt(kHi0, kHi1, mag);
+  uint32_t hi_b = prmt(kHi0, kHi1, mag_b);
+  const uint32_t lo_a = prmt(kLo0, kLo1, mag);
+  const uint32_t lo_b = prmt(kLo0, kLo1, mag_b);
+  hi_a |= prmt(packed << 4, packed, 0xD9C8u) & 0x80808080u;
+  hi_b |= prmt(packed << 4, packed, 0xFBEAu) & 0x80808080u;
+  d[0] = prmt(lo_a, hi_a, 0x6240u);
+  d[1] = prmt(lo_a, hi_a, 0x7351u);
+  d[2] = prmt(lo_b, hi_b, 0x6240u);
+  d[3] = prmt(lo_b, hi_b, 0x7351u);
 }
 
 __device__ __forceinline__ uint2 e4m3x4_to_bf16x4_x2m120(uint32_t q) {
@@ -326,16 +336,37 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
   const int first_head = kv_head * p.group_size;
 
   // Q in A-fragment order: k-step s, lane (g, t) holds rows g and g + 8 at dims qk_dim(s, t) .. +3.
-  for (uint32_t e = threadIdx.x; e < kHeadDim / 16 * 32; e += kNumThreads) {
-    const uint32_t s = e / 32, eg = e % 32 / 4, et = e % 4;
-    const nv_bfloat16* src = p.q + int64_t(row) * p.q_stride_row +
-                             (first_head + int(eg)) * p.q_stride_head + qk_dim<F>(s, et);
-    const uint2 lo =
-        int(eg) < p.group_size ? *reinterpret_cast<const uint2*>(src) : make_uint2(0, 0);
-    const uint2 hi = int(eg) + 8 < p.group_size
-                         ? *reinterpret_cast<const uint2*>(src + 8 * p.q_stride_head)
-                         : make_uint2(0, 0);
-    smem.q[s][e % 32] = make_uint4(lo.x, hi.x, lo.y, hi.y);
+  // NVFP4 stores Q only after the first tile's copies are issued, so its page lookups never wait
+  // on Q; FP8 and BF16 store it at once. BF16 keeps the strided loop, which its split-1 shapes
+  // run faster with than the unrolled one.
+  constexpr bool kStoreQLate = F == KvFormat::kNVFP4;
+  constexpr uint32_t kQLoads = kHeadDim / 16 * 32 / kNumThreads;
+  uint2 q_lo[kQLoads], q_hi[kQLoads];
+  if constexpr (F == KvFormat::kBF16) {
+    for (uint32_t e = threadIdx.x; e < kHeadDim / 16 * 32; e += kNumThreads) {
+      const uint32_t s = e / 32, eg = e % 32 / 4, et = e % 4;
+      const nv_bfloat16* src = p.q + int64_t(row) * p.q_stride_row +
+                               (first_head + int(eg)) * p.q_stride_head + qk_dim<F>(s, et);
+      const uint2 lo =
+          int(eg) < p.group_size ? *reinterpret_cast<const uint2*>(src) : make_uint2(0, 0);
+      const uint2 hi = int(eg) + 8 < p.group_size
+                           ? *reinterpret_cast<const uint2*>(src + 8 * p.q_stride_head)
+                           : make_uint2(0, 0);
+      smem.q[s][e % 32] = make_uint4(lo.x, hi.x, lo.y, hi.y);
+    }
+  } else {
+#pragma unroll
+    for (uint32_t i = 0; i < kQLoads; ++i) {
+      const uint32_t e = threadIdx.x + i * kNumThreads, s = e / 32, eg = e % 32 / 4, et = e % 4;
+      const nv_bfloat16* src = p.q + int64_t(row) * p.q_stride_row +
+                               (first_head + int(eg)) * p.q_stride_head + qk_dim<F>(s, et);
+      q_lo[i] = int(eg) < p.group_size ? *reinterpret_cast<const uint2*>(src) : make_uint2(0, 0);
+      q_hi[i] = int(eg) + 8 < p.group_size
+                    ? *reinterpret_cast<const uint2*>(src + 8 * p.q_stride_head)
+                    : make_uint2(0, 0);
+      if constexpr (!kStoreQLate)
+        smem.q[s][e % 32] = make_uint4(q_lo[i].x, q_hi[i].x, q_lo[i].y, q_hi[i].y);
+    }
   }
 
   // Selection index -> (physical page or -1, page offset), then -> byte offsets and valid bits.
@@ -402,6 +433,14 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
     next_src = gather_nvfp4(data_offset, sf_offset, next_valid, lane);
   lookup(index2, next_page, next_offset);
   int ahead_index = index3;
+
+  if constexpr (kStoreQLate) {
+#pragma unroll
+    for (uint32_t i = 0; i < kQLoads; ++i) {
+      const uint32_t e = threadIdx.x + i * kNumThreads;
+      smem.q[e / 32][e % 32] = make_uint4(q_lo[i].x, q_hi[i].x, q_lo[i].y, q_hi[i].y);
+    }
+  }
 
   float o[4][8] = {};  // n16 accumulators: tiles 2c (o[c][0..3]) and 2c + 1 (o[c][4..7])
   float m[2] = {kMaskedScore, kMaskedScore}, l[2] = {0.f, 0.f};  // rows g and g + 8
