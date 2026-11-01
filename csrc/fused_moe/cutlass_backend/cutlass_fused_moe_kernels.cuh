@@ -1578,11 +1578,13 @@ void restoreTokenRows(T* output, void const* input, uint8_t const* sf, bool cons
     threads /= 2;
   }
   int64_t const splits = std::min(tensorrt_llm::common::ceilDiv(padded_vecs, threads), sms_per_row);
-  restoreTokenRowsKernel<T, IsMX>
-      <<<dim3(ctas, splits), threads, std::min(experts_per_token, threads) * sizeof(int), stream>>>(
-          output, input, sf, swizzled_sf, num_rows, cols, token_selected_experts,
-          unpermuted_row_to_permuted_row, experts_per_token, start_expert, num_experts_per_node,
-          fc1_alpha, fc2_alpha, token_scales, fc1_row_scales, fc2_row_scales, wide_rows);
+  // The chunk's permuted rows, rounded up to 16 bytes: sm_90a loads them 4 at a time.
+  size_t const smem =
+      tensorrt_llm::common::roundUp(std::min(experts_per_token, threads), int64_t{4}) * sizeof(int);
+  restoreTokenRowsKernel<T, IsMX><<<dim3(ctas, splits), threads, smem, stream>>>(
+      output, input, sf, swizzled_sf, num_rows, cols, token_selected_experts,
+      unpermuted_row_to_permuted_row, experts_per_token, start_expert, num_experts_per_node,
+      fc1_alpha, fc2_alpha, token_scales, fc1_row_scales, fc2_row_scales, wide_rows);
 }
 
 // GEMM1's rows (permuted) restoreTokenRowsKernel flagged, recomputed from the MXFP8 codes: an
