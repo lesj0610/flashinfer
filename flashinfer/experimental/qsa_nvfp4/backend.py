@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# QSA sparse paged attention over an NVFP4, FP8-e4m3 or BF16 KV cache, for SM80 through SM90.
+# QSA sparse paged attention over an NVFP4, FP8-e4m3 or BF16 KV cache, for SM80 through SM12x.
 
 import functools
 import math
@@ -102,9 +102,9 @@ def qsa_sparse_paged_attention(
         use_prefill_config
     )  # kept for the signature; the split rule does not depend on it
     major = get_compute_capability(q.device)[0]
-    if major not in (8, 9):
+    if major not in (8, 9, 10, 11, 12):
         raise RuntimeError(
-            f"QSA sparse paged attention supports SM80 through SM90, got SM{major}x"
+            f"QSA sparse paged attention supports SM80 through SM12x, got SM{major}x"
         )
     _check(q.ndim == 3 and k_cache.ndim == 4, "q must be 3D and k_cache 4D")
     num_rows, num_qo_heads, head_dim = q.shape
