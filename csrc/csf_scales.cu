@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cuda_bf16.h>
+
 #include <cstdint>
 
 #include "tvm_ffi_utils.h"
@@ -107,7 +109,7 @@ __global__ void CsfEncodeExceptionsKernel(const uint8_t* __restrict__ scales,
   }
 }
 
-enum class Dest { kSwizzled128x4, kLinear };
+enum class Dest { kSwizzled128x4, kLinear, kTransposed };
 
 struct CsfExpandParams {
   const uint8_t* fixed;
@@ -119,7 +121,8 @@ struct CsfExpandParams {
   int expert_offset;
   int num_experts;
   int rows, cols;
-  // Columns of the destination: the padded columns for 128x4; at least `cols`.
+  // Columns of the destination: the padded columns for 128x4, the row count of each transposed
+  // matrix; at least `cols`.
   int out_cols;
   // Destination slab d comes from source slab (d + rotate_slabs) % (rows / 16).
   int rotate_slabs;
@@ -127,9 +130,30 @@ struct CsfExpandParams {
   int tile_words;
 };
 
+// An E4M3 byte's value. Every E4M3 value is exact in float and in bfloat16.
+__device__ __forceinline__ float E4m3ToFloat(uint32_t x) {
+  const uint32_t sign = (x & 0x80u) << 24, mag = x & 0x7fu;
+  if (mag == 0x7fu) return __uint_as_float(0x7fc00000u | sign);
+  // Subnormals are mag * 2^-9; normals move into place with the exponent bias going 7 -> 127.
+  const float abs = mag < 8 ? mag * 0x1p-9f : __uint_as_float((mag + (120u << 3)) << 20);
+  return __uint_as_float(__float_as_uint(abs) | sign);
+}
+
+template <typename T>
+__device__ __forceinline__ T ScaleAs(uint8_t x);
+template <>
+__device__ __forceinline__ uint8_t ScaleAs<uint8_t>(uint8_t x) {
+  return x;
+}
+template <>
+__device__ __forceinline__ __nv_bfloat16 ScaleAs<__nv_bfloat16>(uint8_t x) {
+  return __float2bfloat16_rn(E4m3ToFloat(x));
+}
+
 // Word `word` (columns 4 * word ..) of tile row `row`. Rows are an odd number of words apart and
 // their words XOR-swizzled within groups of four by (row / 32) % 4, so the 128x4 writer (rows
-// m + 32 * i of one word) reads without bank conflicts.
+// m + 32 * i of one word) and the transposed writer (four consecutive rows per lane of one
+// word) read without bank conflicts.
 __device__ __forceinline__ int TileWord(int row, int word, int tile_words) {
   return row * tile_words + (word ^ (row >> 5 & 3));
 }
@@ -142,8 +166,8 @@ __device__ __forceinline__ uint8_t* TileByte(uint32_t* tile, int row, int col, i
 // tile's slab k: the warp stages the slab in shared memory, decodes its rows into the tile kUnit
 // scales at a time and overwrites the exceptions it fetched meanwhile. The block then writes the
 // tile out.
-template <Dest kDest, int kUnit>
-__global__ void CsfExpandKernel(CsfExpandParams p, uint8_t* __restrict__ out) {
+template <Dest kDest, int kUnit, typename T>
+__global__ void CsfExpandKernel(CsfExpandParams p, T* __restrict__ out) {
   extern __shared__ uint4 smem[];
   int expert = blockIdx.x;
   if (p.experts != nullptr) {
@@ -168,6 +192,11 @@ __global__ void CsfExpandKernel(CsfExpandParams p, uint8_t* __restrict__ out) {
   uint32_t* tile = reinterpret_cast<uint32_t*>(smem);
   // The staged slabs follow the tile's 512 * tile_words bytes, 16-byte aligned.
   uint8_t* staged = reinterpret_cast<uint8_t*>(tile + kTileRows * tile_words);
+  if constexpr (kDest == Dest::kTransposed && sizeof(T) == 2) {
+    // The bfloat16 bits of every scale byte, one per thread, after the staged slabs.
+    reinterpret_cast<uint16_t*>(staged + kTileSlabs * slab_bytes)[threadIdx.x] =
+        __bfloat16_as_ushort(ScaleAs<T>(static_cast<uint8_t>(threadIdx.x)));
+  }
   if (warp < tile_slabs) {
     int s = first_slab + warp + p.rotate_slabs;
     if (s >= slabs) s -= slabs;
@@ -255,11 +284,40 @@ __global__ void CsfExpandKernel(CsfExpandParams p, uint8_t* __restrict__ out) {
       }
       dst[l] = make_uint4(v[0], v[1], v[2], v[3]);
     }
-  } else {
-    uint8_t* dst = out + (static_cast<int64_t>(expert) * p.rows + first_slab * kSlabRows) * cols;
+  } else if constexpr (kDest == Dest::kLinear) {
+    T* dst = out + (static_cast<int64_t>(expert) * p.rows + first_slab * kSlabRows) * cols;
     for (int i = threadIdx.x; i < tile_rows * cols; i += blockDim.x) {
       const int r = i / cols;
-      dst[i] = *TileByte(tile, r, i - r * cols, tile_words);
+      dst[i] = ScaleAs<T>(*TileByte(tile, r, i - r * cols, tile_words));
+    }
+  } else if (4 * lane < tile_rows) {
+    // A warp takes one word's four columns at a time, lane l their rows 4 * l .. 4 * l + 3.
+    T* dst = out + static_cast<int64_t>(expert) * p.out_cols * p.rows + first_slab * kSlabRows +
+             4 * lane;
+    const uint16_t* lut = reinterpret_cast<const uint16_t*>(staged + kTileSlabs * slab_bytes);
+    for (int word = warp; 4 * word < p.out_cols; word += blockDim.x / 32) {
+      uint32_t v[4] = {};
+      if (4 * word < cols) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = tile[TileWord(4 * lane + i, word, tile_words)];
+      }
+      const int word_cols = p.out_cols - 4 * word;
+      T* d = dst + static_cast<int64_t>(4 * word) * p.rows;
+#pragma unroll
+      for (int b = 0; b < 4; ++b, d += p.rows) {
+        if (b >= word_cols) continue;
+        if constexpr (sizeof(T) == 1) {
+          const uint32_t sel = b | (b + 4) << 4;
+          *reinterpret_cast<uint32_t*>(d) =
+              __byte_perm(__byte_perm(v[0], v[1], sel), __byte_perm(v[2], v[3], sel), 0x5410);
+        } else {
+          // Byte b of each row, zero-extended, indexes the table.
+          uint32_t h[4];
+#pragma unroll
+          for (int i = 0; i < 4; ++i) h[i] = lut[__byte_perm(v[i], 0, 0x4440 | b)];
+          *reinterpret_cast<uint2*>(d) = make_uint2(h[0] | h[1] << 16, h[2] | h[3] << 16);
+        }
+      }
     }
   }
 }
@@ -268,16 +326,18 @@ __global__ void CsfExpandKernel(CsfExpandParams p, uint8_t* __restrict__ out) {
 // permutes within.
 int TileWords(int64_t cols) { return static_cast<int>((cols + 15) / 16 * 4 + 1); }
 
-// The tile and the staged slabs, about 192 bytes per column.
-int64_t ExpandSmemBytes(int64_t cols) {
-  return kTileRows * 4 * TileWords(cols) + kTileSlabs * SlabBytes(static_cast<int>(cols));
+// The tile, the staged slabs and, for transposed bfloat16, the conversion table: about 192 bytes
+// per column.
+int64_t ExpandSmemBytes(int64_t cols, bool table) {
+  const int64_t table_bytes = table ? 256 * sizeof(uint16_t) : 0;
+  return kTileRows * 4 * TileWords(cols) + kTileSlabs * SlabBytes(static_cast<int>(cols)) +
+         table_bytes;
 }
 
-template <Dest kDest, int kUnit>
-void LaunchCsfExpandUnit(const CsfExpandParams& p, int64_t num_items, uint8_t* out,
-                         cudaStream_t stream) {
-  const int64_t smem = ExpandSmemBytes(p.cols);
-  auto kernel = CsfExpandKernel<kDest, kUnit>;
+template <Dest kDest, int kUnit, typename T>
+void LaunchCsfExpandUnit(const CsfExpandParams& p, int64_t num_items, T* out, cudaStream_t stream) {
+  const int64_t smem = ExpandSmemBytes(p.cols, kDest == Dest::kTransposed && sizeof(T) == 2);
+  auto kernel = CsfExpandKernel<kDest, kUnit, T>;
   cudaError_t status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             static_cast<int>(smem));
   // Clear the error, or the next launch check reports it.
@@ -291,9 +351,8 @@ void LaunchCsfExpandUnit(const CsfExpandParams& p, int64_t num_items, uint8_t* o
 }
 
 // Decodes the widest unit of scales that tiles a row.
-template <Dest kDest>
-void LaunchCsfExpand(const CsfExpandParams& p, int64_t num_items, uint8_t* out,
-                     cudaStream_t stream) {
+template <Dest kDest, typename T>
+void LaunchCsfExpand(const CsfExpandParams& p, int64_t num_items, T* out, cudaStream_t stream) {
   if (p.cols % 8 == 0) {
     LaunchCsfExpandUnit<kDest, 8>(p, num_items, out, stream);
   } else if (p.cols % 4 == 0) {
@@ -357,11 +416,11 @@ void csf_encode_exceptions(TensorView scales, TensorView fixed, TensorView row_o
 
 void csf_expand(TensorView fixed, TensorView exceptions, TensorView exc_offsets,
                 Optional<TensorView> token_selected_experts, TensorView out, int64_t layout,
-                bool swap_row_halves, int64_t local_expert_offset) {
+                bool transpose, bool swap_row_halves, int64_t local_expert_offset) {
   CHECK_INPUT_AND_TYPE(fixed, dl_uint8);
   CHECK_INPUT_AND_TYPE(exceptions, dl_uint32);
   CHECK_INPUT_AND_TYPE(exc_offsets, dl_int32);
-  CHECK_INPUT_AND_TYPE(out, dl_uint8);
+  CHECK_INPUT(out);
   CHECK_DIM(3, fixed);
   CHECK_DIM(3, out);
   CHECK_DEVICE(exceptions, fixed);
@@ -374,22 +433,30 @@ void csf_expand(TensorView fixed, TensorView exceptions, TensorView exc_offsets,
   TVM_FFI_ICHECK_EQ(exc_offsets.numel(), num_experts * slabs + 1);
   TVM_FFI_ICHECK(!swap_row_halves || slabs % 2 == 0)
       << "swapping row halves needs rows % 32 == 0, got " << rows;
+  const bool bf16 = out.dtype() == dl_bfloat16;
+  TVM_FFI_ICHECK(bf16 || out.dtype() == dl_uint8) << "out must be uint8 or bfloat16";
   TVM_FFI_ICHECK_EQ(out.size(0), num_experts);
   Dest dest;
   int64_t out_cols = cols;
   if (layout == kLayout128x4) {
+    TVM_FFI_ICHECK(!bf16 && !transpose) << "the 128x4 layout takes one-byte scales";
     out_cols = (cols + 3) / 4 * 4;
     TVM_FFI_ICHECK(out.size(1) == (rows + kTileRows - 1) / kTileRows * kTileRows &&
                    out.size(2) == out_cols)
         << "out must be [num_matrices, round_up(rows, 128), round_up(cols, 4)]";
     dest = Dest::kSwizzled128x4;
+  } else if (layout == kLayoutLinear && transpose) {
+    out_cols = out.size(1);
+    TVM_FFI_ICHECK(out_cols >= cols && out.size(2) == rows)
+        << "out must be [num_matrices, padded cols >= cols, rows]";
+    dest = Dest::kTransposed;
   } else {
     TVM_FFI_ICHECK(layout == kLayoutLinear) << "unsupported layout " << layout;
     TVM_FFI_ICHECK(out.size(1) == rows && out.size(2) == cols)
         << "out must be [num_matrices, rows, cols]";
     dest = Dest::kLinear;
   }
-  // Slabs load 16 bytes at a time, and the 128x4 tiles store 16.
+  // Slabs load 16 bytes at a time, and the 128x4 and transposed tiles store up to 16.
   TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(fixed.data_ptr()) % 16 == 0)
       << "fixed must be 16-byte aligned";
   TVM_FFI_ICHECK(dest == Dest::kLinear || reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0)
@@ -420,18 +487,27 @@ void csf_expand(TensorView fixed, TensorView exceptions, TensorView exc_offsets,
   TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin,
                                            fixed.device().device_id),
                     cudaSuccess);
-  if (ExpandSmemBytes(cols) > max_smem) {
+  const bool table = dest == Dest::kTransposed && bf16;
+  if (ExpandSmemBytes(cols, table) > max_smem) {
     int64_t max_cols = 0;
-    while (ExpandSmemBytes(max_cols + 2) <= max_smem) max_cols += 2;
+    while (ExpandSmemBytes(max_cols + 2, table) <= max_smem) max_cols += 2;
     TVM_FFI_THROW(ValueError) << "csf_expand supports up to " << max_cols
                               << " columns on this device, got " << cols;
   }
   ffi::CUDADeviceGuard device_guard(fixed.device().device_id);
   const cudaStream_t stream = get_stream(fixed.device());
-  uint8_t* dst = static_cast<uint8_t*>(out.data_ptr());
   if (dest == Dest::kSwizzled128x4) {
-    LaunchCsfExpand<Dest::kSwizzled128x4>(p, num_items, dst, stream);
+    LaunchCsfExpand<Dest::kSwizzled128x4>(p, num_items, static_cast<uint8_t*>(out.data_ptr()),
+                                          stream);
+  } else if (dest == Dest::kTransposed && bf16) {
+    LaunchCsfExpand<Dest::kTransposed>(p, num_items, static_cast<__nv_bfloat16*>(out.data_ptr()),
+                                       stream);
+  } else if (dest == Dest::kTransposed) {
+    LaunchCsfExpand<Dest::kTransposed>(p, num_items, static_cast<uint8_t*>(out.data_ptr()), stream);
+  } else if (bf16) {
+    LaunchCsfExpand<Dest::kLinear>(p, num_items, static_cast<__nv_bfloat16*>(out.data_ptr()),
+                                   stream);
   } else {
-    LaunchCsfExpand<Dest::kLinear>(p, num_items, dst, stream);
+    LaunchCsfExpand<Dest::kLinear>(p, num_items, static_cast<uint8_t*>(out.data_ptr()), stream);
   }
 }
