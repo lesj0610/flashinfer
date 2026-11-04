@@ -252,17 +252,25 @@ __device__ __forceinline__ void pred_load_128b_evict_first(void* smem, const voi
 __device__ __forceinline__ void copy_nvfp4(uint8_t* rows, const uint8_t* data, const uint8_t* sf,
                                            const Nvfp4Sources& s, uint32_t lane) {
   constexpr uint32_t kRowBytes = KvTraits<KvFormat::kNVFP4>::kRowBytes;
+  auto copy_scales = [&] {
+    if (lane < 16) {
+      pred_load_128b_evict_first(rows + lane * kRowBytes + kHeadDim / 2, sf + s.sf,
+                                 (s.valid >> 4) & 1u);
+    }
+  };
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Workaround: issued after the data rows, this copy compiles for sm_100+ to an LDGSTS that reads
-  // unset uniform registers and faults on SM12x.
-  if (lane < 16) {
-    pred_load_128b_evict_first(rows + lane * kRowBytes + kHeadDim / 2, sf + s.sf,
-                               (s.valid >> 4) & 1u);
-  }
+  // unset uniform registers and faults on SM100 and SM12x. Older targets keep the original order.
+  copy_scales();
+#endif
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
     pred_load_128b_evict_first(rows + (lane / 8 + 4 * i) * kRowBytes + 16 * (lane % 8),
                                data + s.data[i], (s.valid >> i) & 1u);
   }
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ < 1000)
+  copy_scales();
+#endif
 }
 
 // E2M1 x8 to BF16 times 2^120, and E4M3 x4 block scales to BF16 times 2^-120: both exact, and so
