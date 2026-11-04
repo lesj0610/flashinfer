@@ -454,6 +454,18 @@ struct MoeFCGemm {
     return IteratorScale(params, pointer_scale, extent, thread_id, threadblock_offset);
   }
 
+  /// Calls run(platform::integral_constant<int, K>{}) with K = live clamped to [1, MaxK].
+  template <int MaxK, typename Run>
+  CUTLASS_DEVICE static void run_with_live_m_blocks(int const live, Run&& run) {
+    if constexpr (MaxK > 1) {
+      if (live < MaxK) {
+        run_with_live_m_blocks<MaxK - 1>(live, run);
+        return;
+      }
+    }
+    run(platform::integral_constant<int, MaxK>{});
+  }
+
   CUTLASS_DEVICE
   void run_kernel_(Params const& params, SharedStorage& shared_storage) {
     //
@@ -577,7 +589,28 @@ struct MoeFCGemm {
                 {scale_row_extent, problem_size.n()}, thread_idx, tb_offset_scale,
                 params.group_size);
 
-        mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, iterator_scale, accumulators);
+        if constexpr (kE2m1B && Mma::Operator::MmaIterations::kRow >= 4) {
+          // Run only the mma operations of the warp tile's rows that cover problem rows, in a
+          // mainloop specialized for that count so no branch runs per mma. Broadcast from lane 0
+          // so the compiler sees a warp-uniform count and keeps the mma operations converged.
+          // Warp tiles with one or two rows of mma operations keep the single mainloop: one row
+          // leaves nothing to skip, and with two the specialized kernel measured slower.
+          using WarpMma = typename Mma::Operator;
+          int const warp_m =
+              warp_idx % (Mma::WarpCount::kM * Mma::WarpCount::kN) % Mma::WarpCount::kM;
+          int const warp_rows =
+              problem_size.m() - threadblock_offset.m() - warp_m * WarpMma::Shape::kM;
+          int const live_m_blocks = __shfl_sync(
+              0xffffffff,
+              (warp_rows + WarpMma::InstructionShape::kM - 1) / WarpMma::InstructionShape::kM, 0);
+          run_with_live_m_blocks<WarpMma::MmaIterations::kRow>(live_m_blocks, [&](auto live) {
+            mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, iterator_scale,
+                accumulators, live);
+          });
+        } else {
+          mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, iterator_scale,
+              accumulators);
+        }
       } else {
         mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
       }

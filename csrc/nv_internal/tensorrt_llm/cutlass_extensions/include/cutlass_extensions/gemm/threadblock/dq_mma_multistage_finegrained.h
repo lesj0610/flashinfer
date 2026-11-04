@@ -373,6 +373,7 @@ class DqMmaMultistage<Shape_, IteratorA_, SmemIteratorA_, CacheOpA, IteratorB_, 
   }
 
   /// Perform a threadblock-scoped matrix multiply-accumulate
+  template <int LiveMBlocks = Operator::MmaIterations::kRow>
   CUTLASS_DEVICE
   void operator()(
       ///< problem size of GEMM
@@ -386,7 +387,9 @@ class DqMmaMultistage<Shape_, IteratorA_, SmemIteratorA_, CacheOpA, IteratorB_, 
       ///< iterator over scale operand in global memory
       IteratorScale iterator_scale,
       ///< initial value of accumulator
-      FragmentC const& src_accum) {
+      FragmentC const& src_accum,
+      ///< rows of mma operations of the warp tile to run (all by default)
+      platform::integral_constant<int, LiveMBlocks> live_m_blocks = {}) {
     //
     // Prologue
     //
@@ -594,7 +597,7 @@ class DqMmaMultistage<Shape_, IteratorA_, SmemIteratorA_, CacheOpA, IteratorB_, 
 
         FragmentOperandB converted_frag_B_operand = Converter::convert(converted_frag_B);
         warp_mma(accum, warp_frag_A[warp_mma_k % 2], converted_frag_B_operand, accum,
-                 warp_tileB_k_compute_offset);
+                 warp_tileB_k_compute_offset, live_m_blocks);
 
         // Issue global->shared copies for the this stage
         if (warp_mma_k < Base::kWarpGemmIterations - 1) {
