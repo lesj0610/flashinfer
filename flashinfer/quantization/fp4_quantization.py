@@ -44,6 +44,7 @@ from ..jit import (
     sm90a_nvcc_flags,
 )
 from ..jit.cpp_ext import is_cuda_version_at_least
+from ..jit.fp4_quantization import gen_fp4_quantization_sm80_module
 from ..utils import (
     backend_requirement,
     device_support_pdl,
@@ -220,7 +221,9 @@ def gen_fp4_quantization_sm107_module() -> JitSpec:
 
 
 def gen_fp4_quantization_sm90_module() -> JitSpec:
-    return gen_fp4_quantization_module(sm90a_nvcc_flags, "90")
+    return gen_fp4_quantization_module(
+        sm90a_nvcc_flags + ["-DFLASHINFER_FP4_SW_CVT"], "90"
+    )
 
 
 def gen_fp4_quantization_sm110_module() -> JitSpec:
@@ -281,6 +284,10 @@ def get_fp4_quantization_module(backend: str = "100"):
         "103": gen_fp4_quantization_sm103_module,
         "100": gen_fp4_quantization_sm100_module,
         "90": gen_fp4_quantization_sm90_module,
+        "89": gen_fp4_quantization_sm80_module,
+        "87": gen_fp4_quantization_sm80_module,
+        "86": gen_fp4_quantization_sm80_module,
+        "80": gen_fp4_quantization_sm80_module,
     }
 
     # Prefer 'f' (family / feature-set) variant for SM12x when CUDA >= 12.9,
@@ -963,7 +970,7 @@ def silu_and_mul_nvfp4_quantize(
     r"""Apply SwiGLU and NVFP4 quantization in one CuTe-DSL kernel.
 
     Computes ``silu(input[..., :K]) * input[..., K:]`` before quantization.
-    Requires CuTe-DSL and an SM100+ GPU.
+    Requires CuTe-DSL and an SM80+ GPU.
 
     Parameters
     ----------
@@ -1009,12 +1016,12 @@ def silu_and_mul_nvfp4_quantize(
     k = input.shape[-1] // 2
     assert k % sf_vec_size == 0
 
-    # Reject pre-Blackwell GPUs before CuTe-DSL compilation.
+    # Reject unsupported GPUs before CuTe-DSL compilation.
     major, minor = get_compute_capability(input.device)
-    if major < 10:
+    if major < 8:
         raise RuntimeError(
-            "silu_and_mul_nvfp4_quantize requires a Blackwell GPU (SM100+, compute "
-            f"capability >= 10.0); got SM{major}{minor}."
+            "silu_and_mul_nvfp4_quantize requires an SM80+ GPU (compute capability "
+            f">= 8.0); got SM{major}{minor}."
         )
 
     from ..cute_dsl import is_cute_dsl_available
@@ -1093,7 +1100,7 @@ def fp4_quantize(
         Backend to use for quantization:
 
         - ``"cuda"``: stable CUDA kernel (default).
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM80+, **experimental**).
           Supported combinations:
 
           * ``sf_vec_size=16, sf_use_ue8m0=False``: all layouts,
@@ -1486,7 +1493,7 @@ def e2m1_and_ufp8sf_scale_to_float(
     major, minor = get_compute_capability(
         torch.device("cuda:0")
     )  # select any cuda device to get a compute capability
-    if major * 10 + minor < 90:
+    if major < 8:
         # No kernel available; use pure-PyTorch fallback
         return _e2m1_and_ufp8sf_scale_to_float_cpu(
             e2m1_tensor,
@@ -1609,7 +1616,7 @@ def nvfp4_quantize(
         Backend to use for quantization:
 
         - ``"cuda"``: stable CUDA kernel (default).
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**);
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM80+, **experimental**);
           supports all ``sfLayout`` values
           (``layout_128x4`` / ``layout_8x4`` / ``layout_linear``)
           and input dtypes fp16/bf16/float8_e4m3fn, but only
@@ -1892,7 +1899,7 @@ def mxfp4_quantize(
         Backend to use for quantization:
 
         - ``"cuda"``: stable CUDA kernel (default).
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM80+, **experimental**).
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Only used when
         ``backend == "cute-dsl"``.  Auto-detected from device capability
@@ -2417,7 +2424,7 @@ def get_fp4_kv_quantization_module():
 _NVFP4_BLOCK_SIZE = 16
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _nvfp4_kv_dequant_check(fp4_data, block_scales, global_scale, output_dtype=None):
     return True
 
@@ -2464,7 +2471,7 @@ def nvfp4_kv_dequantize(
     return output
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _nvfp4_paged_kv_dequant_check(*args, **kwargs):
     return True
 
@@ -2573,7 +2580,7 @@ def nvfp4_kv_dequantize_paged(
     )
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _nvfp4_kv_quant_check(input, global_scale):
     return True
 
@@ -2586,8 +2593,8 @@ def nvfp4_kv_quantize(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""GPU quantization to the NVFP4 KV-cache format with linear block-scale layout.
 
-    Requires SM100+ (Blackwell) for the ``cvt.rn.satfinite.e2m1x2.f32`` PTX
-    instruction.
+    Requires SM80+. Below SM100 the E2M1 conversion runs in software, with
+    the same results as the ``cvt.rn.satfinite.e2m1x2.f32`` PTX instruction.
 
     Parameters
     ----------

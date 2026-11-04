@@ -545,8 +545,8 @@ def test_trtllm_fp4_mxfp4_moe_valid_intermediate_size_matches_dequant_reference(
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
-    if get_compute_capability(torch.device("cuda"))[0] not in [10]:
-        pytest.skip("TRT-LLM MoE tests are only guaranteed on SM100/SM103 GPUs.")
+    if get_compute_capability(torch.device("cuda"))[0] not in [8, 9, 10]:
+        pytest.skip("TRT-LLM FP4 MoE tests are only guaranteed on SM80 to SM103 GPUs.")
 
     from flashinfer import ActivationType
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
@@ -756,8 +756,8 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
-    if get_compute_capability(torch.device("cuda"))[0] not in [10]:
-        pytest.skip("TRT-LLM MoE tests are only guaranteed on SM100/SM103 GPUs.")
+    if get_compute_capability(torch.device("cuda"))[0] not in [8, 9, 10]:
+        pytest.skip("TRT-LLM FP4 MoE tests are only guaranteed on SM80 to SM103 GPUs.")
 
     from flashinfer import ActivationType
     from flashinfer.fp4_quantization import block_scale_interleave
@@ -1074,8 +1074,8 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
 def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
-    if get_compute_capability(torch.device("cuda"))[0] not in [10]:
-        pytest.skip("TRT-LLM MoE tests are only guaranteed on SM100/SM103 GPUs.")
+    if get_compute_capability(torch.device("cuda"))[0] not in [8, 9, 10]:
+        pytest.skip("TRT-LLM FP4 MoE tests are only guaranteed on SM80 to SM103 GPUs.")
 
     from flashinfer import ActivationType
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe

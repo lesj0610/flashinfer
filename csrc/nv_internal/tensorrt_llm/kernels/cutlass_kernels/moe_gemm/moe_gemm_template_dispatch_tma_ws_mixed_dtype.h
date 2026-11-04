@@ -91,10 +91,21 @@ void sm90_dispatch_mainloop_schedules(
     return;
   }
 
+  constexpr bool use_exact_block_scale =
+      ScaleMode == cutlass::gemm::collective::MixedInputScaleMode::kExactBlockE8M0;
+  constexpr int tile_n = get<1>(CTAShape{});
+  constexpr bool exact_block_tile =
+      get<0>(CTAShape{}) == 128 && get<2>(CTAShape{}) == 128 &&
+      (tile_n == 16 || tile_n == 32 || tile_n == 64 || tile_n == 128 || tile_n == 256);
   switch (inputs.gemm_config.mainloop_schedule) {
     case tkc::MainloopScheduleType::COOPERATIVE:
       if constexpr (get<0>(CTAShape{}) < 128) {
         TLLM_THROW("COOPERATIVE is only enabled when tile M >= 128.");
+      } else if constexpr (use_exact_block_scale &&
+                           (!exact_block_tile || cute::size(ClusterShape{}) != 1)) {
+        TLLM_THROW(
+            "Exact block exponents only use 128xNx128 tiles, N in {16, 32, 64, 128, 256}, "
+            "without clusters.");
       } else {
         sm90_generic_mixed_moe_gemm_kernelLauncher<
             T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape,
@@ -106,12 +117,16 @@ void sm90_dispatch_mainloop_schedules(
 
       break;
     case tkc::MainloopScheduleType::PINGPONG:
-      sm90_generic_mixed_moe_gemm_kernelLauncher<
-          T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape,
-          cutlass::gemm::KernelTmaWarpSpecializedPingpong,
-          cutlass::epilogue::TmaWarpSpecializedCooperative,
-          cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, ScaleMode>(inputs, hopper_inputs,
-                                                                         sm_count_, workspace_size);
+      if constexpr (use_exact_block_scale) {
+        TLLM_THROW("Exact block exponents only use the cooperative schedule.");
+      } else {
+        sm90_generic_mixed_moe_gemm_kernelLauncher<
+            T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape,
+            cutlass::gemm::KernelTmaWarpSpecializedPingpong,
+            cutlass::epilogue::TmaWarpSpecializedCooperative,
+            cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, ScaleMode>(
+            inputs, hopper_inputs, sm_count_, workspace_size);
+      }
       break;
     default:
       TLLM_THROW(
@@ -248,6 +263,8 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
   static constexpr auto ScaleMode =
       Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0
           ? cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0
+      : Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act
+          ? cutlass::gemm::collective::MixedInputScaleMode::kExactBlockE8M0
           : cutlass::gemm::collective::MixedInputScaleMode::kPostMma;
 
 #define DISPATCH_MIXED_DTYPE_MOE_TILE(ENUM_NAME, TILE_M, TILE_N, TILE_K)                    \
@@ -355,15 +372,20 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_
   static constexpr auto ScaleMode =
       Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0
           ? cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0
+      : Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act
+          ? cutlass::gemm::collective::MixedInputScaleMode::kExactBlockE8M0
           : cutlass::gemm::collective::MixedInputScaleMode::kPostMma;
+  using WorkspaceTile =
+      std::conditional_t<ScaleMode ==
+                             cutlass::gemm::collective::MixedInputScaleMode::kExactBlockE8M0,
+                         Shape<_128, _128, _128>, Shape<_128, _64, _Ktile>>;
 
 #ifdef COMPILE_HOPPER_TMA_GROUPED_GEMMS
   GroupedGemmInput<T, WeightType, OutputType, OutputType> inputs{};
   inputs.num_experts = num_experts;
   sm90_generic_mixed_moe_gemm_kernelLauncher<
-      T, WeightType, OutputType, tensorrt_llm::cutlass_extensions::EpilogueOpDefault,
-      Shape<_128, _64, _Ktile>, Shape<_1, _1, _1>,
-      cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+      T, WeightType, OutputType, tensorrt_llm::cutlass_extensions::EpilogueOpDefault, WorkspaceTile,
+      Shape<_1, _1, _1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative,
       cutlass::epilogue::TmaWarpSpecializedCooperative,
       cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, ScaleMode>(
       inputs, TmaWarpSpecializedGroupedGemmInput{}, sm_count_, &count);

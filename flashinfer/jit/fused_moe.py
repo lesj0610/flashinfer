@@ -172,6 +172,7 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
         "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         "-DCUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1",
+        "-DFLASHINFER_FP4_SW_CVT",
     ]
     module_name = None
     if _should_enable_sm90_moe_prebuilt_d_descriptor():
@@ -182,14 +183,32 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
     )
 
 
+# SM80 to SM89: NVFP4 runs on the SM80 16-bit x E2M1 kernels, with the FP4 conversions in software.
+_SM8X_NVCC_FLAGS = [
+    "-DENABLE_BF16",
+    "-DENABLE_FP8",
+    "-DUSING_OSS_CUTLASS_MOE_GEMM",
+    "-DENABLE_FP4",
+    "-DFLASHINFER_FP4_SW_CVT",
+    "-DFLASHINFER_FP4_QUANT_NO_TMA",
+]
+
+
 def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = sm89_nvcc_flags + [
-        "-DENABLE_BF16",
-        "-DENABLE_FP8",
         "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
-        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+        *_SM8X_NVCC_FLAGS,
     ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "89", use_fast_build)
+
+
+def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[8]
+    )
+    return gen_cutlass_fused_moe_module(
+        nvcc_flags + _SM8X_NVCC_FLAGS, "80", use_fast_build
+    )
 
 
 def gen_cutlass_fused_moe_module(
@@ -271,6 +290,11 @@ def gen_cutlass_fused_moe_module(
         / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
         jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
     ]
+    if "-DFLASHINFER_FP4_SW_CVT" in nvcc_flags:
+        # Below SM100 the NVFP4 input is quantized with the FP4 quantization kernels.
+        sources.append(
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu"
+        )
 
     return gen_jit_spec(
         module_name or f"fused_moe_{device_arch}",
@@ -502,7 +526,7 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
         "-DENABLE_FP8",
         "-DENABLE_FP4",
     ] + current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 12]
+        supported_major_versions=[8, 9, 10, 12]
     )
 
     return gen_jit_spec(
