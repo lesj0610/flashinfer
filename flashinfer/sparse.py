@@ -2292,16 +2292,18 @@ class VariableBlockSparseAttentionWrapper:
 
 
 def _qsa_auto_backend(device: torch.device) -> str:
-    """The route ``backend="auto"`` takes for an NVFP4 cache: ``"cake"`` on a compute capability
-    the Cake package exports a library for (``cake_jit.ARCH_BY_CAPABILITY``: 8.x, 9.0, 10.0, 10.3,
-    10.7 and 12.0, capability-exact); ``"default"`` anywhere else, so the reference implementation
-    runs on 11.0 and 12.1 (12.1 until the package ships for it) and reports any older device as
-    unsupported."""
+    """The route ``backend="auto"`` takes for an NVFP4 cache: ``"default"`` on compute capability
+    8.x and 9.0; ``"cake"`` on any other capability the Cake package exports a library for
+    (``cake_jit.ARCH_BY_CAPABILITY``: 10.0, 10.3, 10.7 and 12.0, capability-exact); ``"default"``
+    anywhere else, so the reference implementation runs on 11.0 and 12.1 (12.1 until the package
+    ships for it) and reports any other device as unsupported."""
     if device.type != "cuda":
+        return "default"
+    capability = get_compute_capability(device)
+    if capability[0] in (8, 9):
         return "default"
     from .experimental.cake_qsa_nvfp4.cake_jit import arch_for_capability
 
-    capability = get_compute_capability(device)
     return "cake" if arch_for_capability(capability) is not None else "default"
 
 
@@ -2358,12 +2360,13 @@ def qsa_sparse_paged_attention(
         NVFP4 only: E4M3 block scales ``[num_blocks, page_size, num_kv_heads, 16]``, one per 16
         dims.
     backend : str
-        ``"auto"`` (the default) runs NVFP4 on the Cake kernels of
-        :mod:`flashinfer.experimental.cake_qsa_nvfp4` on every compute capability the
-        package exports a library for (8.x, 9.0 and 12.0 on the ``mma.sync`` programs; 10.0,
-        10.3 and 10.7 on the tcgen05 programs; the table is capability-exact, so 12.1 is
-        not included), and on the reference implementation anywhere else, such as 11.0
-        and 12.1; FP8 and BF16 always run on the reference implementation. ``"cake"`` selects
+        ``"auto"`` (the default) runs NVFP4 on the reference implementation on compute
+        capability 8.x and 9.0, on the Cake kernels of
+        :mod:`flashinfer.experimental.cake_qsa_nvfp4` on the other capabilities the
+        package exports a library for (12.0 on the ``mma.sync`` programs; 10.0, 10.3 and
+        10.7 on the tcgen05 programs; the table is capability-exact, so 12.1 is not
+        included), and on the reference implementation anywhere else, such as 11.0 and
+        12.1; FP8 and BF16 always run on the reference implementation. ``"cake"`` selects
         the Cake kernels (the same contract, their own split and merge plan) and
         ``"default"`` the reference implementation explicitly. The Cake kernels'
         results agree with the reference implementation within the test tolerances
