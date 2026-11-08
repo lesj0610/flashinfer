@@ -391,7 +391,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     here: the keyword-only ``p_rule`` on the GDN side, the private test hook on the KDA side)."""
     from tests.test_helpers.cake_package import cake_package
 
-    kp = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")  # the test only
+    kp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")  # the test only
     # the KDA module accepts its private test hook only after its opt-in (enable_test_knobs)
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     with open(path) as fh:
@@ -400,7 +400,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     W = int(row["cp"])
     args = _partition_inputs(row)
     part = gp.cake_gdn_nondet_train_kcp_partition(**args)
-    kpart = kp.partition_det_kcp(**args)
+    kpart = kp.cake_kda_det_train_kcp_partition(**args)
     assert part.to_dict() == kpart.to_dict(), "partition differs from the KDA module"
     assert _plain(part.to_dict()["fragments"]) == row["fragments"], (
         "partition differs from the row of record"
@@ -421,7 +421,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
         ctx = gp.cake_gdn_nondet_train_kcp_build_context(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="wave_fill1"
         )  # the per-rank rule both modules share; the GDN default "row_cost" is tested on the rows below
-        kctx = kp.build_context_det_kcp(
+        kctx = kp.cake_kda_det_train_kcp_build_context(
             kpart,
             None,
             r,

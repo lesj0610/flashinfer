@@ -1440,6 +1440,335 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         None,
         False,
     ),
+    # The sm103a builds of the same programs with the 4-stage K/V ring and
+    # each stage's P tile in the other stage's S columns.
+    ("context_fp8", "RUNTIME_PACK1_NC_PX"): (
+        "cake_fmha_context_fp8_3f05abdd0dfb416998fd",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_PX"): (
+        "cake_fmha_context_fp8_43829028305fe1296e79",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_PX"): (
+        "cake_fmha_context_fp8_03f683a3fe844acad53a",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_PX"): (
+        "cake_fmha_context_fp8_0c8c4520324b57450d68",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_NC_PX"): (
+        "cake_fmha_context_fp8_949b803cd8ef3e4ee015",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_NC_PX"): (
+        "cake_fmha_context_fp8_11a387bdb94e731b4a81",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_NC_PX"): (
+        "cake_fmha_context_fp8_a6eaaef29b42f9602206",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_NC_PX"): (
+        "cake_fmha_context_fp8_05047f777e8265009b0d",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_NC_PX"): (
+        "cake_fmha_context_fp8_e386241abbbca476ce27",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_LSE_PX"): (
+        "cake_fmha_context_fp8_f907e36ece76575a53d1",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_LSE_PX"): (
+        "cake_fmha_context_fp8_1aba28a73173872fd3fb",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_LSE_PX"): (
+        "cake_fmha_context_fp8_31badec3271fcbce787d",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_LSE_PX"): (
+        "cake_fmha_context_fp8_6b73d5dc4ae4c91c8a91",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_LSE_PX"): (
+        "cake_fmha_context_fp8_4fc03e35f070593d5604",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_LSE_PX"): (
+        "cake_fmha_context_fp8_93267992d47af41601f2",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_LSE_PX"): (
+        "cake_fmha_context_fp8_85a868e1aeda0e3ad931",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_LSE_PX"): (
+        "cake_fmha_context_fp8_f60026397cd113a89c4a",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_LSE_PX"): (
+        "cake_fmha_context_fp8_153db10be76831301707",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_SINK_PX"): (
+        "cake_fmha_context_fp8_06551cbf9595d0fec9b2",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_SINK_PX"): (
+        "cake_fmha_context_fp8_2eb08cfd64f065c2923d",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_SINK_PX"): (
+        "cake_fmha_context_fp8_d9f12a7798a4ef48f3fc",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_SINK_PX"): (
+        "cake_fmha_context_fp8_4218bd247b760dcb8ebd",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_SINK_PX"): (
+        "cake_fmha_context_fp8_5135dab25ffdbce365c9",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_SINK_PX"): (
+        "cake_fmha_context_fp8_3b4d3e7797632fd340d8",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_SINK_PX"): (
+        "cake_fmha_context_fp8_c828c717314b2c30ecdb",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_SINK_PX"): (
+        "cake_fmha_context_fp8_2448bba5c99b727f7bba",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_SINK_PX"): (
+        "cake_fmha_context_fp8_64f3ba3f829afe2a9c81",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_87118ffc6e2fd677b465",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_ae7ec9d64660cc3b1e3c",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_4615c4178898a152657b",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_f579d90a5bdd681b22f9",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_8629ad04ca06ccd1ecd6",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_f3a595de408fa3d2ad51",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_960bf6763c0cfbeae654",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_46865ca87d422fdec925",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_79a7946155bc3993b289",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_f5fa3bfd3b00fd44fabc",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_ebf8d7837e7123a08abe",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_f35f2ffe6db82fbabebf",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_adb2255214f458a9ec66",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_909439ede445c07be428",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_ffd4f84506eb37625918",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_1c6b259c9c16a55a3ace",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_0a4c6a377884f71460b7",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_48b599fe731a4ce66d7b",
+        None,
+        False,
+    ),
+    # Their sm103a one-stage builds of packs 1, 2, 4 and 8
+    # (_CONTEXT_FP8_FORM_ONE_STAGE_ROUTES).
+    ("context_fp8", "RUNTIME_PACK1_NC_PX_Q1"): (
+        "cake_fmha_context_fp8_8e82b164f633739b5629",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_PX_Q1"): (
+        "cake_fmha_context_fp8_e93a40c1207c92f87a57",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_PX_Q1"): (
+        "cake_fmha_context_fp8_3a283b3a3d8e2458600a",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_PX_Q1"): (
+        "cake_fmha_context_fp8_0d8e81c1e5cc25d494be",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_6cb0aa1bc299570e3bb6",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_a5fe9901f54f0f82983e",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_a20192c91fa6463266af",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_67e4a476e798c6ef5eab",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_42a34f611e416b95f3c4",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_70a1f8d6422b88b2a5d1",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_a8f20df7b8e78c71187b",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_340f1b13ef6db66a4819",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_NC_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_f39420f79b571a0d7e68",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_94e7c483b24b790cc3ee",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_aaafe5a028f797974fcd",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_51fbdbb46101ec85a10c",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_NC_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_9d57fae5c177b84f333c",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_56ed41488640572f208c",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_9633967d1993341e9e9e",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_cdfe342fcf2ea3cd54e1",
+        None,
+        False,
+    ),
     # The FP8 split-KV programs: the runtime-size arguments, then the split plan.
     ("context_fp8", "RUNTIME_SK_PACK8"): (
         "cake_fmha_context_fp8_2b603161717df80f5fad",
@@ -1725,17 +2054,6 @@ _CONTEXT_RUNTIME_FLAG_ROUTES: dict[
         (False, True, False): _CONTEXT_BF16_RUNTIME_NONCAUSAL_LSE_ROUTES,
     },
 }
-# The runtime-size BF16 programs of the flag forms (every form but the causal
-# one without LSE or sink): they run the units past the last whole section in
-# the plain order and take no tail-order bit
-# (:data:`_CONTEXT_BF16_TAIL_INTERLEAVE`).
-_CONTEXT_BF16_FLAG_FORM_PROGRAMS = frozenset(
-    name
-    for form, routes in _CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"].items()
-    if form != (True, False, False)
-    for table in routes.values()
-    for name in table.values()
-)
 # Per target, ``(queries, keys)``: a causal BF16 call without LSE or sink at a
 # JIT pack above 1 whose ``max_q_len`` is a power of two of at least
 # ``queries``, over at least ``keys`` cache keys, keeps the JIT module.  The
@@ -1832,6 +2150,32 @@ _CONTEXT_BF16_RUNTIME_FLAG_BOUNDS: dict[
         },
     },
 }
+# Per target and mask, per JIT pack: further calls of the other flag forms the
+# runtime-size BF16 programs serve past :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`,
+# as boxes ``(batch, keys, query x keys, work)``: a call of at most ``batch``
+# requests, at most ``keys`` cache keys, at most that ``max_q_len *
+# max_kv_len`` and at most ``work`` of ``batch_size * num_q_heads * max_q_len *
+# max_kv_len`` takes its form's program (``None``: no bound).  Within each box
+# the programs ran faster than the JIT module beyond the A/A band in every
+# layout timed (10 layouts; 2 for the B200 rows of 1, 64, 1000 and over 8192
+# queries).  B200, causal pack 8, one request: 1 .. 32768 queries x 6145 ..
+# 8192 keys at 8 .. 64 query heads.  GB300, causal pack 1: 1 .. 128 requests
+# x 32 .. 16384 queries x 16384 keys at 8 .. 32 heads; not causal pack 16:
+# 1 .. 16 requests x 512 .. 16384 queries x 4096 .. 16384 keys at 64 and 128
+# query heads.  Sinks and LSE alike.
+_CONTEXT_BF16_RUNTIME_FLAG_BOXES: dict[
+    str,
+    dict[
+        bool,
+        dict[int, tuple[tuple[int | None, int | None, int | None, int | None], ...]],
+    ],
+] = {
+    "sm100a": {True: {8: ((1, 8192, None, 1 << 32),)}},
+    "sm103a": {
+        True: {1: ((None, 16384, None, 1 << 32),)},
+        False: {16: ((None, None, 1 << 26, 1 << 33),)},
+    },
+}
 # Short sm103a launches keep each stage's P tile in its own S columns: the
 # program an exact, runtime-size or (every page size) one-stage route names
 # maps to the same schedule and arguments with the default P placement, for
@@ -1890,11 +2234,15 @@ _CONTEXT_FP8_FORMS: dict[tuple[bool, bool, bool], str] = {
 # Per target, ``(form, pack_g, page_size)`` -> the runtime-size program of an
 # FP8 call of that form (``None``: every page size): the program of its pack
 # (:func:`_context_fp8_runtime_form_pack`), the 3-stage K/V ring with each
-# stage's P tile in its own S columns on both targets.  It writes the LSE (log2
-# units, one float per query row and head) or reads the sinks of the call.
+# stage's P tile in its own S columns on sm100a, and on sm103a the 4-stage
+# ring with each stage's P tile in the other stage's S columns, as for the
+# causal call without LSE or sink (the same arithmetic; its launches of at
+# most 128 keys take the program with P in its own S columns,
+# ``_CONTEXT_FP8_SHORT_KV_ROUTES``).  It writes the LSE (log2 units, one
+# float per query row and head) or reads the sinks of the call.
 _CONTEXT_FP8_RUNTIME_FORM_ROUTES: dict[str, dict[tuple[str, int, int | None], str]] = {
     target: {
-        (form, pack, None): f"RUNTIME_PACK{pack}_{form}"
+        (form, pack, None): f"RUNTIME_PACK{pack}_{form}{suffix}"
         for form in _CONTEXT_FP8_FORMS.values()
         for pack in (
             1,
@@ -1902,7 +2250,27 @@ _CONTEXT_FP8_RUNTIME_FORM_ROUTES: dict[str, dict[tuple[str, int, int | None], st
             *_CONTEXT_FP8_RUNTIME_OWN_PACKS,
         )
     }
-    for target in ("sm100a", "sm103a")
+    for target, suffix in (("sm100a", ""), ("sm103a", "_PX"))
+}
+_CONTEXT_FP8_SHORT_KV_ROUTES["sm103a"] |= {
+    program: (program.removesuffix("_PX"), 128)
+    for program in _CONTEXT_FP8_RUNTIME_FORM_ROUTES["sm103a"].values()
+}
+# Per target, ``(form, pack_g, page_size)`` -> the one-stage program of an FP8
+# call of that form (one 128-row query stage per tile, an m-block of ``128 /
+# pack_g`` query tokens): the call takes it in place of its form program
+# where every tile holds at most one stage of query tokens (``max_q_len <=
+# 128 / pack_g``: the two-stage tile's second stage holds no row, so the
+# tile's rows, key blocks and arithmetic are the same) and it has more keys
+# than the form program's short-KV entry.
+_CONTEXT_FP8_FORM_ONE_STAGE_ROUTES: dict[
+    str, dict[tuple[str, int, int | None], str]
+] = {
+    "sm103a": {
+        (form, pack, None): f"RUNTIME_PACK{pack}_{form}_PX_Q1"
+        for form in _CONTEXT_FP8_FORMS.values()
+        for pack in (1, *_CONTEXT_FP8_RUNTIME_PACKS[::-1])
+    },
 }
 # Per target, the most tiles of a short-KV call (one 128-key block per tile,
 # served by a short-KV one-stage program) at which it takes the smallest pack
@@ -2047,6 +2415,11 @@ _CONTEXT_FP8_ONE_STAGE_PROGRAMS = frozenset(
 )
 _CONTEXT_FP8_ONE_STAGE_PROGRAMS |= frozenset(
     name
+    for routes in _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES.values()
+    for name in routes.values()
+)
+_CONTEXT_FP8_ONE_STAGE_PROGRAMS |= frozenset(
+    name
     for routes in _CONTEXT_FP8_ONE_WAVE_ROUTES.values()
     for program, name in routes.items()
     if program in _CONTEXT_FP8_ONE_STAGE_PROGRAMS
@@ -2145,12 +2518,13 @@ _CONTEXT_BF16_RUNTIME_PARAMS = (
     "page_shift",
 )
 
-# The tail order of a causal runtime-size BF16 launch.  Its work units past the
-# last whole 8-unit section run one unit's m-blocks after another, or, with
-# this bit of ``full_sections`` set, interleaved like a section: every tail
-# unit's m-block, the largest first.  The order moves no tile's work, so the
-# output is the same bit for bit; the launch takes the order of the shorter
-# modelled makespan (:func:`_context_bf16_tail_interleave`).
+# The tail order of a causal runtime-size BF16 launch, with or without sinks
+# or an LSE output.  Its work units past the last whole 8-unit section run one
+# unit's m-blocks after another, or, with this bit of ``full_sections`` set,
+# interleaved like a section: every tail unit's m-block, the largest first.
+# The order moves no tile's work, so the output is the same bit for bit; the
+# launch takes the order of the shorter modelled makespan
+# (:func:`_context_bf16_tail_interleave`).
 _CONTEXT_BF16_TAIL_INTERLEAVE = 1 << 31
 # The tail-order model: a tile costs its KV blocks plus this many; the
 # interleaved order must be shorter by this fraction; a launch of more waves
@@ -8546,11 +8920,26 @@ def select_cake_fmha_context_route(
             program = forms.get((form, pack, page_size)) or forms.get(
                 (form, pack, None)
             )
+            # A call of at most the keys of the program's short-KV entry: the
+            # entry's program (the same schedule, pack, m-blocks and arguments).
+            short = _CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {}).get(program)
+            stages = 2
+            if short and max_kv_len <= short[1]:
+                program = short[0]
+            elif program is not None and max_q_len <= 128 // pack:
+                # A call whose tiles hold at most one stage of query tokens:
+                # the one-stage program of its form and pack, where the
+                # target names one.
+                form_one_stage = _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES.get(target, {}).get(
+                    (form, pack, None)
+                )
+                if form_one_stage is not None:
+                    program, stages = form_one_stage, 1
             if program is not None:
                 pack_g = pack
                 tok_per_stage = 128 // pack
-                num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (
-                    2 * tok_per_stage
+                num_m_blocks = (max_q_len + stages * tok_per_stage - 1) // (
+                    stages * tok_per_stage
                 )
                 total_bh = batch_size * (num_q_heads // pack)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
@@ -8559,7 +8948,8 @@ def select_cake_fmha_context_route(
     # JIT pack and page size in that form's table (the same tile work as the
     # JIT module of the form): the causal form without LSE or sink except the
     # power-of-two query lengths of :data:`_CONTEXT_BF16_RUNTIME_POW2_Q`, the
-    # other forms within the bounds of :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`.
+    # other forms within the bounds of :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`
+    # or a box of :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOXES`.
     flag_form = (is_causal, lse is not None, sinks is not None)
     runtime_form = (
         _CONTEXT_RUNTIME_FLAG_ROUTES.get(component, {}).get(flag_form, {}).get(target)
@@ -8583,15 +8973,31 @@ def select_cake_fmha_context_route(
         if component == "context_bf16" and not plain
         else (None, None, None)
     )
+    work = batch_size * num_q_heads * max_q_len * max_kv_len
+    boxes = (
+        _CONTEXT_BF16_RUNTIME_FLAG_BOXES.get(target, {})
+        .get(is_causal, {})
+        .get(pack_g, ())
+        if component == "context_bf16" and not plain
+        else ()
+    )
     if (
         program is None
         and runtime_form
         and not jit_pow2
-        and (bound_keys is None or max_kv_len <= bound_keys)
-        and (bound_area is None or max_q_len * max_kv_len <= bound_area)
         and (
-            bound_work is None
-            or batch_size * num_q_heads * max_q_len * max_kv_len <= bound_work
+            (
+                (bound_keys is None or max_kv_len <= bound_keys)
+                and (bound_area is None or max_q_len * max_kv_len <= bound_area)
+                and (bound_work is None or work <= bound_work)
+            )
+            or any(
+                (box_batch is None or batch_size <= box_batch)
+                and (box_keys is None or max_kv_len <= box_keys)
+                and (box_area is None or max_q_len * max_kv_len <= box_area)
+                and (box_work is None or work <= box_work)
+                for box_batch, box_keys, box_area, box_work in boxes
+            )
         )
     ):
         program = runtime_form.get((pack_g, page_size)) or runtime_form.get(
@@ -8872,7 +9278,6 @@ class CakeFmhaContextProgramModule:
                     | (
                         _CONTEXT_BF16_TAIL_INTERLEAVE
                         if is_causal
-                        and route.program not in _CONTEXT_BF16_FLAG_FORM_PROGRAMS
                         and _context_bf16_tail_interleave(
                             int(batch_size),
                             int(max_q_len),

@@ -28,9 +28,10 @@ row and rank:
 - the multi handle retains exactly the n history pools (``nbytes`` and the allocator's bytes after the forward);
 - ``graph="replay"`` of the multi forward / backward is bitwise the eager single calls on every call.
 
-Launch forms as ``test_cake_causal_conv1d_det_train_kcp_dist.py``: ``torch.multiprocessing`` (``pytest``: skipped when
-fewer than ``W`` CUDA devices are visible) and one process per Slurm task (``SLURM_NTASKS == W``; the rendezvous from
-``MASTER_ADDR`` / ``MASTER_PORT``; rows of another ``W`` are skipped under a multi-task step).
+``ROWS`` are W = 2 / 4 / 8; ``ROWS_SCALE`` adds a W = 16 per-document zigzag row.  Launch forms as
+``test_cake_causal_conv1d_det_train_kcp_dist.py``: ``torch.multiprocessing`` (``pytest``: skipped when fewer than ``W``
+CUDA devices are visible) and one process per Slurm task (``SLURM_NTASKS == W``; the rendezvous from ``MASTER_ADDR`` /
+``MASTER_PORT``; rows of another ``W`` are skipped under a multi-task step).
 """
 
 from __future__ import annotations
@@ -40,7 +41,6 @@ import gc
 import json
 import os
 import tempfile
-import types
 
 import pytest
 import torch
@@ -71,6 +71,11 @@ ROWS = [
     ((2048, 5, 3000, 1), 8, "zigzag_per_document", (384, 384, 384)),
     ((6, 1, 2, 3, 4000), 8, "ragged:1,1,1,3,0,2,4000,4", (256, 128, 256)),
 ]
+# W = 16 per-document zigzag (a layer's three convolutions at 16-way context parallelism); kept out of ``ROWS``
+# (other suites import it).
+ROWS_SCALE = [
+    ((2048, 5, 3000, 1), 16, "zigzag_per_document", (384, 384, 384)),
+]
 GRAPH_ROWS = [ROWS[0], ROWS[5], ROWS[8]]
 TENSORS = ("y", "dx", "dw")
 
@@ -95,7 +100,9 @@ def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 def _setup(rank: int, W: int, row, port: int, local_id: int):
-    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp_plan as plan
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp import (
+        cake_kcp_plan as plan,
+    )
 
     lengths, _w, layout, Cs = row
     device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
@@ -104,8 +111,8 @@ def _setup(rank: int, W: int, row, port: int, local_id: int):
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", str(port))
         dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
-    part, cu = _partition(plan, lengths, W, layout)
-    ctx = plan.build_context_det_kcp(
+    part, cu = _partition(plan.cake_kda_det_train_kcp_partition, lengths, W, layout)
+    ctx = plan.cake_kda_det_train_kcp_build_context(
         part, dist.group.WORLD, rank, device, conv_kernel_size=WIDTH
     )
     g = torch.Generator(device="cpu").manual_seed(7815)
@@ -349,11 +356,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
         cake_kcp_plan as gplan,
     )
 
-    # ``_partition`` reads the partition function under the KDA plan module's name
-    gdn_plan = types.SimpleNamespace(
-        partition_det_kcp=gplan.cake_gdn_det_train_kcp_partition
-    )
-    gpart, _ = _partition(gdn_plan, row[0], W, row[2])
+    gpart, _ = _partition(gplan.cake_gdn_det_train_kcp_partition, row[0], W, row[2])
     gctx = gplan.cake_gdn_det_train_kcp_build_context(
         gpart, dist.group.WORLD, rank, device
     )
@@ -482,7 +485,7 @@ def _launch(row, graph: bool) -> None:
     assert report["pass"], report
 
 
-@pytest.mark.parametrize("row", ROWS, ids=_row_id)
+@pytest.mark.parametrize("row", ROWS + ROWS_SCALE, ids=_row_id)
 def test_multi_rows(row) -> None:
     """Bitwise against the single calls and per-phase collective counts (module docstring)."""
     _launch(row, graph=False)

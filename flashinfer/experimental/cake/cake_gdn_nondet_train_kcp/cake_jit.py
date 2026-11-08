@@ -92,7 +92,7 @@ The light backward's solve-free replay of #1 (``save_mode="light_akk"``, which k
                              ``akk`` read, not written; grid (NC, H_qk), two resident CTAs per SM as #1
 
 Provenance of the rules: ``flashinfer/experimental/cake_kda_train/cake_kcp_jit.py`` (now
-``flashinfer/experimental/cake_kda_det_train_kcp/cake_kcp_jit.py``; records_of_program,
+``flashinfer/experimental/cake/cake_kda_det_train_kcp/cake_kcp_jit.py``; records_of_program,
 select_record, launch_grid; sha256 c405e7dcd36c9cbe0ff01e3e3194fd760491504655bda28a646c2067a23b4c90) at
 FlashInfer 13d7fcf4041635f5b7f573bb0dbab23570ae1034, adapted to the GDN vocabulary; the loader glue moved to
 :mod:`.cake_backend`.
@@ -1387,7 +1387,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 1, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_gdn_train_85572b8a5cfbc960fd3c_kcp",
+        "kernel_symbol": "kernel_cake_gdn_train_99188218c943435780ea_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1395,7 +1395,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_gdn_train_85572b8a5cfbc960fd3c_kcp",
+        "library": "cake_gdn_train_99188218c943435780ea_kcp",
         "logical": {
             "aqk_tma": "aqk",
             "chunk_bos": "chunk_bos",
@@ -1453,7 +1453,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_gdn_train_68f80b7d8e094ebad01b_kcp",
+        "kernel_symbol": "kernel_cake_gdn_train_1dbb3715625ef542df16_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1461,7 +1461,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_gdn_train_68f80b7d8e094ebad01b_kcp",
+        "library": "cake_gdn_train_1dbb3715625ef542df16_kcp",
         "logical": {
             "aqk_tma": "aqk",
             "chunk_bos": "chunk_bos",
@@ -1521,7 +1521,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 1, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_gdn_train_50b62e87f043cb1972a5_kcp",
+        "kernel_symbol": "kernel_cake_gdn_train_52a061bccbd13469cec9_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1529,7 +1529,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_gdn_train_50b62e87f043cb1972a5_kcp",
+        "library": "cake_gdn_train_52a061bccbd13469cec9_kcp",
         "logical": {
             "aqk_tma": "aqk",
             "chunk_bos": "chunk_bos",
@@ -1591,7 +1591,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_gdn_train_14d0fc16ec0f86066751_kcp",
+        "kernel_symbol": "kernel_cake_gdn_train_926cde5479ddbd1a589a_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1599,7 +1599,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_gdn_train_14d0fc16ec0f86066751_kcp",
+        "library": "cake_gdn_train_926cde5479ddbd1a589a_kcp",
         "logical": {
             "aqk_tma": "aqk",
             "chunk_bos": "chunk_bos",

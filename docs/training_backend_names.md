@@ -16,6 +16,7 @@ run-to-run bitwise results.
 1. **Module:** `flashinfer.cake_<op>_<mode>_train[_kcp]`. `mode` is `det` or `nondet`.
    - The public facade module always sits at the top level of `flashinfer`.
    - The backend package always sits at `flashinfer/experimental/cake/<module>/`.
+   - Exception: a `_kcp` route may live in the backend package of its single-rank module as a submodule (`kcp.py`, `kcp_jit.py`). This applies when the route runs the single-rank programs and adds only its own boundary work. The route's libraries are then listed in that package's `build.json`. The `_kcp` facade still sits at the top level and imports the submodule lazily. Today only causal conv1d uses this form: its KCP route is the single-rank convolution plus a halo exchange, and a separate package would have to either copy the single-rank programs or import across packages.
 2. **Autograd functional:** `cake_<op>_<mode>[_kcp]`.
 3. **Autograd class:** `Cake<Op><Mode>[Kcp]Function`.
 4. **Other functions:** the module name plus `_<verb>`, for example `_forward`, `_backward`, `_forward_workspace_bytes`, `_partition` or `_build_context`.
@@ -51,7 +52,7 @@ Module names are under `flashinfer.`. "Planned" marks versions that do not exist
 | mHC | det | single rank | `cake_mhc_det_train` | `cake_mhc_det_train_prepare`, `cake_mhc_det_train_finish` | `CakeMHCDetPrepareFunction`, `CakeMHCDetFinishFunction` | functions unchanged; classes `CakeMHCDetTrain*Function` |
 | | nondet | single rank | `cake_mhc_nondet_train` | `cake_mhc_nondet_train_prepare`, `cake_mhc_nondet_train_finish` | `CakeMHCNondetPrepareFunction`, `CakeMHCNondetFinishFunction` | `experimental.cake.cake_mhc_train` / `cake_mhc_train_*` |
 | mHC head | det | single rank | `cake_mhc_head_det_train` | `cake_mhc_head_det` | `CakeMHCHeadDetFunction` | `cake_mhc_det_train_head` / `CakeMHCDetTrainHeadFunction` |
-| | nondet | single rank | `cake_mhc_head_nondet_train` | `cake_mhc_head_nondet` | `CakeMHCHeadNondetFunction` | planned |
+| | nondet | single rank | `cake_mhc_head_nondet_train` | `cake_mhc_head_nondet` | `CakeMHCHeadNondetFunction` | new; no former name |
 | GDN | det | single rank | `cake_gdn_det_train` (new top-level facade) | `cake_gdn_det` | `CakeGDNDetFunction` | `experimental.cake_gdn_det_train` / `chunk_gated_delta_rule_det` |
 | | det | KCP | `cake_gdn_det_train_kcp` | `cake_gdn_det_kcp` | `CakeGDNDetKcpFunction` | `chunk_gdn_det_kcp` / `ChunkGDNDetFunctionKcp` |
 | | nondet | single rank | `cake_gdn_nondet_train` | `cake_gdn_nondet` | `CakeGDNNondetFunction` | `experimental.cake.cake_gdn_train` / `chunk_gated_delta_rule(deterministic=False)` |
@@ -67,11 +68,13 @@ Module names are under `flashinfer.`. "Planned" marks versions that do not exist
 | dense GEMM | det | single rank | `cake_dense_gemm_det_train` | `cake_dense_gemm_det_train_projection`, `cake_dense_gemm_det_train_router` | per entry, by rule 3 | `dense_projection_det_gemm`, `router_fp32_det_gemm` |
 | | nondet | single rank | `cake_dense_gemm_nondet_train` | `cake_dense_gemm_nondet_train_projection`, `cake_dense_gemm_nondet_train_router` | per entry, by rule 3 | `experimental.dense_projection_gemm` `cake_backend` |
 | DSA indexer | det | single rank | `cake_dsa_indexer_det_train` | `cake_dsa_indexer_det_train_topk`, `cake_dsa_indexer_det_train_topk_workspace_size` | none (no autograd: top-k selection) | `experimental.cake_dsa_indexer_det` (+ alias `experimental.cake_dsa_indexer`) / `dsa_indexer.dsa_indexer_det_topk(backend="cake")`, `dsa_indexer_det_topk_workspace_size`, aliases `dsa_indexer_topk*` |
-| | nondet | single rank | `cake_dsa_indexer_nondet_train` | | | planned |
+| | nondet | single rank | `cake_dsa_indexer_nondet_train` | `cake_dsa_indexer_nondet_train_topk`, `cake_dsa_indexer_nondet_train_topk_workspace_size` | none (no autograd: top-k selection) | new; no former name |
 | DSA sparse attention | det | single rank | `cake_dsa_sparse_attention_det_train` | | | planned |
 | | nondet | single rank | `cake_dsa_sparse_attention_nondet_train` | `cake_dsa_sparse_attention_nondet`, `cake_dsa_sparse_attention_nondet_varlen`, `cake_dsa_sparse_attention_nondet_nope`, `cake_dsa_sparse_attention_nondet_nope_varlen` | `CakeDSASparseAttentionNondetFunction` (both rope entries), `CakeDSASparseAttentionNondetNopeFunction`, `CakeDSASparseAttentionNondetNopeVarlenFunction` | `experimental.cake_dsa_train` / `dsa_sparse_attention.dsa_sparse_attention{,_varlen,_nope,_nope_varlen}` |
 | GQA HD256 | det | single rank | `cake_gqa_det_train` | `cake_gqa_det` | `CakeGQADetFunction` | planned |
 | | nondet | single rank | `cake_gqa_nondet_train` | `cake_gqa_nondet` | `CakeGQANondetFunction` | `gqa_train` / `varlen_gqa_attention` |
+| SwiGLU + MXFP8 quantization | det | single rank | `cake_gated_act_mxfp8_det_train` | `cake_gated_act_mxfp8_det_train_forward`, `cake_gated_act_mxfp8_det_train_backward` | none (no autograd: the forward and the backward are separate quantizing entries) | `gated_act_mxfp8` / `silu_and_mul_mxfp8_quantize`, `silu_and_mul_mxfp8_quantize_backward` |
+| | nondet | single rank | | | | not planned: elementwise, no reduction to reorder |
 
 ### KCP entries: KDA det as the example
 
@@ -89,8 +92,9 @@ GDN and conv1d use the same pattern with their own stem. For `nondet`, replace `
 ## Decisions
 
 - **GDN `nondet` stays.** Today it is fixed-order in practice; its contract does not promise run-to-run bits.
-- **mHC head becomes its own family.** It ships `det` now; `nondet` is planned.
-- **Missing versions keep their reserved names:** mHC head `nondet`, DSA indexer `nondet`, DSA sparse attention `det` and GQA `det`.
+- **mHC head becomes its own family.** It ships `det` and `nondet`. Like GDN `nondet`, the head's `nondet` is fixed-order (the same kernels as `det`); its contract does not promise run-to-run bits.
+- **Causal conv1d KCP stays inside the single-rank backend packages.** `cake_causal_conv1d_det_train` and `cake_causal_conv1d_nondet_train` each carry a `kcp` submodule behind the top-level `cake_causal_conv1d_<mode>_train_kcp` facades (rule 1 exception).
+- **Missing versions keep their reserved names:** DSA sparse attention `det` and GQA `det`.
 
 ## Current names
 
@@ -225,6 +229,24 @@ Family rename PRs:
 | LM head + loss | nondet | #8952 |
 | DSA indexer | det | #8936 |
 | GQA HD256 | nondet | #8939 |
+| KDA | nondet (single rank and KCP) | KDA family PR |
+| SwiGLU + MXFP8 quantization | det | #9100 |
+
+### SwiGLU + MXFP8 quantization: deterministic package
+
+| Old | New |
+| --- | --- |
+| module `flashinfer.gated_act_mxfp8` | `flashinfer.cake_gated_act_mxfp8_det_train` (stable API, `@flashinfer_api`; backend imported on first use) |
+| package `flashinfer.cake_gated_act_mxfp8_backend` | `flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train` |
+| `silu_and_mul_mxfp8_quantize` | `cake_gated_act_mxfp8_det_train_forward` |
+| `silu_and_mul_mxfp8_quantize_backward` | `cake_gated_act_mxfp8_det_train_backward` |
+| `get_gated_act_mxfp8_module` | `cake_gated_act_mxfp8_det_train_register_custom_ops` |
+| `GatedActMxfp8Outputs` | `CakeGatedActMXFP8DetOutputs` |
+| backend `is_cake_gated_act_mxfp8_supported` | `is_cake_gated_act_mxfp8_det_train_supported` (also on the facade) |
+| backend `check_inputs`, `empty_outputs`, `logical_outputs` | `cake_gated_act_mxfp8_det_train_check_inputs`, `_empty_outputs`, `_logical_outputs` |
+| custom ops `flashinfer::silu_and_mul_mxfp8_quantize`, `flashinfer::silu_and_mul_mxfp8_quantize_backward` | `flashinfer::cake_gated_act_mxfp8_det_train_forward`, `flashinfer::cake_gated_act_mxfp8_det_train_backward` |
+
+The JIT library names (`cake_gated_act_mxfp8_<hash>`) and the kernels are unchanged.
 
 ### GQA HD256: non-deterministic package
 
@@ -241,6 +263,31 @@ Family rename PRs:
 | backend `Workspace` | `CakeGQANondetWorkspace` |
 | backend `DkvAccSource` | `CakeGQANondetDkvAccSource` |
 
-No aliases: the old names fail at import. No entry takes `deterministic=`. Under `torch.use_deterministic_algorithms(True)` the forward (fixed order) runs and the backward raises PyTorch's alert before it launches, because it adds the dQ partials (and row-map dK / dV adds) with atomic FP32 reductions; with `warn_only=True` it warns once per backward call and runs the non-deterministic backward. Nothing falls back to a deterministic implementation; `flashinfer.cake_gqa_det_train` is reserved (planned).
+No aliases: the old names fail at import. No entry takes `deterministic=`. Every sum of the forward and the backward has one fixed order (the backward stores dS^T to a workspace, computes dQ as a GEMM over it and folds row-map destinations in window order; nothing adds with atomics), so every output repeats bit for bit run to run for one shape, `max_seqlen_k` and workspace budget, and nothing raises PyTorch's alert under `torch.use_deterministic_algorithms(True)`. `flashinfer.cake_gqa_det_train` is reserved (planned).
 
 Build identities keep their names: program / library stems `cake_gqa_train_<20 hex>[_<arch>]`, kernel symbols `kernel_cake_gqa_train_<20 hex>`, csrc file names and `cake_jit.LIBRARY_PREFIX`; `build.json` changes only `"package"`. Internal backend helpers (`default_workspace`, `load`, `record`, `stage_record`, `library_name`, ...) keep their names.
+
+### KDA: non-deterministic packages (single rank and KCP)
+
+| Old | New |
+| --- | --- |
+| module `flashinfer.cake_kda_train` (mode selector, `deterministic=` keyword) | `flashinfer.cake_kda_nondet_train` (stable API, `@flashinfer_api`; backend imported on first use) |
+| package `flashinfer.experimental.cake.cake_kda_train` | `flashinfer.experimental.cake.cake_kda_nondet_train` |
+| `chunk_kda` | `cake_kda_nondet` |
+| `chunk_kda_fwd` / `chunk_kda_bwd` | `cake_kda_nondet_train_forward` / `cake_kda_nondet_train_backward` |
+| `kda_train_arena`, `kda_train_workspace`, `kda_train_workspace_bytes`, `kda_train_saved_bytes` | `cake_kda_nondet_train_arena`, `cake_kda_nondet_train_workspace`, `cake_kda_nondet_train_workspace_bytes`, `cake_kda_nondet_train_saved_bytes` |
+| `is_kda_train_supported` | `is_cake_kda_nondet_train_supported` |
+| backend `ChunkKDAFunction`, `KdaWorkspace`, `KdaChunkSaved`, `KdaArena` | `CakeKDANondetFunction`, `CakeKDANondetWorkspace`, `CakeKDANondetChunkSaved`, `CakeKDANondetArena` |
+| module `flashinfer.cake_kda_train_kcp` | `flashinfer.cake_kda_nondet_train_kcp` (stable API, `@flashinfer_api`) |
+| package `flashinfer.experimental.cake_kda_train_kcp` | `flashinfer.experimental.cake.cake_kda_nondet_train_kcp` |
+| `chunk_kda_kcp` | `cake_kda_nondet_kcp` |
+| `chunk_kda_fwd_kcp` / `chunk_kda_bwd_kcp` | `cake_kda_nondet_train_kcp_forward` / `cake_kda_nondet_train_kcp_backward` |
+| `partition_kcp`, `build_context_kcp` | `cake_kda_nondet_train_kcp_partition`, `cake_kda_nondet_train_kcp_build_context` |
+| `kda_workspace_bytes_kcp`, `kda_saved_bytes_kcp`, `kda_comm_bytes_kcp`, `kda_handoff_bytes_kcp` | `cake_kda_nondet_train_kcp_workspace_bytes`, `cake_kda_nondet_train_kcp_saved_bytes`, `cake_kda_nondet_train_kcp_comm_bytes`, `cake_kda_nondet_train_kcp_handoff_bytes` |
+| `reduce_gate_param_grads_kcp`, `kcp_handoff_stats` | `cake_kda_nondet_train_kcp_reduce_gate_param_grads`, `cake_kda_nondet_train_kcp_handoff_stats` |
+| `ContextKcp`, `PartitionKcp`, `WorkspaceKcp`, `SavedKcp`, `RecomputeHandleKcp`, `OptionsKcp` | `CakeKDANondetKcpContext`, `CakeKDANondetKcpPartition`, `CakeKDANondetKcpWorkspace`, `CakeKDANondetKcpSaved`, `CakeKDANondetKcpRecomputeHandle`, `CakeKDANondetKcpOptions` |
+| backend `ChunkKDAFunctionKcp`, `CallKcp`, `FragmentKcp` | `CakeKDANondetKcpFunction`, `CakeKDANondetKcpCall`, `CakeKDANondetKcpFragment` |
+
+No aliases: the old names fail at import. No entry takes `deterministic=`; the former selector default (`deterministic=True` ran the deterministic package) is gone, so a caller of the deterministic path imports `flashinfer.cake_kda_det_train` / `flashinfer.cake_kda_det_train_kcp`. No launch of these packages is unordered: under `torch.use_deterministic_algorithms(True)` (also with `warn_only=True`) the entries run the non-deterministic package and raise no alert and no warning; nothing falls back to the deterministic package. A workspace, saved set or arena option of the deterministic package is refused with `ValueError` naming the mode.
+
+Build identities keep their names: program / library stems `cake_kda_train_<20 hex>[_kcp]`, kernel symbols, csrc file names and the `cake_jit` / `cake_kcp_jit` records; `build.json` changes only `"package"`, and the KCP package's `build.json` / `build.test.json` declare their single-rank sibling in `common.requires.packages` (`["cake_kda_nondet_train"]`). The KCP package imports that sibling by name from its own parent package (`_single_rank.py`), so vendoring builds ship the two directories side by side. Internal backend helpers (`plan`, `workspace_bytes`, `saved_bytes`, `kcp_plan`, `KcpPreconditionError`, ...) keep their names.
