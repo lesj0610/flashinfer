@@ -27,6 +27,7 @@ PACKAGES: dict[str, str] = {
     "cake.cake_mhc_head_det_train": "flashinfer.experimental.cake.cake_mhc_head_det_train",
     "cake.cake_mhc_head_nondet_train": "flashinfer.experimental.cake.cake_mhc_head_nondet_train",
     "cake.cake_dsa_sparse_attention_nondet_train": "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train",
+    "cake.cake_dsa_sparse_attention_det_train": "flashinfer.experimental.cake.cake_dsa_sparse_attention_det_train",
     "cake.cake_dsa_indexer_det_train": "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
     "cake.cake_dsa_indexer_nondet_train": "flashinfer.experimental.cake.cake_dsa_indexer_nondet_train",
     "cake.cake_lm_head_det_train": "flashinfer.experimental.cake.cake_lm_head_det_train",
@@ -58,6 +59,7 @@ PACKAGES: dict[str, str] = {
     "cake_gdn_nondet_train": "flashinfer.experimental.cake.cake_gdn_nondet_train",
     # the non-deterministic GQA HD256 training package; its key carries the namespace
     "cake.cake_gqa_nondet_train": "flashinfer.experimental.cake.cake_gqa_nondet_train",
+    "cake.cake_gqa_det_train": "flashinfer.experimental.cake.cake_gqa_det_train",
     "cake.cake_mhc_nondet_train": "flashinfer.experimental.cake.cake_mhc_nondet_train",
     "cake_causal_conv1d_nondet_train": "flashinfer.experimental.cake.cake_causal_conv1d_nondet_train",
 }

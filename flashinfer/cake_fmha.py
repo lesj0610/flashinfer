@@ -797,7 +797,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "Q511_SM103A"): (
-        "cake_fmha_context_nvfp4_c916619510183749b162",
+        "cake_fmha_context_nvfp4_ea63d1372358797fdf6f",
         16,
         False,
     ),
@@ -807,7 +807,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "Q511_SCALE_PTR_SM103A"): (
-        "cake_fmha_context_nvfp4_1b4750660638d644a971",
+        "cake_fmha_context_nvfp4_e673bfa791f7c71aeb61",
         16,
         False,
     ),
@@ -817,7 +817,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK1_SM103A"): (
-        "cake_fmha_context_nvfp4_e5bc1ab476ab2d2281b3",
+        "cake_fmha_context_nvfp4_6f93414ba399d23b5916",
         None,
         False,
     ),
@@ -827,7 +827,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK2_SM103A"): (
-        "cake_fmha_context_nvfp4_06d8cd436fe722542cfe",
+        "cake_fmha_context_nvfp4_a07b0866dce3af2b4840",
         None,
         False,
     ),
@@ -837,7 +837,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK4_SM103A"): (
-        "cake_fmha_context_nvfp4_dfc2b69916b570e5656e",
+        "cake_fmha_context_nvfp4_a2ccb67e2966ae3b7edc",
         None,
         False,
     ),
@@ -847,7 +847,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK5_SM103A"): (
-        "cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808",
+        "cake_fmha_context_nvfp4_a43177abb2d2639c34ba",
         None,
         False,
     ),
@@ -857,7 +857,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK6_SM103A"): (
-        "cake_fmha_context_nvfp4_183aa672fdfdebe90f8c",
+        "cake_fmha_context_nvfp4_85634e40302d7c512ac5",
         None,
         False,
     ),
@@ -867,7 +867,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK7_SM103A"): (
-        "cake_fmha_context_nvfp4_8ead4ba98b727ad2bb88",
+        "cake_fmha_context_nvfp4_e86e3160f4a150409eb7",
         None,
         False,
     ),
@@ -877,7 +877,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK8_SM103A"): (
-        "cake_fmha_context_nvfp4_a7e740ed276553b8299f",
+        "cake_fmha_context_nvfp4_2a9272cea2714be55f6d",
         None,
         False,
     ),
@@ -887,7 +887,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK12_SM103A"): (
-        "cake_fmha_context_nvfp4_8fab5c6a2f2e50fd6e51",
+        "cake_fmha_context_nvfp4_5541b6e1896cbe81f9e5",
         None,
         False,
     ),
@@ -897,7 +897,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK16_SM103A"): (
-        "cake_fmha_context_nvfp4_ac3c9f437f13b1b822dd",
+        "cake_fmha_context_nvfp4_a012c93ca3cba6e2a56e",
         None,
         False,
     ),
@@ -1667,7 +1667,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         None,
         False,
     ),
-    # Their sm103a one-stage builds of packs 1, 2, 4 and 8
+    # Their one-stage builds of packs 1, 2, 4 and 8, for both targets
     # (_CONTEXT_FP8_FORM_ONE_STAGE_ROUTES).
     ("context_fp8", "RUNTIME_PACK1_NC_PX_Q1"): (
         "cake_fmha_context_fp8_8e82b164f633739b5629",
@@ -2152,28 +2152,53 @@ _CONTEXT_BF16_RUNTIME_FLAG_BOUNDS: dict[
 }
 # Per target and mask, per JIT pack: further calls of the other flag forms the
 # runtime-size BF16 programs serve past :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`,
-# as boxes ``(batch, keys, query x keys, work)``: a call of at most ``batch``
-# requests, at most ``keys`` cache keys, at most that ``max_q_len *
+# as boxes ``(batch, min queries, queries, keys, query x keys, work)``: a call
+# of at most ``batch`` requests, a ``max_q_len`` from ``min queries`` to
+# ``queries``, at most ``keys`` cache keys, at most that ``max_q_len *
 # max_kv_len`` and at most ``work`` of ``batch_size * num_q_heads * max_q_len *
 # max_kv_len`` takes its form's program (``None``: no bound).  Within each box
 # the programs ran faster than the JIT module beyond the A/A band in every
-# layout timed (10 layouts; 2 for the B200 rows of 1, 64, 1000 and over 8192
-# queries).  B200, causal pack 8, one request: 1 .. 32768 queries x 6145 ..
-# 8192 keys at 8 .. 64 query heads.  GB300, causal pack 1: 1 .. 128 requests
-# x 32 .. 16384 queries x 16384 keys at 8 .. 32 heads; not causal pack 16:
-# 1 .. 16 requests x 512 .. 16384 queries x 4096 .. 16384 keys at 64 and 128
-# query heads.  Sinks and LSE alike.
+# layout timed (10 layouts; 2 for the B200 pack-8 rows of 1, 64, 1000 and over
+# 8192 queries).  B200, causal: one request up to 8192 keys at pack 8 (1 ..
+# 32768 queries x 6145 .. 8192 keys at 8 .. 64 query heads) and pack 16 (1 x
+# 128 .. 32768 x 8192 keys at 16 .. 64 heads); packs 4 and 16 up to 6144 keys
+# and 3 x 2^30 work (1 .. 16 requests x 512 .. 8192 queries; not at 3 x 2^31,
+# 16 x 2048 x 6144 keys at 32 heads and 64 x 256 at 64); packs 2 .. 12 up to
+# 512 queries, 8192 keys and 2^31 work (1 .. 256 requests x 32 .. 512 queries
+# x 8192 keys).
+# GB300, causal pack 1: 1 .. 128 requests x 32 .. 16384 queries x 16384 keys
+# at 8 .. 32 heads; not causal pack 16: 1 .. 16 requests x 512 .. 16384
+# queries x 4096 .. 16384 keys at 64 and 128 query heads.  Sinks and LSE alike.
+_CONTEXT_BF16_FLAG_BOX = tuple[
+    int | None, int | None, int | None, int | None, int | None, int | None
+]
+_CONTEXT_BF16_FLAG_BOX_ONE_REQUEST: _CONTEXT_BF16_FLAG_BOX = (
+    1, None, None, 8192, None, 1 << 32
+)  # fmt: skip
+_CONTEXT_BF16_FLAG_BOX_6144: _CONTEXT_BF16_FLAG_BOX = (
+    None, None, None, 6144, None, 3 << 30
+)  # fmt: skip
+_CONTEXT_BF16_FLAG_BOX_SHORT_Q: _CONTEXT_BF16_FLAG_BOX = (
+    None, None, 512, 8192, None, 1 << 31
+)  # fmt: skip
 _CONTEXT_BF16_RUNTIME_FLAG_BOXES: dict[
-    str,
-    dict[
-        bool,
-        dict[int, tuple[tuple[int | None, int | None, int | None, int | None], ...]],
-    ],
+    str, dict[bool, dict[int, tuple[_CONTEXT_BF16_FLAG_BOX, ...]]]
 ] = {
-    "sm100a": {True: {8: ((1, 8192, None, 1 << 32),)}},
+    "sm100a": {
+        True: {
+            2: (_CONTEXT_BF16_FLAG_BOX_SHORT_Q,),
+            4: (_CONTEXT_BF16_FLAG_BOX_6144, _CONTEXT_BF16_FLAG_BOX_SHORT_Q),
+            5: (_CONTEXT_BF16_FLAG_BOX_SHORT_Q,),
+            6: (_CONTEXT_BF16_FLAG_BOX_SHORT_Q,),
+            7: (_CONTEXT_BF16_FLAG_BOX_SHORT_Q,),
+            8: (_CONTEXT_BF16_FLAG_BOX_ONE_REQUEST, _CONTEXT_BF16_FLAG_BOX_SHORT_Q),
+            12: (_CONTEXT_BF16_FLAG_BOX_SHORT_Q,),
+            16: (_CONTEXT_BF16_FLAG_BOX_ONE_REQUEST, _CONTEXT_BF16_FLAG_BOX_6144),
+        },
+    },
     "sm103a": {
-        True: {1: ((None, 16384, None, 1 << 32),)},
-        False: {16: ((None, None, 1 << 26, 1 << 33),)},
+        True: {1: ((None, None, None, 16384, None, 1 << 32),)},
+        False: {16: ((None, None, None, None, 1 << 26, 1 << 33),)},
     },
 }
 # Short sm103a launches keep each stage's P tile in its own S columns: the
@@ -2262,15 +2287,21 @@ _CONTEXT_FP8_SHORT_KV_ROUTES["sm103a"] |= {
 # where every tile holds at most one stage of query tokens (``max_q_len <=
 # 128 / pack_g``: the two-stage tile's second stage holds no row, so the
 # tile's rows, key blocks and arithmetic are the same) and it has more keys
-# than the form program's short-KV entry.
+# than the form program's short-KV entry (sm103a: 128; sm100a has none).
+# Both targets run the build with the 4-stage K/V ring and each stage's P
+# tile in the other stage's S columns (timed B200: 4 .. 32 requests of 1 ..
+# 64 query tokens over 64 .. 2048 keys, heads 32/4, 32/8, 16/8 and 32/32, ran
+# 5 .. 35 % faster than the two-stage form program with P in its own S
+# columns).
 _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES: dict[
     str, dict[tuple[str, int, int | None], str]
 ] = {
-    "sm103a": {
+    target: {
         (form, pack, None): f"RUNTIME_PACK{pack}_{form}_PX_Q1"
         for form in _CONTEXT_FP8_FORMS.values()
         for pack in (1, *_CONTEXT_FP8_RUNTIME_PACKS[::-1])
-    },
+    }
+    for target in ("sm100a", "sm103a")
 }
 # Per target, the most tiles of a short-KV call (one 128-key block per tile,
 # served by a short-KV one-stage program) at which it takes the smallest pack
@@ -8993,10 +9024,12 @@ def select_cake_fmha_context_route(
             )
             or any(
                 (box_batch is None or batch_size <= box_batch)
+                and (box_min_q is None or max_q_len >= box_min_q)
+                and (box_q is None or max_q_len <= box_q)
                 and (box_keys is None or max_kv_len <= box_keys)
                 and (box_area is None or max_q_len * max_kv_len <= box_area)
                 and (box_work is None or work <= box_work)
-                for box_batch, box_keys, box_area, box_work in boxes
+                for box_batch, box_min_q, box_q, box_keys, box_area, box_work in boxes
             )
         )
     ):
