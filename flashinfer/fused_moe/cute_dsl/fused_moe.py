@@ -152,8 +152,9 @@ def _canonicalize_quant_mode(quant_mode: str) -> str:
 def _check_clamped_relu2_supported(
     activation: ActivationType, quant_mode: str, device: Union[str, torch.device]
 ) -> None:
-    """ClampedRelu2 needs the SM100/SM103 gather GEMM1 epilogue: W4A16 and the
-    Rubin (SM107) kernels do not implement it."""
+    """ClampedRelu2 needs the SM100/SM103 gather GEMM1 epilogue: W4A16, the
+    Rubin (SM107) kernels and the CUTLASS MoE kernels run below SM100 do not
+    implement it."""
     if activation != ActivationType.ClampedRelu2:
         return
     if quant_mode == "w4a16":
@@ -161,12 +162,12 @@ def _check_clamped_relu2_supported(
             "ActivationType.ClampedRelu2 is not supported when quant_mode='w4a16'"
         )
     device = torch.device(device)
-    if (
-        device.type == "cuda"
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_capability(device) == (10, 7)
-    ):
-        raise ValueError("ActivationType.ClampedRelu2 is not supported on SM107")
+    if device.type == "cuda" and torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability(device)
+        if capability == (10, 7):
+            raise ValueError("ActivationType.ClampedRelu2 is not supported on SM107")
+        if capability[0] < 10:
+            raise ValueError("ActivationType.ClampedRelu2 is not supported below SM100")
 
 
 #: ``(data_ptr, device index, e4m3_max, _version)`` of GEMM2-input scales

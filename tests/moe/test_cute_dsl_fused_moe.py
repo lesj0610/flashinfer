@@ -77,6 +77,19 @@ pytestmark = pytest.mark.usefixtures("observe_swap_ab_mma_plans")
 
 
 @pytest.fixture(autouse=True)
+def _skip_swap_ab_below_sm100(request):
+    """Below SM100 the MoE runs on the CUTLASS MoE kernels, which have no swap_ab."""
+    callspec = getattr(request.node, "callspec", None)
+    params = getattr(callspec, "params", {}) or {}
+    if (
+        params.get("swap_ab")
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(0)[0] < 10
+    ):
+        pytest.skip("swap_ab requires Blackwell SM100 or SM103")
+
+
+@pytest.fixture(autouse=True)
 def _skip_sm107_unimplemented_moe_features(request):
     """Skip parameterizations the SM107 (Rubin) W4A4 MoE kernels do not implement.
 
@@ -1995,7 +2008,7 @@ class TestCuteDslMoeW4A16:
     )
     @pytest.mark.parametrize("swap_ab", [False, True])
     def test_weight_scale_update(self, use_wrapper: bool, swap_ab: bool):
-        if swap_ab and (is_sm107() or not is_sm100_family()):
+        if swap_ab and is_sm107():
             pytest.skip("swap_ab requires Blackwell SM100 or SM103")
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
@@ -2263,6 +2276,8 @@ class TestCuteDslMoeW4A16:
 
         _assert_moe_quant_mode_reference(result, ref_output, "w4a16")
 
+    # Pins native W4A16 tactics.
+    @sm100_required
     @pytest.mark.parametrize(
         "tactic",
         [
@@ -2747,6 +2762,8 @@ class TestCuteDslFusedMoeFunctional:
 
         if is_sm107():
             pytest.skip("SM107 gather grouped GEMM does not implement ClampedRelu2")
+        if not is_sm100_family():
+            pytest.skip("The CUTLASS MoE kernels do not implement ClampedRelu2")
 
         activation_type = ActivationType.ClampedRelu2
         num_tokens, hidden_size, intermediate_size = 128, 1024, 512

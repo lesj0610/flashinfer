@@ -2872,7 +2872,10 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
     ),
 )
 def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swap_ab):
-    if swap_ab and get_compute_capability(torch.device("cuda")) == (10, 7):
+    if swap_ab and get_compute_capability(torch.device("cuda")) not in (
+        (10, 0),
+        (10, 3),
+    ):
         pytest.skip("swap_ab requires SM100 or SM103")
     if (
         get_compute_capability(torch.device("cuda")) == (10, 7)
