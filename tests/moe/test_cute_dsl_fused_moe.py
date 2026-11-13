@@ -77,6 +77,19 @@ pytestmark = pytest.mark.usefixtures("observe_swap_ab_mma_plans")
 
 
 @pytest.fixture(autouse=True)
+def _skip_swap_ab_below_sm100(request):
+    """Below SM100 the MoE runs on the CUTLASS MoE kernels, which have no swap_ab."""
+    callspec = getattr(request.node, "callspec", None)
+    params = getattr(callspec, "params", {}) or {}
+    if (
+        params.get("swap_ab")
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(0)[0] < 10
+    ):
+        pytest.skip("swap_ab requires Blackwell SM100 or SM103")
+
+
+@pytest.fixture(autouse=True)
 def _skip_sm107_unimplemented_moe_features(request):
     """Skip parameterizations the SM107 (Rubin) W4A4 MoE kernels do not implement.
 
@@ -175,7 +188,14 @@ sm100_required = pytest.mark.skipif(
     not is_sm100_family(),
     reason="Requires CuteDSL MoE target SM100, SM103 or SM107",
 )
-sm10x_required = sm100_required
+# The MoE APIs also run below SM100 (SM80 to SM90), on the CUTLASS MoE kernels.
+sm10x_required = pytest.mark.skipif(
+    not is_sm100_family()
+    and not (
+        torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in (8, 9)
+    ),
+    reason="Requires CuteDSL MoE target SM80 to SM90, SM100, SM103 or SM107",
+)
 
 mxfp8_required = pytest.mark.skipif(
     not (
@@ -337,18 +357,19 @@ def _compute_moe_quant_mode_reference(tensors, quant_mode, swap_ab=False, **kwar
 
 
 def _assert_moe_quant_mode_reference(actual, expected, quant_mode, swap_ab=False):
-    if quant_mode == "w4a16":
+    # Below SM100 W4A16 runs on the records or CUTLASS SM80 kernels, which round
+    # differently from the split kernel the W4A16 oracle follows.
+    if quant_mode == "w4a16" and is_sm100_family():
         assert_w4a16_bits(actual, expected)
-    elif quant_mode in ("w4a4", "w4a8", "mxfp8"):
-        if swap_ab:
-            assert_cute_dsl_moe_bits(actual, expected)
-        elif quant_mode == "w4a4":
-            passed, percent_within, atol = check_accuracy(actual, expected)
-            assert passed, (
-                f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-            )
-        else:
-            raise ValueError("MXFP accuracy cases require swap_ab")
+    elif quant_mode in ("w4a4", "w4a8", "mxfp8") and swap_ab:
+        assert_cute_dsl_moe_bits(actual, expected)
+    elif quant_mode in ("w4a4", "w4a16"):
+        passed, percent_within, atol = check_accuracy(actual, expected)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+    elif quant_mode in ("w4a8", "mxfp8"):
+        raise ValueError("MXFP accuracy cases require swap_ab")
     else:
         raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
@@ -1977,11 +1998,14 @@ class TestAutotunerBucketConfig:
 
 
 @cute_dsl_available
-@sm100_required
+@sm10x_required
 class TestCuteDslMoeW4A16:
     pytestmark = _requires_dsl_arch
 
-    @pytest.mark.parametrize("use_wrapper", [False, True])
+    # The wrapper call pins a native W4A16 tactic.
+    @pytest.mark.parametrize(
+        "use_wrapper", [False, pytest.param(True, marks=sm100_required)]
+    )
     @pytest.mark.parametrize("swap_ab", [False, True])
     def test_weight_scale_update(self, use_wrapper: bool, swap_ab: bool):
         if swap_ab and is_sm107():
@@ -2044,14 +2068,17 @@ class TestCuteDslMoeW4A16:
         # Weight scales are serving-owned tensors and may be updated in place.
         # Reuse the same allocation to ensure W4A16 reads the current contents.
         result = run()
-        assert_w4a16_bits(
-            result, split_w4a16_reference_from_tensors(tensors, swap_ab=swap_ab)
+        _assert_moe_quant_mode_reference(
+            result,
+            split_w4a16_reference_from_tensors(tensors, swap_ab=swap_ab),
+            "w4a16",
         )
         assert torch.count_nonzero(result).item() > 0
         tensors["w1_weight_sf"].zero_()
         updated = run()
         assert_w4a16_bits(updated, torch.zeros_like(updated))
 
+    @sm100_required
     @pytest.mark.parametrize("scale_axis", ["row", "k"])
     @pytest.mark.parametrize(
         "rows,route_tile,tactic",
@@ -2134,6 +2161,7 @@ class TestCuteDslMoeW4A16:
         )
         assert_w4a16_bits(output, expected)
 
+    @sm100_required
     @pytest.mark.parametrize(
         "route_tile,gemm1_tactic,gemm2_tactic",
         [
@@ -2248,6 +2276,8 @@ class TestCuteDslMoeW4A16:
 
         _assert_moe_quant_mode_reference(result, ref_output, "w4a16")
 
+    # Pins native W4A16 tactics.
+    @sm100_required
     @pytest.mark.parametrize(
         "tactic",
         [
@@ -2305,6 +2335,60 @@ class TestCuteDslMoeW4A16:
         full = run(torch.arange(pool, device="cuda"))
         perm = torch.randperm(pool, device="cuda", generator=gen)
         assert torch.equal(run(perm), full[perm])
+
+
+@cute_dsl_available
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability(0)[0] not in (8, 9),
+    reason="W4A16 records run below SM100",
+)
+@pytest.mark.parametrize("gated", [True, False])
+def test_w4a16_records_tactics(gated: bool):
+    """Every records tactic gives the same output, within tolerance of the reference. GEMM1
+    takes three 128-column records; the gated GEMM2 K of 192 ends in a 64-wide tail."""
+    from flashinfer import cute_dsl_fused_moe
+    from flashinfer.fused_moe.cute_dsl.tuner import W4A16_SM80_TACTICS
+
+    tensors = create_moe_tensors(
+        num_tokens=100,
+        hidden_size=256,
+        intermediate_size=192 if gated else 384,
+        num_experts=8,
+        num_local_experts=8,
+        top_k=2,
+        gated=gated,
+    )
+    activation = ActivationType.Swiglu if gated else ActivationType.Relu2
+    outputs = [
+        cute_dsl_fused_moe(
+            x=tensors["x_bf16"],
+            x_sf=None,
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=None,
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=8,
+            top_k=2,
+            quant_mode="w4a16",
+            use_fused_finalize=False,
+            activation_type=activation,
+            tactic=tactic,
+        )
+        for tactic in W4A16_SM80_TACTICS
+    ]
+    _assert_moe_quant_mode_reference(
+        outputs[0],
+        split_w4a16_reference_from_tensors(tensors, activation_type=activation),
+        "w4a16",
+    )
+    for tactic, output in zip(W4A16_SM80_TACTICS[1:], outputs[1:], strict=True):
+        assert torch.equal(output, outputs[0]), tactic
 
 
 # =============================================================================
@@ -2491,6 +2575,7 @@ class TestCuteDslFusedMoeFunctional:
             pytest.param("w4a16", False, False, (256, 384, 256), id="w4a16-ordinary"),
         ],
     )
+    @sm100_required
     def test_finalize_handles_cluster_padding_and_partial_tiles(
         self,
         quant_mode: str,
@@ -2731,6 +2816,8 @@ class TestCuteDslFusedMoeFunctional:
 
         if is_sm107():
             pytest.skip("SM107 gather grouped GEMM does not implement ClampedRelu2")
+        if not is_sm100_family():
+            pytest.skip("The CUTLASS MoE kernels do not implement ClampedRelu2")
 
         activation_type = ActivationType.ClampedRelu2
         num_tokens, hidden_size, intermediate_size = 128, 1024, 512
@@ -3143,7 +3230,7 @@ class TestCuteDslFusedMoeFunctional:
                 swiglu_beta=1.0,
                 swiglu_limit=7.0,
             )
-            assert_w4a16_bits(result, reference)
+            _assert_moe_quant_mode_reference(result, reference, "w4a16")
 
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     def test_swiglu_oai_accuracy(self, quant_mode: str):
@@ -3757,6 +3844,7 @@ class TestCuteDslMoEWrapper:
         assert result.shape == (target_num_tokens, hidden_size)
         assert not torch.isnan(result).any()
 
+    @sm100_required
     def test_cuda_graph_wrapper_lifetime_after_autotune(self):
         """Dropped CUDA graph wrappers should not wait for cyclic GC,
         even after autotune profiling has populated the autotuner cache."""
@@ -3927,8 +4015,8 @@ class TestApiConsistency:
 
         if quant_mode == "w4a16":
             reference = split_w4a16_reference_from_tensors(tensors)
-            assert_w4a16_bits(result_functional, reference)
-            assert_w4a16_bits(result_wrapper, reference)
+            _assert_moe_quant_mode_reference(result_functional, reference, "w4a16")
+            _assert_moe_quant_mode_reference(result_wrapper, reference, "w4a16")
             assert_w4a16_bits(result_functional, result_wrapper)
         elif quant_mode == "w4a4":
             # Outputs may differ slightly because the APIs can autotune
@@ -4120,7 +4208,7 @@ class TestExpertParallelism:
 
 
 @cute_dsl_available
-@sm10x_required
+@sm100_required
 class TestMoeSortBufferInitPoisoned:
     """Validate the invariant that the routing kernel writes every
     output entry that downstream code reads, by pre-poisoning the
@@ -4342,7 +4430,7 @@ class TestMoeSortBufferInitPoisoned:
 
 
 @cute_dsl_available
-@sm10x_required
+@sm100_required
 class TestAllValidTactics:
     """Test that every tactic returned by get_valid_tactics produces correct output.
 
@@ -5278,7 +5366,7 @@ class TestRubinTwoCtaAndClusterNTacticsAccuracy:
 
 
 @cute_dsl_available
-@sm10x_required
+@sm100_required
 class TestOddTileCountBoundsContract:
     """Exercise the active-count bounds contract at an *odd* tile count.
 

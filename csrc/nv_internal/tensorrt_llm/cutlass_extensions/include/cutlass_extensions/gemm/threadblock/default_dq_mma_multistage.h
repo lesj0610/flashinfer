@@ -231,8 +231,9 @@ struct DqMma<
                 "Mma multistage must dequantize after ldsm");
 
   static_assert(platform::is_same<ElementB, uint8_t>::value ||
-                    platform::is_same<ElementB, uint4b_t>::value,
-                "Element B must be uint8 or uint4");
+                    platform::is_same<ElementB, uint4b_t>::value ||
+                    platform::is_same<ElementB, float_e2m1_t>::value,
+                "Element B must be uint8, uint4 or e2m1");
 
   static cutlass::arch::CacheOperation::Kind const CacheOpA =
       ((sizeof_bits<ElementA>::value * kAlignmentA) == 128) ? cutlass::arch::CacheOperation::Global
@@ -292,8 +293,12 @@ struct DqMma<
 
   using SmemIteratorScale = typename ScaleIterators::SmemIteratorScale;
 
-  using Converter = FastInterleavedAndBiasedNumericArrayConverter<
-      ElementScale, ElementB, MmaCore::MmaPolicy::Operator::FragmentB::kElements>;
+  // E2M1 codes keep their natural order and have no bias (see LayoutDetailsB).
+  static constexpr int kConvertedElements = MmaCore::MmaPolicy::Operator::FragmentB::kElements;
+  using Converter = std::conditional_t<
+      platform::is_same<ElementB, float_e2m1_t>::value,
+      FastE2M1NumericArrayConverter<ElementScale, kConvertedElements>,
+      FastInterleavedAndBiasedNumericArrayConverter<ElementScale, ElementB, kConvertedElements>>;
 
   // Define the threadblock-scoped pipelined matrix multiply
   using ThreadblockMma = cutlass::gemm::threadblock::DqMmaMultistage<

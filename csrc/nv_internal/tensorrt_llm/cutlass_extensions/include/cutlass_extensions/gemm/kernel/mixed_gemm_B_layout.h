@@ -109,6 +109,13 @@ struct LayoutDetailsB<TypeA, uint4b_t, Arch,
   using Operator = cutlass::arch::OpMultiplyAddDequantizeInterleavedBToA;
 };
 
+// E2M1 (NVFP4) weights take the INT4 layout: the same row permutation and column interleave, but
+// no bias and no nibble reordering, since they convert in their natural order.
+template <typename TypeA, typename Arch>
+struct LayoutDetailsB<TypeA, float_e2m1_t, Arch,
+                      typename platform::enable_if<Arch::kMinComputeCapability >= 75>::type>
+    : LayoutDetailsB<TypeA, uint4b_t, Arch> {};
+
 }  // namespace kernel
 }  // namespace gemm
 }  // namespace cutlass

@@ -196,10 +196,12 @@ from .core import (
 )
 
 from .prepare import (
+    cutlass_nvfp4_sm80_weights,
     interleave_cute_dsl_moe_weights,
     interleave_moe_scales_for_sm90_mixed_gemm,
     interleave_moe_weights_for_sm90_mixed_gemm,
     preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+    trtllm_nvfp4_sm80_weights,
 )
 
 from ..tllm_enums import (
@@ -461,6 +463,7 @@ __all__ = [
     "convert_to_block_layout",
     "cutlass_fused_moe",
     "cutlass_fused_moe_workspace_size",
+    "cutlass_nvfp4_sm80_weights",
     "interleave_moe_scales_for_sm90_mixed_gemm",
     "interleave_cute_dsl_moe_weights",
     "interleave_moe_weights_for_sm90_mixed_gemm",
@@ -498,6 +501,7 @@ __all__ = [
     "trtllm_fused_moe_workspace_size",
     "trtllm_mxint4_block_scale_moe",
     "trtllm_mxint4_block_scale_routed_moe",
+    "trtllm_nvfp4_sm80_weights",
     "fused_topk_deepseek",
     "AlphaMoERoutePlan",
     "allocate_alphamoe_route_plan",

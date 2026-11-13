@@ -1191,6 +1191,29 @@ def get_w4a16_moe_valid_tactics() -> List[Tuple]:
 W4A16_MOE_TACTICS = tuple(get_w4a16_moe_valid_tactics())
 
 
+# Below SM100 W4A16 runs on records (csrc/w4a16_moe_sm80.cu) with these tactics: row tile, then
+# the GEMM1 and GEMM2 variants: 0 the row tile's own; at row tile 64, 1 GEMM1 at 2 stages (GEMM2
+# as 0), 2 GEMM2 at 2 stages, 3 GEMM1 and 4 GEMM2 over two 128-column records per CTA, 5 GEMM2
+# as 4 with vector scale loads; at row tile 96, 6 and 7 the 2-stage paths, 7 with 12 row parts.
+# Untuned calls take row tile 64.
+W4A16_SM80_TACTICS = (
+    (8, 0, 0),
+    (16, 0, 0),
+    (32, 0, 0),
+    (64, 0, 0),
+    (96, 0, 0),
+    (64, 1, 1),
+    (64, 1, 2),
+    (64, 3, 2),
+    (64, 3, 4),
+    (64, 1, 4),
+    (64, 3, 5),
+    (64, 1, 5),
+    (96, 6, 6),
+    (96, 7, 7),
+)
+
+
 class CuteDslFusedMoEW4A16Runner(TunableRunner):
     """Tunable runner for the BF16-activation, NVFP4-weight MoE pipeline.
 
@@ -1365,6 +1388,13 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 use_2cta_instrs=mma_tiler_m == 256,
             )
 
+        if (
+            inputs[0].is_cuda
+            and torch.cuda.get_device_capability(inputs[0].device)[0] < 10
+        ):
+            records = inputs[4].dtype == torch.uint8 and inputs[4].dim() == 2
+            return list(W4A16_SM80_TACTICS) if records else []
+
         valid_tactics = []
         for tactic in W4A16_MOE_TACTICS:
             gemm1_tactic, gemm2_tactic = tactic
@@ -1419,6 +1449,10 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 f"moe_output must have shape {(num_tokens, hidden_size)}, "
                 f"got {tuple(moe_output.shape)}"
             )
+        if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
+            from .fused_moe import _cute_dsl_fused_moe_sm80
+
+            return _cute_dsl_fused_moe_sm80(self, inputs, tactic)
         return launch_w4a16_moe(
             x=x,
             token_selected_experts=token_selected_experts,

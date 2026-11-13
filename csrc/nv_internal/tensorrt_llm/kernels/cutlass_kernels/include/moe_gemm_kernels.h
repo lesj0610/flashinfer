@@ -62,6 +62,14 @@ struct GroupedGemmInput {
 
   cudaStream_t stream = 0;
   cutlass_extensions::CutlassGemmConfig gemm_config;
+
+  // NVFP4 weights with per-token activations: FP32 scale per row of A, padded by a GEMM tile.
+  float const* row_scales = nullptr;
+  // The SM80 FP4 small-M kernel only: GEMM row r reads A's row a_rows[r] % a_tokens when a_rows is
+  // given, and rows without row scales take their expert's expert_scales[e] when given.
+  int const* a_rows = nullptr;
+  int a_tokens = 0;
+  float const* expert_scales = nullptr;
 };
 
 struct TmaWarpSpecializedGroupedGemmInput {
@@ -309,6 +317,12 @@ class MoeGemmRunner {
 #else
   static constexpr bool use_fp4 = false;
   static constexpr bool use_wfp4afp8 = false;
+#endif
+#if defined(FLASHINFER_FP4_SW_CVT)
+  // Below SM100 NVFP4 runs on the SM80 16-bit x E2M1 GEMMs, with the activations restored.
+  static constexpr bool use_restored_fp4 = use_fp4;
+#else
+  static constexpr bool use_restored_fp4 = false;
 #endif
   static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
   static constexpr bool use_sm90_wfp4afp8 =
