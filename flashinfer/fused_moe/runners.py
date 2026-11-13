@@ -5243,12 +5243,14 @@ class CuteDslRunner(MoERunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         self._require_built()
-        # Below SM100 the CUTLASS SM80 kernels choose their own tactics.
-        return (
-            [-1]
-            if self._below_sm100()
-            else self._inner.get_valid_tactics(inputs, profile)
-        )
+        # Below SM100 the CUTLASS SM80 kernels choose their own tactics; W4A16 records
+        # have theirs.
+        if self._below_sm100():
+            from .cute_dsl.tuner import CuteDslFusedMoEW4A16Runner
+
+            w4a16 = isinstance(self._inner, CuteDslFusedMoEW4A16Runner)
+            return (w4a16 and self._inner.get_valid_tactics(inputs, profile)) or [-1]
+        return self._inner.get_valid_tactics(inputs, profile)
 
     def _cache_key_extras(self) -> tuple:
         extras = super()._cache_key_extras() + (
@@ -5270,8 +5272,9 @@ class CuteDslRunner(MoERunner):
         if self._below_sm100():
             from .cute_dsl.fused_moe import _cute_dsl_fused_moe_sm80
 
+            tactic = None if tactic == -1 else tactic
             return _cute_dsl_fused_moe_sm80(
-                self._inner, inputs, None, **self._forward_kwargs
+                self._inner, inputs, tactic, **self._forward_kwargs
             )
         return self._inner.forward(
             inputs,
@@ -5341,6 +5344,16 @@ class CuteDslRunner(MoERunner):
                 sm80, v["w1_weight"].shape, v["w2_weight"].shape, device
             )
             v = {**v, **dict(zip(keys, sm80, strict=True))}
+        elif self._below_sm100() and "sm80_fc1_records" in v:
+            # W4A16 reads the records prepared with the view over all experts; an
+            # expert-parallel shard converts the weights on every call.
+            experts, num_experts = self.config.experts, self.config.routing.num_experts
+            if experts.local_expert_offset == 0 and experts.local_num_experts in (
+                None,
+                num_experts,
+            ):
+                records = (v["sm80_fc1_records"], v["sm80_fc2_records"])
+                v = {**v, "w1_weight_sf": records[0], "w2_weight_sf": records[1]}
 
         pair = self.config.quant.pair
         use_per_token_activation = bool(self.config.quant.per_token_scale)

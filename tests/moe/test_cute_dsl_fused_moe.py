@@ -357,7 +357,7 @@ def _compute_moe_quant_mode_reference(tensors, quant_mode, swap_ab=False, **kwar
 
 
 def _assert_moe_quant_mode_reference(actual, expected, quant_mode, swap_ab=False):
-    # Below SM100 W4A16 runs on the CUTLASS SM80 kernels, which round
+    # Below SM100 W4A16 runs on the records or CUTLASS SM80 kernels, which round
     # differently from the split kernel the W4A16 oracle follows.
     if quant_mode == "w4a16" and is_sm100_family():
         assert_w4a16_bits(actual, expected)
@@ -2335,6 +2335,60 @@ class TestCuteDslMoeW4A16:
         full = run(torch.arange(pool, device="cuda"))
         perm = torch.randperm(pool, device="cuda", generator=gen)
         assert torch.equal(run(perm), full[perm])
+
+
+@cute_dsl_available
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability(0)[0] not in (8, 9),
+    reason="W4A16 records run below SM100",
+)
+@pytest.mark.parametrize("gated", [True, False])
+def test_w4a16_records_tactics(gated: bool):
+    """Every records tactic gives the same output, within tolerance of the reference. GEMM1
+    takes three 128-column records; the gated GEMM2 K of 192 ends in a 64-wide tail."""
+    from flashinfer import cute_dsl_fused_moe
+    from flashinfer.fused_moe.cute_dsl.tuner import W4A16_SM80_TACTICS
+
+    tensors = create_moe_tensors(
+        num_tokens=100,
+        hidden_size=256,
+        intermediate_size=192 if gated else 384,
+        num_experts=8,
+        num_local_experts=8,
+        top_k=2,
+        gated=gated,
+    )
+    activation = ActivationType.Swiglu if gated else ActivationType.Relu2
+    outputs = [
+        cute_dsl_fused_moe(
+            x=tensors["x_bf16"],
+            x_sf=None,
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=None,
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=8,
+            top_k=2,
+            quant_mode="w4a16",
+            use_fused_finalize=False,
+            activation_type=activation,
+            tactic=tactic,
+        )
+        for tactic in W4A16_SM80_TACTICS
+    ]
+    _assert_moe_quant_mode_reference(
+        outputs[0],
+        split_w4a16_reference_from_tensors(tensors, activation_type=activation),
+        "w4a16",
+    )
+    for tactic, output in zip(W4A16_SM80_TACTICS[1:], outputs[1:], strict=True):
+        assert torch.equal(output, outputs[0]), tactic
 
 
 # =============================================================================

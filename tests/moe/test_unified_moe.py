@@ -2958,7 +2958,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
         )
         assert_cute_dsl_moe_bits(actual, reference)
         return
-    # Below SM100 NVFP4 x BF16 runs on the CUTLASS SM80 kernels, which round
+    # Below SM100 NVFP4 x BF16 runs on the records or CUTLASS SM80 kernels, which round
     # differently from the split kernel the exact reference follows.
     if (
         quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16)

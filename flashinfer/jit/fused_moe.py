@@ -211,6 +211,27 @@ def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
     )
 
 
+def gen_w4a16_moe_sm80_module() -> JitSpec:
+    """BF16 x NVFP4 MoE records kernels for SM80 to SM90.
+
+    SM86, SM87 and SM89 run the sm_80 code; SM90 gets its own sm_90 build.
+    """
+    archs = current_compilation_context.TARGET_CUDA_ARCHS
+    nvcc_flags = []
+    if any(major == 8 for major, _ in archs):
+        nvcc_flags.append("-gencode=arch=compute_80,code=sm_80")
+    if any(major == 9 for major, _ in archs):
+        nvcc_flags.append("-gencode=arch=compute_90,code=sm_90")
+    if not nvcc_flags:
+        raise RuntimeError("W4A16 MoE records kernels need an SM80 to SM90 target")
+    return gen_jit_spec(
+        "w4a16_moe_sm80",
+        [jit_env.FLASHINFER_CSRC_DIR / "w4a16_moe_sm80.cu"],
+        extra_cuda_cflags=nvcc_flags,
+        use_fast_math=False,
+    )
+
+
 def gen_cutlass_fused_moe_module(
     nvcc_flags: List[str],
     device_arch: str,
