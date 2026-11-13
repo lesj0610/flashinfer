@@ -374,8 +374,7 @@ class DqMmaMultistage<Shape_, IteratorA_, SmemIteratorA_, CacheOpA, IteratorB_, 
 
   /// Perform a threadblock-scoped matrix multiply-accumulate
   template <int LiveMBlocks = Operator::MmaIterations::kRow>
-  CUTLASS_DEVICE
-  void operator()(
+  CUTLASS_DEVICE void operator()(
       ///< problem size of GEMM
       int gemm_k_iterations,
       ///< destination accumulator tile

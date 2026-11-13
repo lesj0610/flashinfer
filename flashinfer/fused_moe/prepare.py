@@ -2226,7 +2226,8 @@ def _check_sm80_nvfp4_operands(
     ``cutlass_nvfp4_sm80_weights`` returns, with BF16 scales, or with ``sm90`` MXFP4's SM90 one."""
     (num_experts, rows, half_k1), (_, hidden_size, half_k2) = w1_shape, w2_shape
     k1, k2 = round_up(half_k1 * 2, 64), round_up(half_k2 * 2, 64)
-    layouts = (  # each expert's dtype, shape and strides
+    # each expert's dtype, shape and strides
+    layouts: tuple[tuple[torch.dtype, tuple[int, ...], tuple[int, ...]], ...] = (
         (torch.uint8, (rows, half_k1), (k1 // 2, 1)),
         (torch.bfloat16, (k1 // 16, rows), (rows, 1)),
         (torch.uint8, (hidden_size, half_k2), (k2 // 2, 1)),

@@ -208,10 +208,10 @@ class MmaTensorOpComputeBWithF16 {
   /// Performs a warp-level matrix multiply-accumulate operation. On SM80+, only the first
   /// LiveMBlocks rows of mma operations run; D keeps C in the rows after them.
   template <int LiveMBlocks = MmaIterations::kRow>
-  CUTLASS_DEVICE
-  void operator()(FragmentC& D, TransformedFragmentA const& A, TransformedFragmentB const& B,
-                  FragmentC const& C, int const warp_tileB_k_offset,
-                  platform::integral_constant<int, LiveMBlocks> = {}) const {
+  CUTLASS_DEVICE void operator()(FragmentC& D, TransformedFragmentA const& A,
+                                 TransformedFragmentB const& B, FragmentC const& C,
+                                 int const warp_tileB_k_offset,
+                                 platform::integral_constant<int, LiveMBlocks> = {}) const {
     using MmaOperandA = typename ArchMmaOperator::FragmentA;
     using MmaOperandB = typename ArchMmaOperator::FragmentB;
     using MmaOperandC = typename ArchMmaOperator::FragmentC;

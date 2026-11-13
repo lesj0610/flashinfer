@@ -277,16 +277,15 @@ class DqMmaPipelined<Shape_, IteratorA_, SmemIteratorA_, IteratorB_, SmemIterato
 
   /// Perform a threadblock-scoped matrix multiply-accumulate
   template <int LiveMBlocks = Operator::MmaIterations::kRow>
-  CUTLASS_DEVICE
-  void operator()(int gemm_k_iterations,         ///< number of iterations of the mainloop
-                  FragmentC& accum,              ///< destination accumulator tile
-                  IteratorA iterator_A,          ///< iterator over A operand in global memory
-                  IteratorB iterator_B,          ///< iterator over B operand in global memory
-                  IteratorScale iterator_scale,  ///< iterator over scale operand in global memory
-                  FragmentC const& src_accum,    ///< source accumulator tile
-                  ///< rows of mma operations of the warp tile to run (all by default)
-                  platform::integral_constant<int, LiveMBlocks> live_m_blocks = {}) {
-
+  CUTLASS_DEVICE void operator()(
+      int gemm_k_iterations,         ///< number of iterations of the mainloop
+      FragmentC& accum,              ///< destination accumulator tile
+      IteratorA iterator_A,          ///< iterator over A operand in global memory
+      IteratorB iterator_B,          ///< iterator over B operand in global memory
+      IteratorScale iterator_scale,  ///< iterator over scale operand in global memory
+      FragmentC const& src_accum,    ///< source accumulator tile
+      ///< rows of mma operations of the warp tile to run (all by default)
+      platform::integral_constant<int, LiveMBlocks> live_m_blocks = {}) {
     //
     // Prologue
     //
