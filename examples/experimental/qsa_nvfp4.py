@@ -1,4 +1,4 @@
-"""Run QSA sparse paged attention over an NVFP4 KV cache (SM80 through SM90)."""
+"""Run QSA sparse paged attention over an NVFP4 KV cache (SM80 through SM12x)."""
 
 import torch
 
