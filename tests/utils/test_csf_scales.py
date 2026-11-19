@@ -133,6 +133,19 @@ def swizzle_128x4_ref(scales: torch.Tensor):
     return padded.permute(0, 1, 4, 3, 2, 5).reshape(num_matrices, m, k)
 
 
+def transposed_ref(scales: torch.Tensor, padded_cols: int, dtype: torch.dtype):
+    num_matrices, rows, cols = scales.shape
+    out = torch.zeros(num_matrices, padded_cols, rows, dtype=dtype, device="cuda")
+    if dtype != torch.uint8:
+        scales = scales.view(torch.float8_e4m3fn).to(dtype)
+    out[:, :cols] = scales.transpose(1, 2)
+    return out
+
+
+def bits(x: torch.Tensor):
+    return x.view(torch.int16) if x.dtype == torch.bfloat16 else x.view(torch.uint8)
+
+
 @pytest.mark.parametrize(
     "num_matrices,rows,cols",
     [(3, 32, 2), (2, 256, 40), (4, 384, 10), (2, 160, 20), (2, 256, 448)],
@@ -145,13 +158,24 @@ def test_expand_csf_scales_layouts(num_matrices, rows, cols, swap_row_halves):
     csf = encode_csf_scales(scales)
     if swap_row_halves:
         scales = swap_halves(scales)
-    for ref, layout in (
-        (scales, SfLayout.layout_linear),
-        (swizzle_128x4_ref(scales), SfLayout.layout_128x4),
+    bf16 = torch.bfloat16
+    linear = SfLayout.layout_linear
+    for ref, layout, transpose in (
+        (scales, linear, False),
+        (scales.view(torch.float8_e4m3fn).to(bf16), linear, False),
+        (transposed_ref(scales, round_up(cols, 4), bf16), linear, True),
+        (transposed_ref(scales, cols + 3, torch.uint8), linear, True),
+        (swizzle_128x4_ref(scales), SfLayout.layout_128x4, False),
     ):
-        out = torch.full_like(ref, 0x5A)
-        expand_csf_scales(csf, out, layout=layout, swap_row_halves=swap_row_halves)
-        assert torch.equal(out, ref), layout
+        out = torch.full_like(bits(ref), 0x5A).view(ref.dtype)
+        expand_csf_scales(
+            csf,
+            out,
+            layout=layout,
+            transpose=transpose,
+            swap_row_halves=swap_row_halves,
+        )
+        assert torch.equal(bits(out), bits(ref)), (ref.dtype, layout, transpose)
     if get_compute_capability(out.device)[0] >= 9:  # block_scale_interleave needs SM90+
         assert torch.equal(out, block_scale_interleave(scales).view_as(out))
 
@@ -163,18 +187,25 @@ def test_expand_csf_scales_no_rows():
         expand_csf_scales(csf, out, layout=layout)
 
 
-def test_expand_csf_scales_too_wide():
-    csf = encode_csf_scales(torch.zeros(16, 2048, dtype=torch.uint8, device="cuda"))
-    out = torch.empty(1, 16, 2048, dtype=torch.uint8, device="cuda")
+@pytest.mark.parametrize("transpose", [False, True])
+def test_expand_csf_scales_too_wide(transpose):
+    # Transposed bfloat16 also keeps a conversion table in shared memory.
+    def ref(scales):
+        if not transpose:
+            return scales
+        return transposed_ref(scales, scales.shape[2], torch.bfloat16)
+
+    def expand(scales):
+        out = torch.empty_like(ref(scales))
+        return expand_csf_scales(encode_csf_scales(scales), out, transpose=transpose)
+
     with pytest.raises(ValueError, match="supports up to") as e:
-        expand_csf_scales(csf, out)
+        expand(torch.zeros(1, 16, 2048, dtype=torch.uint8, device="cuda"))
     check_encode(np.zeros((1, 32, 32), np.uint8))  # no CUDA error left behind
     # A full 128-row tile at the widest width the device accepts expands.
     cols = int(str(e.value).split("up to ")[1].split()[0])
     scales = random_scales(np.random.default_rng(cols), (1, 128, cols))
-    out = torch.empty_like(scales)
-    expand_csf_scales(encode_csf_scales(scales), out)
-    assert torch.equal(out, scales)
+    assert torch.equal(bits(expand(scales)), bits(ref(scales)))
 
 
 def check_routed(out, ref, poison, routed):
@@ -208,14 +239,12 @@ def test_expand_csf_scales_cuda_graph():
     num_experts, top_k = 32, 4
     scales = random_scales(np.random.default_rng(3), (num_experts, 384, 40))
     csf = encode_csf_scales(scales)
-    ref = swizzle_128x4_ref(swap_halves(scales))
+    ref = bits(transposed_ref(swap_halves(scales), 40, torch.bfloat16))
     ids = torch.zeros(8, top_k, dtype=torch.int32, device="cuda")
-    out = torch.empty_like(ref)
+    out = torch.empty(ref.shape, dtype=torch.bfloat16, device="cuda")
 
     def expand():
-        expand_csf_scales(
-            csf, out, ids, layout=SfLayout.layout_128x4, swap_row_halves=True
-        )
+        expand_csf_scales(csf, out, ids, transpose=True, swap_row_halves=True)
 
     expand()
     graph = torch.cuda.CUDAGraph()
@@ -226,6 +255,6 @@ def test_expand_csf_scales_cuda_graph():
             8, num_experts, generator=torch.Generator().manual_seed(seed)
         )
         ids.copy_(routing.topk(top_k).indices)
-        out.fill_(0xFF)
+        bits(out).fill_(-1)
         graph.replay()
-        check_routed(out, ref, 0xFF, set(ids.flatten().tolist()))
+        check_routed(bits(out), ref, -1, set(ids.flatten().tolist()))
