@@ -85,7 +85,7 @@ from ...quantization.nvfp4_quantization_utils import (
     nvfp4_e4m3_max,
     resolve_nvfp4_4over6,
 )
-from ...utils import supported_compute_capability
+from ...utils import check_shape_dtype_device, supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
@@ -1117,7 +1117,7 @@ class CuteDslMoEWrapper:
     parameter or `autotune()` context.
 
     Supported architectures: SM100, SM103, and SM107. W4A8 and W8A8 are limited to
-    SM100 and SM103.
+    SM100 and SM103. SM80 to SM90 run the records path of :func:`cute_dsl_fused_moe`.
 
     Attributes:
         num_experts: Total number of experts.
@@ -1155,7 +1155,7 @@ class CuteDslMoEWrapper:
         ...     output = moe.run(x, x_sf, topk_ids, topk_weights, w1, w1_sf, ...)
     """
 
-    @supported_compute_capability([100, 103, 107])
+    @supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107])
     @flashinfer_api
     def __init__(
         self,
@@ -1591,6 +1591,20 @@ class CuteDslMoEWrapper:
         torch.Tensor
             Output tensor of shape ``[num_tokens, hidden_size]``.
         """
+        if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
+            # Below SM100: the functional API's records path under this configuration.
+            return cute_dsl_fused_moe(
+                x, x_sf, token_selected_experts, token_final_scales, w1_weight, w1_weight_sf,
+                w1_alpha, fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha, self.num_experts,
+                self.top_k, self.num_local_experts, self.local_expert_offset, self.output_dtype,
+                enable_pdl=self.enable_pdl, activation_type=self.activation_type.value,
+                swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta,
+                swiglu_limit=self.swiglu_limit, situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta, quant_mode=self.quant_mode,
+                per_token_scale=per_token_scale, tactic=tactic, nvfp4_4over6=nvfp4_4over6,
+                clamped_relu2_limit=self.clamped_relu2_limit,
+                routing_weights_before_fc2=self.routing_weights_before_fc2,
+            )  # fmt: skip
         validate_pre_fc2_options(
             self.routing_weights_before_fc2,
             per_token_scale=per_token_scale is not None,
@@ -1855,7 +1869,7 @@ def _cute_dsl_fused_moe_impl(
     )
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107])
 @flashinfer_api(trace=cute_dsl_fused_moe_trace)
 def cute_dsl_fused_moe(
     x: torch.Tensor,
@@ -1904,7 +1918,10 @@ def cute_dsl_fused_moe(
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
     Supported architectures: SM100, SM103, and SM107. W4A8 and W8A8 are limited to
-    SM100 and SM103. This is the simple functional API; for CUDA-graph support
+    SM100 and SM103. SM80 to SM90 run W4A4 and W4A16 on the records of
+    :func:`prepare_records_nvfp4_weights` in ``w1_weight_sf`` and ``w2_weight_sf``, W4A8 on
+    those of :func:`prepare_records_mxfp4_weights` (their global scales in the alphas).
+    This is the simple functional API; for CUDA-graph support
     use :class:`CuteDslMoEWrapper` instead.
 
     Auto-tuning is controlled by the :func:`autotune` context manager::
@@ -2098,6 +2115,81 @@ def cute_dsl_fused_moe(
     """
     quant_mode = _canonicalize_quant_mode(quant_mode)
     recipe_kwargs = _cute_dsl_recipe_kwargs(nvfp4_4over6, quant_mode, per_token_scale)
+    if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
+        # Below SM100 W4A4, W4A16 and W4A8 run on records (prepare_records_nvfp4_weights;
+        # W4A8 prepare_records_mxfp4_weights, their global scales in the alphas), which hold
+        # the weights too, in the weight-scale slots: the weights give only shapes.
+        # localized_* (per-domain copies of these weights) only steer the SM100 kernels.
+        activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_clamped_relu2_config(
+            activation, clamped_relu2_limit, x.device
+        )
+        validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+        w4a4, pt = quant_mode == "w4a4", per_token_scale is not None
+        w4a8 = quant_mode == "w4a8"  # MXFP8 x, GEMM2's input MXFP8 as on SM100
+        validate_pre_fc2_routing(
+            routing_weights_before_fc2, quant_mode, activation, output_dtype,
+            per_token_scale=pt, localized_weights=localized_weights is not None,
+        )  # fmt: skip
+        x16 = (torch.bfloat16, torch.float16)
+        if (
+            quant_mode not in ("w4a4", "w4a16", "w4a8")
+            or (x.dtype in x16) == (w4a4 or w4a8)
+            or output_dtype not in x16
+            or (quant_mode == "w4a16" and x.dtype != output_dtype)
+            or (x_sf is None or fc2_input_scale is None) == w4a4
+            or (w4a8 and (x.dtype != torch.float8_e4m3fn or x_sf is None))
+            or (pt and not w4a4)
+        ):
+            raise NotImplementedError(
+                "Below SM100 CuTe-DSL MoE runs W4A4, W4A16 and W4A8 on records: BF16 or FP16 "
+                "output (the W4A16 input of that type), per token with W4A4."
+            )
+        recipe = resolve_nvfp4_4over6(nvfp4_4over6) if pt else None  # as on SM100
+        if pt and nvfp4_4over6 is not _UNSET:
+            _check_gemm2_input_scale(fc2_input_scale, recipe)
+        from ..core import _records_moe
+
+        shape = (x.shape[0], w2_weight.shape[1])
+        if moe_output is None:
+            moe_output = x.new_empty(shape, dtype=output_dtype)
+        else:
+            check_shape_dtype_device(moe_output, shape, None, None, "moe_output")
+        ids = token_selected_experts
+        if local_expert_offset:  # local ids; the other ranks' are skipped
+            ids = ids - local_expert_offset
+        inputs = [x, ids, token_final_scales, w1_weight_sf, w1_alpha]
+        inputs += [w2_weight_sf, w2_alpha, moe_output]
+        if w4a4:  # per token GEMM2 quantizes its rows under fc2_input_scale
+            x_sf = x_sf.view(torch.uint8).reshape(x.shape[0], -1)
+            inputs[0] = x.view(torch.uint8)
+            inputs += [x_sf] + (
+                [None, fc2_input_scale] if pt else [fc2_input_scale, None]
+            )
+            inputs += [None, per_token_scale]
+        elif w4a8:  # its E8M0 scales [tokens, K / 32]
+            inputs[0] = x.view(torch.uint8)
+            inputs += [x_sf.view(torch.uint8).reshape(x.shape[0], -1), None, None]
+        from ..core import _RecordsExt
+
+        situ, inf = situ_beta is not None, float("inf")
+        rw = token_final_scales if routing_weights_before_fc2 else None
+        if rw is not None:  # GEMM1 weights its rows, the top-k sum adds them
+            inputs[2] = torch.ones_like(rw)
+        ext = _RecordsExt(
+            ActivationType.Situ if situ else activation,
+            (None, None, clamped_relu2_limit),
+            (situ_beta, situ_linear_beta or inf, inf)
+            if situ
+            else (1.0, 0.0, inf)  # GeGLU-tanh reads none of them, as on SM100
+            if activation == ActivationType.GegluTanh
+            else (swiglu_alpha, swiglu_beta, swiglu_limit),
+            rw=rw,
+            x_fmt=int(w4a8),
+            fq=int(w4a8),
+        )
+        inter = w2_weight.shape[2] * 2
+        return _records_moe(inputs, inter, gated, 8192, tactic, recipe=recipe, ext=ext)
     _require_cute_dsl_arch_for(x.device, native_only=True)
     if swap_ab:
         from ..prepare import _cute_dsl_gated_weight_group_size
@@ -2292,7 +2384,7 @@ def cute_dsl_fused_moe(
     return best_runner(inputs, tactic=best_tactic, **call_kwargs)
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107])
 @flashinfer_api(trace=cute_dsl_fused_moe_trace)
 def cute_dsl_fused_moe_nvfp4(
     x: torch.Tensor,
@@ -2389,7 +2481,7 @@ def cute_dsl_fused_moe_nvfp4(
     )
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103])
 @flashinfer_api(trace=cute_dsl_fused_moe_mxfp8_mxfp4_trace)
 def cute_dsl_fused_moe_mxfp8_mxfp4(
     x: torch.Tensor,
@@ -2475,7 +2567,7 @@ class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
     instance to that call's CUDA stream; create one wrapper per stream.
     """
 
-    @supported_compute_capability([100, 103])
+    @supported_compute_capability([80, 86, 87, 89, 90, 100, 103])
     @flashinfer_api
     def __init__(
         self,

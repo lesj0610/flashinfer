@@ -163,19 +163,19 @@ def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
 
 
 def _check_mxfp8_cuda_capability(device: torch.device) -> None:
-    """Reject pre-SM100 CUDA devices while allowing the CPU host path."""
+    """Reject pre-SM80 CUDA devices while allowing the CPU host path."""
     if device.type == "cuda":
         major, minor = get_compute_capability(device)
-        if major < 10:
+        if major < 8:
             raise RuntimeError(
-                "mxfp8_quantize with backend='cuda' requires SM100 or newer, "
+                "mxfp8_quantize with backend='cuda' requires SM80 or newer, "
                 f"got SM{major}{minor}"
             )
 
 
 @functools.cache
-def get_mxfp8_quantization_sm100_module():
-    module = gen_mxfp8_quantization_sm100_module().build_and_load()
+def get_mxfp8_quantization_sm100_module(backend: str = "100"):
+    module = gen_mxfp8_quantization_sm100_module(backend).build_and_load()
 
     @register_custom_op(
         "flashinfer::mxfp8_quantize_sm100",
@@ -413,9 +413,9 @@ def mxfp8_quantize(
         - ``"auto"`` (default): ``"cuda"``, or the batch-invariant kernel
           under ``batch_invariant=True`` (which requires ``"auto"``).
         - ``"cuda"``: stable JIT-compiled kernel. CUDA inputs require
-          SM100 or newer. CPU inputs use the host implementation and
+          SM80 or newer. CPU inputs use the host implementation and
           require ``torch.float32``.
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM80+, **experimental**).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
         ``is_sf_swizzled_layout``.
@@ -442,7 +442,7 @@ def mxfp8_quantize(
     ------
     RuntimeError
         If ``backend="cuda"`` receives a CUDA tensor on a device older
-        than SM100.
+        than SM80.
 
     Warnings
     --------
@@ -502,7 +502,10 @@ def mxfp8_quantize(
         _check_mxfp8_cuda_capability(input.device)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
-        x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
+        # SM80 to SM90 convert to E2M1 and E4M3 in software in their own modules.
+        major = get_compute_capability(input.device)[0] if input.is_cuda else 10
+        module = get_mxfp8_quantization_sm100_module(f"{min(major, 10)}0")
+        x_q, sf = module.mxfp8_quantize_sm100(
             input,
             sf_swizzle_layout,
             alignment,

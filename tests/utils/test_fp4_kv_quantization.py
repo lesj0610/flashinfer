@@ -615,8 +615,8 @@ def test_nvfp4_kv_dequantize_paged_rejects_non_scalar_scale():
 def test_nvfp4_kv_quant(shape, dtype):
     """Test quantization kernel output shapes and basic validity."""
     cc = get_compute_capability()
-    if cc < 100:
-        pytest.skip(f"SM{cc} does not support NVFP4 quantization (requires SM100+)")
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support NVFP4 quantization (requires SM80+)")
 
     M, K = shape
     torch.manual_seed(42)
@@ -642,8 +642,8 @@ def test_nvfp4_kv_quant(shape, dtype):
 def test_nvfp4_kv_roundtrip(shape, dtype):
     """Test quantize -> dequantize roundtrip error is within FP4 precision."""
     cc = get_compute_capability()
-    if cc < 100:
-        pytest.skip(f"SM{cc} does not support NVFP4 quantization (requires SM100+)")
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support NVFP4 quantization (requires SM80+)")
 
     M, K = shape
     torch.manual_seed(42)
