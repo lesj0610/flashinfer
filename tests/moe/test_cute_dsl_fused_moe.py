@@ -70,6 +70,7 @@ from .utils import (
     check_accuracy,
     compute_reference_moe_fp4,
     create_moe_tensors,
+    sm90_fp4_moe_runs,
 )
 
 
@@ -178,19 +179,11 @@ sm100_required = pytest.mark.skipif(
 sm10x_required = sm100_required
 
 
-def _sm90_runs(**tuple_kwargs) -> bool:
-    """Whether SM90 runs this CuTe DSL tuple (flashinfer.fused_moe.sm90)."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 9:
-        return False
-    from flashinfer.fused_moe.sm90.driver import sm90_fp4_moe_supports
-
-    return sm90_fp4_moe_supports("cute_dsl", **tuple_kwargs)
-
-
 # W4A4 per-token 4over6 with SwiGLU, which SM90 runs too.
 sm100_or_sm90_w4a4_4over6_required = pytest.mark.skipif(
     not is_sm100_family()
-    and not _sm90_runs(
+    and not sm90_fp4_moe_runs(
+        "cute_dsl",
         per_token=True,
         nvfp4_4over6=NVFP44Over6Config(),
         activation_type=ActivationType.Swiglu,

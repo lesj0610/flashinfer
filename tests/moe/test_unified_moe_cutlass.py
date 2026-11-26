@@ -65,6 +65,7 @@ from tests.moe.utils import (
     fp8_per_tensor_global_scale,
     fp8_per_tensor_requant_hook,
     powlu_ref,
+    sm90_fp4_moe_runs,
 )
 from flashinfer.utils import (
     get_compute_capability,
@@ -2579,18 +2580,16 @@ cutlass_nvfp4_required = pytest.mark.skipif(
 
 def _is_sm90_cutlass_nvfp4_4over6_supported() -> bool:
     """SM90 runs the per-tensor 4over6 SwiGLU tuple (flashinfer.fused_moe.sm90)."""
-    if not torch.cuda.is_available():
-        return False
-    device = torch.device("cuda")
-    if get_compute_capability(device) != (9, 0) or not CutlassNvfp4Config.supported(90):
-        return False
-    from flashinfer.fused_moe.sm90.driver import sm90_fp4_moe_supports
-
-    return is_sm90a_supported(device) and sm90_fp4_moe_supports(
-        "cutlass",
-        per_token=False,
-        nvfp4_4over6=NVFP44Over6Config(),
-        activation_type=SwiGLU().type,
+    return (
+        torch.cuda.is_available()
+        and is_sm90a_supported(torch.device("cuda"))
+        and CutlassNvfp4Config.supported(90)
+        and sm90_fp4_moe_runs(
+            "cutlass",
+            per_token=False,
+            nvfp4_4over6=NVFP44Over6Config(),
+            activation_type=SwiGLU().type,
+        )
     )
 
 

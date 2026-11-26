@@ -73,11 +73,7 @@ set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
 
 def _skip_unless_sm90_runs(use_4over6: bool, activation_type) -> None:
     """On SM90, skip the NVFP4 tuples flashinfer.fused_moe.sm90 does not run yet."""
-    if torch.cuda.get_device_capability()[0] != 9:
-        return
-    from flashinfer.fused_moe.sm90.driver import sm90_fp4_moe_supports
-
-    if not sm90_fp4_moe_supports(
+    if torch.cuda.get_device_capability()[0] == 9 and not moe_utils.sm90_fp4_moe_runs(
         "cutlass",
         per_token=False,
         nvfp4_4over6=NVFP44Over6Config() if use_4over6 else None,

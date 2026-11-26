@@ -244,6 +244,17 @@ def nvfp4_4over6_env(use_4over6: bool):
             os.environ["FLASHINFER_NVFP4_4OVER6"] = original_value
 
 
+def sm90_fp4_moe_runs(entry: str, **tuple_kwargs) -> bool:
+    """Whether SM90 runs this NVFP4 tuple of ``entry`` (flashinfer.fused_moe.sm90)."""
+    if not torch.cuda.is_available() or get_compute_capability(
+        torch.device("cuda")
+    ) != (9, 0):
+        return False
+    from flashinfer.fused_moe.sm90.driver import sm90_fp4_moe_supports
+
+    return sm90_fp4_moe_supports(entry, **tuple_kwargs)
+
+
 @pytest.fixture(autouse=True)
 def set_nvfp4_4over6_env(request):
     if "use_4over6" not in request.fixturenames:

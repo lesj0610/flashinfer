@@ -71,16 +71,13 @@ def _skip_unless_runs(
     device: torch.device, *, use_4over6: bool, activation_type: ActivationType
 ) -> None:
     """SM100 and SM103 run every case; SM90 the tuples FlashInfer reports it runs."""
-    if get_compute_capability(device)[0] == 9:
-        from flashinfer.fused_moe.sm90.driver import sm90_fp4_moe_supports
-
-        if sm90_fp4_moe_supports(
-            "trtllm",
-            per_token=True,
-            nvfp4_4over6=NVFP44Over6Config() if use_4over6 else None,
-            activation_type=activation_type,
-        ):
-            return
+    if moe_utils.sm90_fp4_moe_runs(
+        "trtllm",
+        per_token=True,
+        nvfp4_4over6=NVFP44Over6Config() if use_4over6 else None,
+        activation_type=activation_type,
+    ):
+        return
     _skip_unless_sm10x(device)
 
 

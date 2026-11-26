@@ -157,6 +157,7 @@ from tests.moe.test_cute_dsl_fused_moe import (  # noqa: E402
 from tests.moe.utils import (  # noqa: E402
     assert_trtllm_packed_call_contract,
     create_relu2_moe_tensors,
+    sm90_fp4_moe_runs,
 )
 
 
@@ -2677,21 +2678,10 @@ sm100_required = pytest.mark.skipif(
 )
 
 
-def _sm90_runs(entry: str, **tuple_kwargs) -> bool:
-    """Whether SM90 runs this NVFP4 tuple of ``entry`` (flashinfer.fused_moe.sm90)."""
-    if not torch.cuda.is_available() or get_compute_capability(
-        torch.device("cuda")
-    ) != (9, 0):
-        return False
-    from flashinfer.fused_moe.sm90.driver import sm90_fp4_moe_supports
-
-    return sm90_fp4_moe_supports(entry, **tuple_kwargs)
-
-
 # TRT-LLM NVFP4 per-token 4over6 with SwiGLU, which SM90 runs too.
 sm100_or_sm90_trtllm_4over6_required = pytest.mark.skipif(
     not _is_unified_nvfp4_arch()
-    and not _sm90_runs(
+    and not sm90_fp4_moe_runs(
         "trtllm",
         per_token=True,
         nvfp4_4over6=NVFP44Over6Config(),
