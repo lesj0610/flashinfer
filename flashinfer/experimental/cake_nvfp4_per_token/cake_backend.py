@@ -1959,8 +1959,6 @@ def generated_program_available(device: torch.device) -> bool:
     The tactic of a shape is resolved for the device's actual SM count; a shape
     whose kernel is not registered raises ``NotImplementedError`` naming the key
     at preparation (:func:`kernel_module_name`)."""
-    if get_compute_capability(device) == (9, 0):
-        return True  # SM90 runs the per-token GEMM as the wgmma dense GEMM, no generated program
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(get_compute_capability(device))
     if arch is None:
         return False
