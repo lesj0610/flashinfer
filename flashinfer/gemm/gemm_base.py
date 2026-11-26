@@ -3525,9 +3525,19 @@ def fp8_gemm_sm100(
         "cudnn": lambda: _cudnn_gemm_fp8_runner(),
         "cute-dsl_sm107": _cute_dsl_fp8_gemm_runner_sm107,
     }
-    runners = [
-        runner_factories[name]() for name in runner_names if name in runner_factories
-    ]
+    major, minor = get_compute_capability(a.device)
+    # SM8x has no FP8 MMA: every backend runs the SM8x dense GEMM, but SM89 keeps
+    # its native cuBLAS / cuDNN runners
+    if major == 8 and (minor != 9 or not {"cublas", "cudnn"} & set(runner_names)):
+        from .sm8x_fp8_dense import Sm8xFp8Runner
+
+        runners = [Sm8xFp8Runner(runner_names)]
+    else:
+        runners = [
+            runner_factories[name]()
+            for name in runner_names
+            if name in runner_factories
+        ]
     assert runners, "No suitable runners found"
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
@@ -6556,7 +6566,7 @@ def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
     return (tuple(block_scale_shape), tuple(block_scale_stride))
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _trtllm_low_latency_gemm_fp8_requirement(a: torch.Tensor, b: torch.Tensor, **_):
     if b.ndim != 3:
         raise ValueError(
@@ -6583,13 +6593,13 @@ def _check_mm_fp8_unprocessed_weight(a: torch.Tensor, b: torch.Tensor) -> None:
         raise ValueError("mm_fp8 requires FP8 operands")
 
 
-@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cublas_mm_fp8_requirement(a: torch.Tensor, b: torch.Tensor, **_):
     _check_mm_fp8_unprocessed_weight(a, b)
     return True
 
 
-@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cudnn_mm_fp8_requirement(
     a: torch.Tensor, b: torch.Tensor, backend: str = "auto", **_
 ):
@@ -6597,7 +6607,7 @@ def _cudnn_mm_fp8_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cutlass_mm_fp8_requirement(a: torch.Tensor, b: torch.Tensor, **_):
     _check_mm_fp8_unprocessed_weight(a, b)
     if a.dtype == torch.float8_e5m2 or b.dtype == torch.float8_e5m2:
@@ -6634,7 +6644,7 @@ def _fp8_unit_scale(device: torch.device) -> torch.Tensor:
     return torch.ones(1, dtype=torch.float32, device=device)
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _cutedsl_low_latency_blockscaled_gemm_fp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -6814,9 +6824,10 @@ def mm_fp8(
                 f"Output dtype mismatch. Expected {out_dtype}, got {out.dtype}."
             )
 
-    if backend == "trtllm_low_latency":
+    sm8x = get_compute_capability(a.device)[0] == 8  # every backend runs fp8_gemm_sm100
+    if backend == "trtllm_low_latency" and not sm8x:
         trtllm_low_latency_gemm(a, b, alpha, out)
-    elif backend == "cutedsl_low_latency":
+    elif backend == "cutedsl_low_latency" and not sm8x:
         k = a.shape[1]
         scale_sizes = [((rows + 127) // 128) * (k // 128) * 512 for rows in (n, m)]
         workspace = _get_stream_cache_buf(
@@ -6849,7 +6860,7 @@ def mm_fp8(
             "mm_fp8_cutedsl_low_latency", [runner], TuningConfig(), inputs
         )
         runner(inputs=inputs, tactic=tactic)
-    elif runner_names:
+    elif runner_names or sm8x:
         # bmm_fp8 runners with batch 1; (n, k) row-major is bmm_fp8's column-major B.
         unit_scale = _fp8_unit_scale(a.device)
         workspace_buffer = _get_stream_cache_buf(
@@ -6857,12 +6868,12 @@ def mm_fp8(
         )
         fp8_gemm_sm100(
             a.unsqueeze(0),
-            b.t().unsqueeze(0),
+            b if b.ndim == 3 else b.t().unsqueeze(0),
             alpha if alpha is not None else unit_scale,
             unit_scale,
             out.unsqueeze(0),
             workspace_buffer,
-            runner_names,
+            runner_names or [backend],
         )
     else:
         raise ValueError(
@@ -11079,7 +11090,7 @@ def mm_fp4(
     return out
 
 
-@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cudnn_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -11093,7 +11104,7 @@ def _cudnn_bmm_fp8_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
-@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cublas_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -11107,7 +11118,7 @@ def _cublas_bmm_fp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cutlass_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -11125,8 +11136,9 @@ def _cutlass_bmm_fp8_requirement(
 
 # cute-dsl bmm_fp8 is Rubin (sm107) only; the heuristic below never offers it
 # on sm100/sm103, so advertising those here would let an explicit
-# backend="cute-dsl" through to an empty runner list and an assert.
-@supported_compute_capability([107])
+# backend="cute-dsl" through to an empty runner list and an assert. SM8x takes
+# the empty list to its dense GEMM.
+@supported_compute_capability([80, 86, 87, 89, 107])
 def _cute_dsl_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -11142,7 +11154,8 @@ def _cute_dsl_bmm_fp8_requirement(
         raise ValueError(
             "CuTe-DSL is not available. Please install cutlass with cute support."
         )
-    _check_cute_dsl_arch(A.device)
+    if get_compute_capability(A.device)[0] != 8:  # SM8x generates no CuTe-DSL code
+        _check_cute_dsl_arch(A.device)
 
     # Check dimensions are 3D (batch, m, k) and (batch, k, n)
     if A.dim() != 3 or B.dim() != 3:
