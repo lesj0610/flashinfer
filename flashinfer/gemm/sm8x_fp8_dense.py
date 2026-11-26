@@ -1213,8 +1213,9 @@ def sm8x_mm_fp8_lora(
 ) -> None:
     """``mm_fp8_lora`` on SM8x: the FP32 ``a_scale * b_scale * (a @ b.T)`` of the validated
     E4M3 ``a`` ``(M, K)`` and ``b`` ``(N, K)``, plus ``lora_scale * (d @ lora_b.T)`` when all
-    three are given and ``lora_scale != 0`` (read on the device; zero keeps the base bitwise),
-    plus ``bias``, rounded once to ``out``."""
+    three are given and ``lora_scale != 0`` (read on the device, never the host: a zero scale
+    still computes the product, then keeps the base bitwise), plus ``bias``, rounded once to
+    ``out``."""
     from ..fused_moe.utils import (
         get_hybrid_num_tokens_buckets,
         map_to_hybrid_bucket_uncapped,

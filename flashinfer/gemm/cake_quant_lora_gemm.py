@@ -1566,8 +1566,10 @@ def mm_fp8_lora(
     Notes
     -----
     * Architectures: SM8x (the SM8x dense FP8 GEMM, with the correction and ``bias``
-      added in fp32 before the single rounding), SM90 (H100 / H200), SM100 (B200) and
-      SM103 (B300); SM120 / SM121 are not supported.
+      added in fp32 before the single rounding; ``lora_scale`` is read on the device, so
+      ``lora_scale == 0`` still computes the correction and drops it, the output bitwise the
+      adapter-off one), SM90 (H100 / H200), SM100 (B200) and SM103 (B300); SM120 / SM121
+      are not supported.
     * Shape rules: ``M >= 1``, ``N`` a positive multiple of 8; ``K`` a multiple of 128
       on SM8x / SM100 / SM103 and of 16 on SM90 (where additionally ``M * N <= 2**32``); the
       LoRA rank ``r = d.shape[1]`` must be one of ``(32, 64, 128)``.  Violations raise
