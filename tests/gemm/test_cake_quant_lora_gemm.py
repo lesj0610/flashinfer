@@ -1534,7 +1534,10 @@ CONTRACT_FLOORS: dict[str, dict[str, dict[str, float]]] = {
 }
 
 FAMILIES = ("nvfp4", "fp8")
-FAMILY_CAPABILITIES = {"nvfp4": ((10, 0), (10, 3)), "fp8": ((9, 0), (10, 0), (10, 3))}
+FAMILY_CAPABILITIES = {
+    "nvfp4": ((10, 0), (10, 3)),
+    "fp8": ((8, 0), (8, 6), (8, 7), (8, 9), (9, 0), (10, 0), (10, 3)),
+}
 MIN_SQNR_DB = 40.0
 MAX_REL_TO_MAX = 0.01
 OUTER_BOUND = {"nvfp4": (1.0, 0.1), "fp8": (0.1, 0.1)}

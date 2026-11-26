@@ -1198,3 +1198,47 @@ def sm8x_mm_16bit_fp8(
         "mm_16bit_fp8_sm8x", [Sm8x16BitFp8Runner()], tuning, inputs
     )
     chosen(inputs=inputs, tactic=tactic)
+
+
+def sm8x_mm_fp8_lora(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    d: Optional[torch.Tensor],
+    lora_b: Optional[torch.Tensor],
+    lora_scale: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+) -> None:
+    """``mm_fp8_lora`` on SM8x: the FP32 ``a_scale * b_scale * (a @ b.T)`` of the validated
+    E4M3 ``a`` ``(M, K)`` and ``b`` ``(N, K)``, plus ``lora_scale * (d @ lora_b.T)`` when all
+    three are given and ``lora_scale != 0`` (read on the device; zero keeps the base bitwise),
+    plus ``bias``, rounded once to ``out``."""
+    from ..fused_moe.utils import (
+        get_hybrid_num_tokens_buckets,
+        map_to_hybrid_bucket_uncapped,
+    )
+
+    m, n = (int(x) for x in out.shape)
+    acc = torch.empty((1, m, n), dtype=torch.float32, device=a.device)
+    tuning = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                (0,), (1,), get_hybrid_num_tokens_buckets, map_to_hybrid_bucket_uncapped
+            ),
+        ),
+        constraint_specs=(ConstraintSpec(4, 1, lambda shapes: shapes[0][1]),),
+    )
+    inputs = [a[None], b.t()[None], a_scale, b_scale, acc]
+    chosen, tactic = AutoTuner.get().choose_one(
+        "mm_fp8_lora_sm8x", [Sm8xFp8Runner(())], tuning, inputs
+    )
+    chosen(inputs=inputs, tactic=tactic)
+    c = acc[0]
+    if d is not None and lora_b is not None and lora_scale is not None:
+        s = lora_scale.reshape(1)
+        c = torch.where(s == 0, c, c.addcmul(d.float() @ lora_b.float().t(), s))
+    if bias is not None:
+        c = c + bias.float()
+    out.copy_(c)

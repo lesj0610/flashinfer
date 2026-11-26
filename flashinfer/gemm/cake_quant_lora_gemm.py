@@ -61,6 +61,7 @@ from ..jit.cake_quant_lora_gemm import (
 from ..utils import (
     _get_cache_buf,
     backend_requirement,
+    get_compute_capability,
     get_device_sm_count,
     supported_compute_capability,
 )
@@ -1157,7 +1158,11 @@ def _select_for_call(
     d: Optional[torch.Tensor],
     adapter_state: str,
 ) -> tuple[str, CakeQuantLoraTarget, int]:
-    target = cake_quant_lora_target(a.device)
+    # SM8x runs the records FP8 GEMM (``sm8x_mm_fp8_lora``) under the SM100 program rules.
+    if get_compute_capability(a.device)[0] == 8:
+        target: CakeQuantLoraTarget = "sm100a"
+    else:
+        target = cake_quant_lora_target(a.device)
     m = int(a.shape[0])
     n = int(b.shape[0])
     k = int(a.shape[1]) * (2 if family == FAMILY_NVFP4 else 1)
@@ -1196,7 +1201,7 @@ def _cake_nvfp4_lora_requirement(
     return True
 
 
-@supported_compute_capability([90, 100, 103])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103])
 def _cake_fp8_lora_requirement(
     a, b, a_scale, b_scale, d=None, lora_b=None, lora_scale=None, **kwargs
 ):
@@ -1237,6 +1242,14 @@ def _run(
     has_bias = bias is not None
     if out is None:
         out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+    if get_compute_capability(device)[0] == 8:
+        from .sm8x_fp8_dense import sm8x_mm_fp8_lora
+
+        sm8x_mm_fp8_lora(
+            a, b, scale_views["a_scale"], scale_views["b_scale"], d, lora_b,
+            lora_scale, bias, out,
+        )  # fmt: skip
+        return out
     if adapter_state == "prepared":
         # The prepared path: the adapter's folded operand and its own scale are the LoRA operands (the kernel reads
         # the scale on the device; lora_scale == 0 takes its zero-adapter path), no fold and no host read per call.
@@ -1552,10 +1565,11 @@ def mm_fp8_lora(
 
     Notes
     -----
-    * Architectures: SM90 (H100 / H200), SM100 (B200) and SM103 (B300); SM120 / SM121
-      are not supported.
+    * Architectures: SM8x (the SM8x dense FP8 GEMM, with the correction and ``bias``
+      added in fp32 before the single rounding), SM90 (H100 / H200), SM100 (B200) and
+      SM103 (B300); SM120 / SM121 are not supported.
     * Shape rules: ``M >= 1``, ``N`` a positive multiple of 8; ``K`` a multiple of 128
-      on SM100 / SM103 and of 16 on SM90 (where additionally ``M * N <= 2**32``); the
+      on SM8x / SM100 / SM103 and of 16 on SM90 (where additionally ``M * N <= 2**32``); the
       LoRA rank ``r = d.shape[1]`` must be one of ``(32, 64, 128)``.  Violations raise
       ``ValueError`` naming the violated requirement.  On SM100 / SM103 the pair-tile
       width is resolved from the shape and the device SM count; it is not a caller knob.  On
