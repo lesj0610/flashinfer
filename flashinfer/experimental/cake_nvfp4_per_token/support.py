@@ -32,7 +32,7 @@ CAKE_K_TILE = 256  # smallest mainloop K tile of the generated GEMM programs
 
 
 @experimental_backend
-@supported_compute_capability([100, 103])
+@supported_compute_capability([80, 86, 87, 89, 100, 103])
 def cake_mm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
