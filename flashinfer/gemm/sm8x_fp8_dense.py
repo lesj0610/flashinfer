@@ -35,7 +35,7 @@ from ..autotuner import (
     TuningConfig,
 )
 from ..fused_moe.core import _w4a16_moe_sm80_module
-from .sm8x_fp4_dense import _ones, _out_module, _pad
+from .sm8x_fp4_dense import _lora_epilogue, _ones, _out_module, _pad
 
 _E4M3, _E5M2 = torch.float8_e4m3fn, torch.float8_e5m2
 _FMT = {_E4M3: 1, _E5M2: 2}
@@ -1377,10 +1377,7 @@ def sm8x_mm_fp8_lora(
         "mm_fp8_lora_sm8x", [Sm8xFp8Runner(())], tuning, inputs
     )
     chosen(inputs=inputs, tactic=tactic)
-    c = acc[0]
-    if d is not None and lora_b is not None and lora_scale is not None:
-        s = lora_scale.reshape(1)
-        c = torch.where(s == 0, c, c.addcmul(d.float() @ lora_b.float().t(), s))
-    if bias is not None:
-        c = c + bias.float()
-    out.copy_(c)
+    has_lora = lora_b is not None and lora_scale is not None
+    _lora_epilogue(
+        acc[0], d if has_lora else None, lora_b, lora_scale, lora_scale, bias, out
+    )

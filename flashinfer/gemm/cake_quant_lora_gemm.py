@@ -1151,6 +1151,13 @@ def _check_mm_fp8_lora_problem(
     return True
 
 
+def _lora_target(device: torch.device) -> CakeQuantLoraTarget:
+    # SM8x runs the records GEMMs (``sm8x_mm_fp8_lora``, ``sm8x_mm_nvfp4_lora``) under the SM100 program rules.
+    if get_compute_capability(device)[0] == 8:
+        return "sm100a"
+    return cake_quant_lora_target(device)
+
+
 def _select_for_call(
     family: str,
     a: torch.Tensor,
@@ -1158,11 +1165,7 @@ def _select_for_call(
     d: Optional[torch.Tensor],
     adapter_state: str,
 ) -> tuple[str, CakeQuantLoraTarget, int]:
-    # SM8x runs the records FP8 GEMM (``sm8x_mm_fp8_lora``) under the SM100 program rules.
-    if get_compute_capability(a.device)[0] == 8:
-        target: CakeQuantLoraTarget = "sm100a"
-    else:
-        target = cake_quant_lora_target(a.device)
+    target = _lora_target(a.device)
     m = int(a.shape[0])
     n = int(b.shape[0])
     k = int(a.shape[1]) * (2 if family == FAMILY_NVFP4 else 1)
@@ -1181,7 +1184,7 @@ def _select_for_call(
     return template, target, sm_count
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([80, 86, 87, 89, 100, 103])
 def _cake_nvfp4_lora_requirement(
     a,
     b,
@@ -1242,13 +1245,28 @@ def _run(
     has_bias = bias is not None
     if out is None:
         out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
-    if get_compute_capability(device)[0] == 8:
+    if get_compute_capability(device)[0] == 8 and family == FAMILY_FP8:
         from .sm8x_fp8_dense import sm8x_mm_fp8_lora
 
         sm8x_mm_fp8_lora(
             a, b, scale_views["a_scale"], scale_views["b_scale"], d, lora_b,
             lora_scale, bias, out,
         )  # fmt: skip
+        return out
+    if get_compute_capability(device)[0] == 8:
+        # The term the SM100 program adds, gated on the device scale it reads.
+        from .sm8x_fp4_dense import sm8x_mm_nvfp4_lora
+
+        alpha = scale_views["alpha"]
+        if adapter_state == "prepared":
+            lora = (d, lora_adapter.b_folded, alpha, lora_adapter.lora_scale)
+        elif d is not None and lora_b is not None and lora_scale is not None:
+            lora = (d, lora_b, lora_scale, lora_scale)
+        else:
+            lora = (None, None, None, None)
+        sm8x_mm_nvfp4_lora(
+            a, b, scale_views["SFA"], scale_views["SFB"], alpha, *lora, bias, out
+        )
         return out
     if adapter_state == "prepared":
         # The prepared path: the adapter's folded operand and its own scale are the LoRA operands (the kernel reads
@@ -1430,8 +1448,11 @@ def mm_nvfp4_lora(
 
     Notes
     -----
-    * Architectures: SM100 (B200) and SM103 (B300) only; SM120 / SM121 are not
-      supported (the kernel uses tcgen05 / TMEM).
+    * Architectures: SM8x (the SM8x dense NVFP4 GEMM, with the correction and ``bias``
+      added in fp32 before the single rounding; the scale gating the correction is read on
+      the device, so a zero scale keeps the output bitwise the adapter-off one), SM100
+      (B200) and SM103 (B300); SM120 / SM121 are not supported (the kernel uses tcgen05 /
+      TMEM).
     * Shape rules: ``M >= 1``, ``N >= 1``, ``K`` a multiple of 256; the LoRA rank
       ``r = d.shape[1]`` must be one of ``(32, 64, 128)``.  Violations raise
       ``ValueError`` naming the violated requirement.
@@ -1466,7 +1487,7 @@ def mm_nvfp4_lora(
     sf_cols = k // _SF_BLOCK
     # Every NVFP4 program shares the scale-operand form: 128-row atoms of (K / MMA_K) 512-byte sets viewed as
     # uint32 words, one TMA box per 128-row x K=256 scale block (the delivered test asserts the shared form).
-    record = PROGRAMS[_templates_for(FAMILY_NVFP4, cake_quant_lora_target(a.device))[0]]
+    record = PROGRAMS[_templates_for(FAMILY_NVFP4, _lora_target(a.device))[0]]
     sf_rows = int(record["sf_row_pad"])
     sf_sets = k // int(record["sf_mma_k"])
     padded_m = _ceil_div(m, sf_rows) * sf_rows

@@ -125,9 +125,9 @@ def test_sm120_svdquant_can_implement_rejects_ragged_rank():
     )
 
 
-def _skip_unless_sm100():
+def _skip_unless_sm100(sm8x: bool = False):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] != 10:
+    if compute_capability[0] != 10 and not (sm8x and compute_capability[0] == 8):
         pytest.skip(
             "NVFP4 SVDQuant kernels require SM100-class GPUs, "
             f"got compute capability {compute_capability}."
@@ -293,7 +293,7 @@ def _make_gemm_problem(
 @pytest.mark.parametrize("m", [44, 129, 256, 1000])
 @pytest.mark.parametrize("n", [3072, 12288, 4096])
 def test_nvfp4_quantize_smooth(m, n):
-    _skip_unless_sm100()
+    _skip_unless_sm100(sm8x=True)
     torch.manual_seed(0)
     device = "cuda"
     x = torch.randn(m, n, dtype=torch.bfloat16, device=device) / (n**0.25)
@@ -433,7 +433,7 @@ def test_mm_nvfp4_svdquant_rank_chunks(m, rank, tactic):
 
 
 def test_mm_nvfp4_svdquant_rejects_bad_rank():
-    _skip_unless_sm100()
+    _skip_unless_sm100(sm8x=True)
     torch.manual_seed(0)
     m, n, k = 128, 3072, 3072
     p = _make_gemm_problem(m, n, k, rank=64)
@@ -455,7 +455,7 @@ def test_mm_nvfp4_svdquant_rejects_bad_rank():
 
 
 def test_mm_nvfp4_svdquant_sm100_pooled_alpha_uses_first_element():
-    _skip_unless_sm100()
+    _skip_unless_sm100(sm8x=True)
     torch.manual_seed(0)
     p = _make_gemm_problem(129, 3072, 3072, rank=32)
     expected = mm_nvfp4_svdquant(
@@ -487,7 +487,7 @@ def test_mm_nvfp4_svdquant_sm100_pooled_alpha_uses_first_element():
 @pytest.mark.parametrize("m", [129, 6912])
 @pytest.mark.parametrize("rank", [32, 96])
 def test_mm_nvfp4_svdquant_autotuned(m, rank):
-    _skip_unless_sm100()
+    _skip_unless_sm100(sm8x=True)
     torch.manual_seed(0)
     n, k = 3072, 3072
     p = _make_gemm_problem(m, n, k, rank=rank)
@@ -523,7 +523,7 @@ def test_mm_nvfp4_svdquant_autotuned(m, rank):
 @pytest.mark.parametrize("use_bias", [False, True])
 @pytest.mark.parametrize("rank", [_RANK, 64])
 def test_svdquant_linear_matches_reference(use_bias, rank):
-    _skip_unless_sm100()
+    _skip_unless_sm100(sm8x=True)
     torch.manual_seed(0)
     m, n, k = 129, 3072, 3072
     device = "cuda"
@@ -1134,6 +1134,9 @@ def test_mm_nvfp4_svdquant_cuda_graph(rank):
     assert torch.equal(out_graph, out_eager)
 
 
+_CAKE_CAPABILITIES = ((8, 0), (8, 6), (8, 7), (8, 9), (10, 0), (10, 3))
+
+
 @pytest.mark.parametrize(
     "m,k,rank,use_bias",
     [
@@ -1148,8 +1151,8 @@ def test_mm_nvfp4_svdquant_cuda_graph(rank):
     ],
 )
 def test_mm_nvfp4_svdquant_cake_cuda_graph_replay(m, k, rank, use_bias):
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    if torch.cuda.get_device_capability() not in _CAKE_CAPABILITIES:
+        pytest.skip("Cake NVFP4 SVDQuant requires SM8x, SM100 or SM103")
     if get_cuda_version() < Version("13.0"):
         pytest.skip("Cake NVFP4 SVDQuant requires CUDA 13.0 or later")
     torch.manual_seed(0)
@@ -1184,8 +1187,8 @@ def test_mm_nvfp4_svdquant_cake_cuda_graph_replay(m, k, rank, use_bias):
 
 @pytest.mark.parametrize("use_bias", [False, True])
 def test_mm_nvfp4_svdquant_cake_pooled_scale_buffers(use_bias):
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    if torch.cuda.get_device_capability() not in _CAKE_CAPABILITIES:
+        pytest.skip("Cake NVFP4 SVDQuant requires SM8x, SM100 or SM103")
     if get_cuda_version() < Version("13.0"):
         pytest.skip("Cake NVFP4 SVDQuant requires CUDA 13.0 or later")
     torch.manual_seed(0)
@@ -1255,8 +1258,8 @@ def test_mm_nvfp4_svdquant_sm120_cuda_graph_replay(backend):
 
 
 def test_mm_nvfp4_svdquant_cake_requires_cuda13():
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    if torch.cuda.get_device_capability() not in _CAKE_CAPABILITIES:
+        pytest.skip("Cake NVFP4 SVDQuant requires SM8x, SM100 or SM103")
     if get_cuda_version() >= Version("13.0"):
         pytest.skip("Requires an unsupported CUDA toolkit")
     p = _make_gemm_problem(129, 3072, 3072, rank=32)
@@ -1274,8 +1277,8 @@ def test_mm_nvfp4_svdquant_cake_requires_cuda13():
 
 
 def _skip_unless_cake_backend():
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    if torch.cuda.get_device_capability() not in _CAKE_CAPABILITIES:
+        pytest.skip("Cake NVFP4 SVDQuant requires SM8x, SM100 or SM103")
     if get_cuda_version() < Version("13.0"):
         pytest.skip("Cake NVFP4 SVDQuant requires CUDA 13.0 or later")
 
