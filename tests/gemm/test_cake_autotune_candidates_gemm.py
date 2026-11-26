@@ -51,7 +51,7 @@ FP4_N, FP4_K = 2112, 7168
 
 
 def _cake_arch() -> bool:
-    return get_compute_capability(torch.device("cuda")) in ((10, 0), (10, 3))
+    return get_compute_capability(torch.device("cuda")) in ((9, 0), (10, 0), (10, 3))
 
 
 def _skip_unless_cake_bf16_bmm_supported():
@@ -66,7 +66,7 @@ def _skip_unless_cake_bf16_bmm_supported():
 
 def _skip_unless_cake_fp4_supported():
     if not _cake_arch():
-        pytest.skip("cake per-token NVFP4 GEMM requires SM100 or SM103.")
+        pytest.skip("cake per-token NVFP4 GEMM requires SM90, SM100 or SM103.")
     if not cb.generated_program_available(torch.device("cuda")):
         pytest.skip("no generated per-token NVFP4 program registered for this GPU")
     if not is_cute_dsl_available():
@@ -760,8 +760,6 @@ def test_cake_candidates_absent_on_unsupported_arch(monkeypatch, fresh_tuner):
     if _cake_arch():
         pytest.skip("covers architectures without the cake GEMMs")
     compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability == (9, 0):
-        pytest.skip("SM90 serves the cake mm_fp4 per-token path (tests/sm90)")
     cc = compute_capability[0] * 10 + compute_capability[1]
     assert not mm_fp4.is_backend_supported("cake", cc)
     assert not bmm_bf16.is_backend_supported("cake", cc)
