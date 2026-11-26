@@ -1,0 +1,875 @@
+#!/usr/bin/env python3
+"""nvcc_emu: nvcc drop-in that builds sm_90a CUDA code into sm_80 binaries (PLAN section 3).
+
+Flow:
+  1. Architecture options (-arch/-code/-gencode and long forms) are replaced by the single
+     ``-gencode=arch=compute_<A>,code=sm_<A>`` (A from WGEMU_SRC_ARCH, default 90a).
+  2. ``<real nvcc> -dryrun -keep -keep-dir <dir> <args>`` lists the compilation steps; the
+     ``#$ NAME=value`` lines are exported, the other ``#$`` lines are run one by one.
+  3. Every PTX written by cicc for compute_86+ is translated in place with ptxemu (the
+     emulation library PTX is merged right after the module header, ``.target`` becomes sm_80).
+     PTX files given as inputs are translated into the keep directory before ptxas reads them.
+  4. ptxas / nvlink ``sm_9x`` -> ``sm_80``; fatbinary ``--image3=kind=elf,sm=90a`` -> ``sm=80``;
+     PTX images (kind=ptx) are dropped.
+
+Environment:
+  WGEMU_DISABLE=1        run the real nvcc unchanged
+  WGEMU_MODE             exact (default) | fast | check
+  WGEMU_SRC_ARCH         90a (default) | 90
+  WGEMU_TRAP=1           check mode: trap on violations
+  WGEMU_ALLOW_CLUSTER=1  drop .reqnctapercluster > 1 instead of failing
+  WGEMU_ASYNC_DELAY=1    E1: asynchronous copies into shared memory (cp.async.bulk global->shared,
+                         cp.async.bulk.tensor loads, cp.async) write poison at issue; the data
+                         arrives when a thread observes the completion (mbarrier test_wait /
+                         try_wait success, cp.async.wait_group / wait_all). Violations print
+                         WGEMU-VIOLATION async-delay-* (tools/ptxemu/instrument.py)
+  WGEMU_DL_SLOTS         E1 pool slots per module (default 128: CTAs running at the same time)
+  WGEMU_DL_RECORDS       E1 pending copies per CTA (default 4096)
+  WGEMU_COUNT=1          E2: per-launch counters; host/shim.c prints one WGEMU-COUNT line per
+                         launch of a counted kernel
+  WGEMU_REAL_NVCC        real nvcc path (default: CUDA home recorded by make_cuda_home_shadow.sh,
+                         then $CUDA_HOME/bin/nvcc, then /usr/local/cuda/bin/nvcc)
+  WGEMU_LIB              use this emu_lib.ptx instead of building runtime/emu_lib.cu
+  WGEMU_CACHE_DIR        emu_lib.ptx cache (default ~/.cache/wgemu)
+  WGEMU_INVENTORY        inventory.tsv for the remaining-opcode check
+  WGEMU_KEEP=1           keep all intermediate files
+
+Extra option (removed before calling nvcc):
+  --wgemu-shadow <relpath>:<regex>:<replacement>
+      Copy the header <relpath> (found through -I / -isystem) into <keep>/wgemu_shadow with
+      re.subn(regex, replacement, text, flags=re.M) applied (at least one match required) and
+      put that directory first on the include path. ':' inside the fields is written '\\:'.
+
+The translation report (<stem>.wgemu_report.json), the remaining sm_86+ check
+(<stem>.wgemu_check.txt), the original PTX (<stem>.wgemu_orig.ptx) and the command list
+(wgemu_cmds.sh) stay in the keep directory: -keep-dir if given, otherwise <output>.wgemu.d.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+TOOLS_DIR = Path(os.path.realpath(__file__)).parent
+ROOT = TOOLS_DIR.parent
+SHADOW_MARKER = ".wgemu_real_cuda_home"
+
+INFO_FLAGS = {
+    "--version",
+    "-V",
+    "--help",
+    "-h",
+    "--list-gpu-arch",
+    "-arch-ls",
+    "--list-gpu-code",
+    "-code-ls",
+}
+ARCH_OPTS = {
+    "-arch",
+    "--gpu-architecture",
+    "-code",
+    "--gpu-code",
+    "-gencode",
+    "--generate-code",
+}
+UNSUPPORTED_OPTS = {
+    "-dlto": "link-time optimization emits NVVM IR instead of PTX",
+    "--dlink-time-opt": "link-time optimization emits NVVM IR instead of PTX",
+    "-lto": "link-time optimization emits NVVM IR instead of PTX",
+    "-split-compile": "split compilation runs cicc per partition",
+    "--split-compile": "split compilation runs cicc per partition",
+    "-split-compile-extended": "split compilation runs cicc per partition",
+    "--split-compile-extended": "split compilation runs cicc per partition",
+}
+# Options whose value may be given as the next argument.
+VALUE_OPTS = {
+    "-o",
+    "--output-file",
+    "-I",
+    "--include-path",
+    "-isystem",
+    "--system-include",
+    "-include",
+    "--pre-include",
+    "-L",
+    "--library-path",
+    "-l",
+    "--library",
+    "-D",
+    "--define-macro",
+    "-U",
+    "--undefine-macro",
+    "-x",
+    "--x",
+    "-ccbin",
+    "--compiler-bindir",
+    "-cudart",
+    "--cudart",
+    "-cudadevrt",
+    "--cudadevrt",
+    "-std",
+    "--std",
+    "-odir",
+    "--output-directory",
+    "-ldir",
+    "--libdevice-directory",
+    "-MF",
+    "--dependency-output",
+    "-MT",
+    "--dependency-target-name",
+    "-Xcompiler",
+    "--compiler-options",
+    "-Xlinker",
+    "--linker-options",
+    "-Xarchive",
+    "--archive-options",
+    "-Xptxas",
+    "--ptxas-options",
+    "-Xnvlink",
+    "--nvlink-options",
+    "-Xcudafe",
+    "-Xfatbin",
+    "--fatbin-options",
+    "-t",
+    "--threads",
+    "-maxrregcount",
+    "--maxrregcount",
+    "-rdc",
+    "--relocatable-device-code",
+    "-Werror",
+    "--Werror",
+    "-diag-suppress",
+    "--diag-suppress",
+    "-diag-warn",
+    "--diag-warn",
+    "-diag-error",
+    "--diag-error",
+    "-keep-dir",
+    "--keep-dir",
+    "-optf",
+    "--options-file",
+    "-ftz",
+    "--ftz",
+    "-prec-div",
+    "--prec-div",
+    "-prec-sqrt",
+    "--prec-sqrt",
+    "-fmad",
+    "--fmad",
+    "-default-stream",
+    "--default-stream",
+    "-time",
+    "--time",
+    "-run-args",
+    "--run-args",
+    "-dopt",
+    "--dopt",
+    "-frandom-seed",
+    "--frandom-seed",
+    "-jump-table-density",
+    "--jump-table-density",
+    "-compress-mode",
+    "--compress-mode",
+    "-host-linker-script",
+    "--host-linker-script",
+    "-ext-tool",
+    "--ext-tool",
+    "-arch",
+    "--gpu-architecture",
+    "-code",
+    "--gpu-code",
+    "-gencode",
+    "--generate-code",
+    "--wgemu-shadow",
+    "-ftemplate-depth",
+    "--ftemplate-depth",
+    "-static-global-template-stub",
+    "--static-global-template-stub",
+    "-device-entity-has-hidden-visibility",
+    "--device-entity-has-hidden-visibility",
+}
+
+_ENV_LINE_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)\Z")
+_TOOL_ARCH_RE = re.compile(
+    r"(?P<pre>(?<!\S)\"?-{1,2}(?:arch|gpu-name)(?:=|\s+)\"?)(?P<kind>sm|compute)_(?P<num>\d+)[af]?"
+)
+_CICC_ARCH_RE = re.compile(r"(?<!\S)-arch\s+\"?compute_(\d+)[af]?")
+_OUT_RE = re.compile(r'(?<!\S)-o\s+(?:"([^"]*)"|(\S+))')
+_FATBIN_PTX_RE = re.compile(
+    r'\s(?:"--image3=kind=ptx,[^"]*"|--image3=kind=ptx,\S*|"--image=profile=compute_[^"]*"|--image=profile=compute_\S*)'
+)
+_FATBIN_ELF_RE = re.compile(r"(--image3=kind=elf,sm=)(\d+)[af]?")
+_FATBIN_OLD_RE = re.compile(r"(--image=profile=sm_)(\d+)[af]?")
+_FATBIN_LTO_RE = re.compile(r"--image3=kind=(?!elf|ptx)\w+")
+_INCLUDE_RE = re.compile(r'^(\s*#\s*include\s*)"([^"]+)"', re.M)
+
+
+class EmuError(Exception):
+    pass
+
+
+def log(msg: str) -> None:
+    print(f"nvcc_emu: {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------------------------
+# Real nvcc, library
+# ---------------------------------------------------------------------------------------------
+
+
+def find_real_nvcc() -> str:
+    me = os.path.realpath(__file__)
+    cands: list[tuple[str, str]] = []
+    env = os.environ.get("WGEMU_REAL_NVCC")
+    if env:
+        cands.append(("WGEMU_REAL_NVCC", env))
+    else:
+        marker = Path(os.path.abspath(sys.argv[0])).parent.parent / SHADOW_MARKER
+        if marker.is_file():
+            cands.append(
+                (str(marker), str(Path(marker.read_text().strip()) / "bin" / "nvcc"))
+            )
+        home = os.environ.get("CUDA_HOME")
+        if home:
+            hm = Path(home) / SHADOW_MARKER
+            if hm.is_file():
+                cands.append(
+                    (str(hm), str(Path(hm.read_text().strip()) / "bin" / "nvcc"))
+                )
+            else:
+                cands.append(("CUDA_HOME", str(Path(home) / "bin" / "nvcc")))
+        cands.append(("default", "/usr/local/cuda/bin/nvcc"))
+    for origin, path in cands:
+        if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+            if origin == "WGEMU_REAL_NVCC" or origin.endswith(SHADOW_MARKER):
+                raise EmuError(f"real nvcc from {origin} is not executable: {path}")
+            continue
+        if os.path.realpath(path) == me:
+            if origin in ("WGEMU_REAL_NVCC",) or origin.endswith(SHADOW_MARKER):
+                raise EmuError(
+                    f"real nvcc from {origin} resolves to nvcc_emu itself: {path}"
+                )
+            continue
+        return path
+    raise EmuError("cannot find the real nvcc; set WGEMU_REAL_NVCC")
+
+
+def _hash_tree(h: Any, base: Path) -> None:
+    if not base.is_dir():
+        return
+    for f in sorted(base.rglob("*")):
+        if not f.is_file() or "__pycache__" in f.parts or f.suffix == ".pyc":
+            continue
+        h.update(str(f.relative_to(ROOT)).encode() + b"\0")
+        h.update(f.read_bytes() + b"\0")
+
+
+def library_plan(real_nvcc: str) -> tuple[Path, list[str] | None]:
+    """(emu_lib.ptx path, build command or None if it already exists / was given)."""
+    given = os.environ.get("WGEMU_LIB")
+    if given:
+        p = Path(given)
+        if not p.is_file():
+            raise EmuError(f"WGEMU_LIB={given} does not exist")
+        return p, None
+    src = ROOT / "runtime" / "emu_lib.cu"
+    if not src.is_file():
+        raise EmuError(
+            f"emulation library source {src} not found (or set WGEMU_LIB=<emu_lib.ptx>)"
+        )
+    cmd = [
+        real_nvcc,
+        "-arch=compute_80",
+        "-rdc=true",
+        "--ptx",
+        "-O3",
+        "-std=c++17",
+        "-I",
+        str(ROOT / "include"),
+        str(src),
+        "-o",
+    ]
+    h = hashlib.sha256()
+    _hash_tree(h, ROOT / "runtime")
+    _hash_tree(h, ROOT / "include")
+    ver = subprocess.run(
+        [real_nvcc, "--version"], capture_output=True, text=True, check=False
+    )
+    if ver.returncode != 0:
+        raise EmuError(f"{real_nvcc} --version failed: {ver.stderr.strip()}")
+    h.update(ver.stdout.encode())
+    h.update("\0".join(cmd[1:]).encode())
+    cache = Path(os.environ.get("WGEMU_CACHE_DIR") or Path.home() / ".cache" / "wgemu")
+    out = cache / f"emu_lib.{h.hexdigest()[:20]}.ptx"
+    return out, (None if out.is_file() else cmd)
+
+
+def ensure_library(path: Path, cmd: list[str] | None) -> None:
+    if cmd is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_suffix(".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if path.is_file():
+            return
+        fd, tmp = tempfile.mkstemp(
+            prefix=path.stem + ".", suffix=".tmp.ptx", dir=path.parent
+        )
+        os.close(fd)
+        try:
+            r = subprocess.run([*cmd, tmp], capture_output=True, text=True, check=False)
+            if r.returncode != 0:
+                raise EmuError(
+                    f"building the emulation library failed (rc={r.returncode}):\n{shlex.join([*cmd, tmp])}\n{r.stdout}{r.stderr}"
+                )
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+
+# ---------------------------------------------------------------------------------------------
+# Argument handling
+# ---------------------------------------------------------------------------------------------
+
+
+def expand_options_files(args: list[str]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        name, eq, val = a.partition("=")
+        if name in ("-optf", "--options-file"):
+            if not eq:
+                if i + 1 >= len(args):
+                    raise EmuError(f"{a} needs a value")
+                val = args[i + 1]
+                i += 1
+            for f in val.split(","):
+                out.extend(expand_options_files(shlex.split(Path(f).read_text())))
+        else:
+            out.append(a)
+        i += 1
+    return out
+
+
+def split_shadow_spec(spec: str) -> tuple[str, str, str]:
+    parts: list[str] = []
+    cur: list[str] = []
+    i = 0
+    while i < len(spec):
+        c = spec[i]
+        if c == "\\" and i + 1 < len(spec) and spec[i + 1] == ":":
+            cur.append(":")
+            i += 2
+            continue
+        if c == ":":
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    parts.append("".join(cur))
+    if len(parts) != 3 or not parts[0] or not parts[1]:
+        raise EmuError(
+            f"--wgemu-shadow expects <relpath>:<regex>:<replacement>, got {spec!r}"
+        )
+    return parts[0], parts[1], parts[2]
+
+
+class Parsed:
+    def __init__(self) -> None:
+        self.forward: list[str] = []
+        self.inputs: list[str] = []
+        self.output: str | None = None
+        self.keep = False
+        self.keep_dir: str | None = None
+        self.dryrun = False
+        self.verbose = False
+        self.include_dirs: list[str] = []
+        self.shadow: list[tuple[str, str, str]] = []
+        # dependency output (-MD/-MMD with -MF/-MT): written by a separate real-nvcc -M run,
+        # since nvcc -dryrun lists it as an internal "-- Filter Dependencies --" step
+        self.dep_mode: str | None = None
+        self.dep_file: str | None = None
+        self.dep_target: str | None = None
+
+
+def parse_args(args: list[str]) -> Parsed:
+    p = Parsed()
+    i = 0
+    n = len(args)
+    while i < n:
+        a = args[i]
+        if not a.startswith("-") or a == "-":
+            p.inputs.append(a)
+            p.forward.append(a)
+            i += 1
+            continue
+        name, eq, val = a.partition("=")
+        if name in UNSUPPORTED_OPTS:
+            raise EmuError(f"{name} is not supported: {UNSUPPORTED_OPTS[name]}")
+        takes_next = name in VALUE_OPTS and not eq
+        if takes_next:
+            if i + 1 >= n:
+                raise EmuError(f"option {name} needs a value")
+            val = args[i + 1]
+        step = 2 if takes_next else 1
+        if name in ARCH_OPTS:
+            pass  # replaced by the normalized -gencode
+        elif name == "--wgemu-shadow":
+            p.shadow.append(split_shadow_spec(val))
+        elif a in ("-keep", "--keep", "-save-temps", "--save-temps"):
+            p.keep = True
+        elif name in ("-keep-dir", "--keep-dir"):
+            p.keep_dir = val
+        elif a in ("-dryrun", "--dryrun"):
+            p.dryrun = True
+        elif a in ("-v", "--verbose"):
+            p.verbose = True
+        elif a in ("-MD", "--generate-dependencies-with-compile"):
+            p.dep_mode = "-M"
+        elif a in ("-MMD", "--generate-nonsystem-dependencies-with-compile"):
+            p.dep_mode = "-MM"
+        elif name in ("-MF", "--dependency-output"):
+            p.dep_file = val
+        elif name in ("-MT", "--dependency-target-name"):
+            p.dep_target = val
+        else:
+            if name in ("-o", "--output-file"):
+                p.output = val
+            elif name in ("-I", "--include-path", "-isystem", "--system-include"):
+                p.include_dirs.extend(v for v in val.split(",") if v)
+            elif a.startswith("-I") and len(a) > 2 and not eq:
+                p.include_dirs.append(a[2:])
+            p.forward.extend(args[i : i + step])
+        i += step
+    return p
+
+
+def default_keep_dir(p: Parsed, cwd: Path) -> tuple[Path, bool]:
+    """(directory, is_temporary)."""
+    if p.keep_dir:
+        return Path(p.keep_dir).resolve(), False
+    if p.keep:
+        return cwd, False  # nvcc -keep writes intermediates to the current directory
+    if p.output and not os.path.abspath(p.output).startswith("/dev/"):
+        return Path(os.path.abspath(p.output + ".wgemu.d")), False
+    if not p.output and p.inputs:
+        return cwd / (Path(p.inputs[0]).name + ".wgemu.d"), False
+    return Path(tempfile.mkdtemp(prefix="nvcc_emu.")), True
+
+
+def make_shadow_headers(p: Parsed, kd: Path) -> list[str]:
+    if not p.shadow:
+        return []
+    root = kd / "wgemu_shadow"
+    grouped: dict[str, list[tuple[str, str]]] = {}
+    for rel, rx, repl in p.shadow:
+        grouped.setdefault(rel, []).append((rx, repl))
+    for rel, subs in grouped.items():
+        src = None
+        for d in p.include_dirs:
+            cand = Path(d) / rel
+            if cand.is_file():
+                src = cand.resolve()
+                break
+        if src is None:
+            raise EmuError(
+                f"--wgemu-shadow: {rel} not found in the include path {p.include_dirs}"
+            )
+        text = src.read_text()
+        for rx, repl in subs:
+            try:
+                text, count = re.subn(rx, repl, text, flags=re.M)
+            except re.error as e:
+                raise EmuError(f"--wgemu-shadow {rel}: bad regex {rx!r}: {e}") from None
+            if count == 0:
+                raise EmuError(
+                    f"--wgemu-shadow {rel}: regex {rx!r} matched nothing in {src}"
+                )
+
+        def absolute(m: re.Match, base: Path = src.parent) -> str:
+            name = m.group(2)
+            target = base / name
+            if not os.path.isabs(name) and target.is_file():
+                return f'{m.group(1)}"{target.resolve()}"'
+            return m.group(0)
+
+        text = _INCLUDE_RE.sub(absolute, text)
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(text)
+    return [f"-I{root}"]
+
+
+def normalize_arch() -> str:
+    a = os.environ.get("WGEMU_SRC_ARCH", "90a")
+    # 89 / 86: sm_8x sources (e.g. sm_89 fp8 mma) translated for sm_80.
+    if a not in ("90a", "90", "89", "86"):
+        raise EmuError(f"WGEMU_SRC_ARCH={a} (expected 90a, 90, 89 or 86)")
+    return f"-gencode=arch=compute_{a},code=sm_{a}"
+
+
+# ---------------------------------------------------------------------------------------------
+# Command rewriting
+# ---------------------------------------------------------------------------------------------
+
+
+def parse_env_value(raw: str) -> str:
+    v = raw.rstrip()
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"' and v.count('"') == 2:
+        v = v[1:-1]
+    return v
+
+
+def tool_of(cmd: str) -> str:
+    try:
+        first = shlex.split(cmd)[0]
+    except (ValueError, IndexError):
+        first = cmd.split()[0] if cmd.split() else ""
+    return os.path.basename(first)
+
+
+def _rewrite_arch(cmd: str) -> str:
+    def sub(m: re.Match) -> str:
+        if int(m.group("num")) <= 80:
+            return m.group(0)
+        return f"{m.group('pre')}{m.group('kind')}_80"
+
+    return _TOOL_ARCH_RE.sub(sub, cmd)
+
+
+def rewrite_fatbinary(cmd: str) -> str:
+    m = _FATBIN_LTO_RE.search(cmd)
+    if m:
+        raise EmuError(f"fatbinary image {m.group(0)} is not supported")
+    out = _FATBIN_PTX_RE.sub("", cmd)
+    out = _FATBIN_ELF_RE.sub(
+        lambda m: m.group(1) + ("80" if int(m.group(2)) > 80 else m.group(2)), out
+    )
+    return _FATBIN_OLD_RE.sub(
+        lambda m: m.group(1) + ("80" if int(m.group(2)) > 80 else m.group(2)), out
+    )
+
+
+def cicc_output(cmd: str) -> tuple[int, str] | None:
+    """(compute arch, -o path) of a cicc command that needs translation, else None."""
+    m = _CICC_ARCH_RE.search(cmd)
+    if not m or int(m.group(1)) <= 80:
+        return None
+    outs = _OUT_RE.findall(cmd)
+    if not outs:
+        raise EmuError(f"cannot find the cicc output in: {cmd}")
+    path = outs[-1][0] or outs[-1][1]
+    if not path.endswith(".ptx"):
+        raise EmuError(
+            f"cicc output {path} is not PTX (LTO / NVVM IR output is not supported)"
+        )
+    return int(m.group(1)), path
+
+
+def ptxas_inputs(cmd: str) -> list[str]:
+    toks = shlex.split(cmd)
+    out = []
+    for k, t in enumerate(toks[1:], 1):
+        if t.endswith(".ptx") and toks[k - 1] != "-o" and not t.startswith("-"):
+            out.append(t)
+    return out
+
+
+def replace_path(cmd: str, old: str, new: str) -> str:
+    q_old = f'"{old}"'
+    if q_old in cmd:
+        return cmd.replace(q_old, f'"{new}"')
+    rx = re.compile(r"(?<!\S)" + re.escape(old) + r"(?!\S)")
+    if not rx.search(cmd):
+        raise EmuError(f"cannot locate {old} in: {cmd}")
+    return rx.sub(lambda _m: shlex.quote(new), cmd)
+
+
+# ---------------------------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------------------------
+
+
+class Driver:
+    def __init__(self, real: str, p: Parsed, kd: Path) -> None:
+        self.real = real
+        self.p = p
+        self.kd = kd
+        self._lib: Path | None = None
+        self.mode = os.environ.get("WGEMU_MODE", "exact")
+        if self.mode not in ("exact", "fast", "check"):
+            raise EmuError(f"WGEMU_MODE={self.mode} (expected exact, fast or check)")
+        self.trap = os.environ.get("WGEMU_TRAP") == "1"
+        self.allow_cluster = os.environ.get("WGEMU_ALLOW_CLUSTER") == "1"
+        self.async_delay = os.environ.get("WGEMU_ASYNC_DELAY") == "1"
+        self.count = os.environ.get("WGEMU_COUNT") == "1"
+        self.dl_slots = os.environ.get("WGEMU_DL_SLOTS", "")
+        self.dl_records = os.environ.get("WGEMU_DL_RECORDS", "")
+        for name, val in (
+            ("WGEMU_DL_SLOTS", self.dl_slots),
+            ("WGEMU_DL_RECORDS", self.dl_records),
+        ):
+            if val and not val.isdigit():
+                raise EmuError(f"{name}={val} (expected a positive integer)")
+        self.inventory = os.environ.get("WGEMU_INVENTORY")
+        self.translated: set[str] = set()
+        self.stems: dict[str, int] = {}
+        self.script: list[str] = [
+            "#!/usr/bin/env bash",
+            "set -e",
+            f"cd {shlex.quote(os.getcwd())}",
+        ]
+        self.cwd = Path.cwd()
+
+    def echo(self, line: str) -> None:
+        if self.p.verbose or self.p.dryrun:
+            print(f"#$ {line}", file=sys.stderr)
+
+    def library(self) -> Path:
+        """emu_lib.ptx, built (or found in the cache) on first use."""
+        if self._lib is None:
+            lib, cmd = library_plan(self.real)
+            if cmd is not None:
+                self.script.append(
+                    shlex.join([*cmd, str(lib)]) + "   # emulation library build"
+                )
+                self.echo(shlex.join([*cmd, str(lib)]) + "   # emulation library build")
+                if not self.p.dryrun:
+                    ensure_library(lib, cmd)
+            self._lib = lib
+        return self._lib
+
+    def translate(self, src: str, dst: str) -> None:
+        srcp = (self.cwd / src).resolve()
+        dstp = (self.cwd / dst).absolute()
+        stem = srcp.stem
+        n = self.stems.get(stem, 0)
+        self.stems[stem] = n + 1
+        if n:
+            stem = f"{stem}.{n}"
+        orig = self.kd / f"{stem}.wgemu_orig.ptx"
+        report = self.kd / f"{stem}.wgemu_report.json"
+        argv = [
+            str(orig),
+            "-o",
+            str(dstp),
+            "--lib",
+            str(self.library()),
+            "--mode",
+            self.mode,
+            "--report",
+            str(report),
+        ]
+        if self.trap:
+            argv.append("--trap")
+        if self.allow_cluster:
+            argv.append("--allow-cluster")
+        if self.async_delay:
+            argv.append("--async-delay")
+            if self.dl_slots:
+                argv += ["--dl-slots", self.dl_slots]
+            if self.dl_records:
+                argv += ["--dl-records", self.dl_records]
+        if self.count:
+            argv.append("--count")
+        if self.inventory:
+            argv += ["--inventory", self.inventory]
+        shell = f"cp {shlex.quote(str(srcp))} {shlex.quote(str(orig))} && PYTHONPATH={shlex.quote(str(TOOLS_DIR))} {shlex.quote(sys.executable)} -m ptxemu {shlex.join(argv)}"
+        self.script.append(shell)
+        self.echo(shell)
+        if not self.p.dryrun:
+            shutil.copyfile(srcp, orig)
+            if str(TOOLS_DIR) not in sys.path:
+                sys.path.insert(0, str(TOOLS_DIR))
+            from ptxemu import cli  # noqa: PLC0415
+
+            rc = cli.main(argv)
+            self.write_check(stem, report, rc)
+            if rc != 0:
+                raise EmuError(f"ptxemu failed (rc={rc}) on {srcp}; see {report}")
+        # recorded in dry runs too, so a later ptxas step does not list a second translation
+        self.translated.add(str(dstp))
+
+    def write_check(self, stem: str, report: Path, rc: int) -> None:
+        lines = [f"ptxemu exit status: {rc}"]
+        try:
+            rep = json.loads(report.read_text())
+        except (OSError, ValueError) as e:
+            lines.append(f"no report: {e}")
+            rep = {}
+        if "error" in rep:
+            lines.append(f"translation error: {rep['error']}")
+        chk = rep.get("check") or {}
+        rem = chk.get("remaining")
+        if rem is not None:
+            lines.append(f"remaining sm_{chk.get('min_sm')}+ items: {len(rem)}")
+            lines += [
+                f"  line {r['line']}: {r['kind']} {r['token']} (inventory {r['inventory']!r})"
+                for r in rem
+            ]
+        (self.kd / f"{stem}.wgemu_check.txt").write_text("\n".join(lines) + "\n")
+
+    def run_cmd(self, cmd: str, env: dict[str, str]) -> None:
+        tool = tool_of(cmd)
+        post = None
+        if tool == "cicc":
+            post = cicc_output(cmd)
+        elif tool == "ptxas":
+            cmd = _rewrite_arch(cmd)
+            for inp in ptxas_inputs(cmd):
+                absp = str((self.cwd / inp).absolute())
+                if absp in self.translated:
+                    continue
+                stem = Path(inp).stem
+                dst = self.kd / f"{stem}.wgemu_input.ptx"
+                self.translate(inp, str(dst))
+                cmd = replace_path(cmd, inp, str(dst))
+        elif tool == "nvlink":
+            cmd = _rewrite_arch(cmd)
+        elif tool == "fatbinary":
+            cmd = rewrite_fatbinary(cmd)
+        self.script.append(cmd)
+        self.echo(cmd)
+        if not self.p.dryrun:
+            r = subprocess.run(["bash", "-c", cmd], env=env, cwd=self.cwd, check=False)
+            if r.returncode != 0:
+                if tool == "rm":
+                    pass  # nvcc removes a stale file that usually does not exist
+                else:
+                    raise EmuError(
+                        f"command failed (rc={r.returncode}): {cmd}", r.returncode
+                    )
+        if post is not None:
+            _, out = post
+            self.translate(out, out)
+
+
+def cleanup(kd: Path, temp: bool, before: set[str]) -> None:
+    if temp:
+        shutil.rmtree(kd, ignore_errors=True)
+        return
+    for f in kd.iterdir():
+        if (
+            f.name in before
+            or not f.is_file()
+            or "wgemu" in f.name
+            or f.suffix == ".ptx"
+        ):
+            continue
+        f.unlink()
+
+
+def write_deps(real: str, p: Parsed, fwd: list[str]) -> int:
+    """Dependency file for -MD/-MMD: real nvcc -M/-MM over the same inputs and flags."""
+    if p.dep_file is None:
+        log("error: -MD/-MMD without -MF is not supported")
+        return 1
+    args: list[str] = []
+    i = 0
+    while i < len(fwd):
+        a = fwd[i]
+        if a in ("-o", "--output-file"):
+            i += 2
+            continue
+        if a.startswith(("-o=", "--output-file=")) or a in ("-c", "--compile"):
+            i += 1
+            continue
+        args.append(a)
+        i += 1
+    target = p.dep_target or p.output
+    cmd = [real, p.dep_mode, *args, "-o", p.dep_file]
+    if target:
+        cmd[2:2] = ["-MT", target]
+    r = subprocess.run(cmd, check=False)
+    if r.returncode != 0:
+        log(f"error: dependency generation failed (rc={r.returncode})")
+    return r.returncode
+
+
+def main(argv: list[str]) -> int:
+    real = find_real_nvcc()
+    if (
+        os.environ.get("WGEMU_DISABLE") == "1"
+        or not argv
+        or any(a in INFO_FLAGS for a in argv)
+    ):
+        os.execv(real, [real, *argv])
+    args = expand_options_files(argv)
+    p = parse_args(args)
+    cwd = Path.cwd()
+    kd, temp = default_keep_dir(p, cwd)
+    kd.mkdir(parents=True, exist_ok=True)
+    before = {f.name for f in kd.iterdir()}
+    fwd = [normalize_arch(), *make_shadow_headers(p, kd), *p.forward]
+    dry = subprocess.run(
+        [real, "-dryrun", "-keep", "-keep-dir", str(kd), *fwd],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if dry.stdout:
+        sys.stdout.write(dry.stdout)
+    if dry.returncode != 0:
+        sys.stderr.write(dry.stderr)
+        return dry.returncode
+    drv = Driver(real, p, kd)
+    env = dict(os.environ)
+    cmds: list[str] = []
+    for line in dry.stderr.splitlines():
+        if not line.startswith("#$ "):
+            if line.strip():
+                print(line, file=sys.stderr)
+            continue
+        body = line[3:]
+        m = _ENV_LINE_RE.match(body)
+        if m:
+            env[m.group(1)] = parse_env_value(m.group(2))
+            drv.script.append(f"export {m.group(1)}={shlex.quote(env[m.group(1)])}")
+            drv.echo(body)
+        else:
+            cmds.append(body)
+    try:
+        for cmd in cmds:
+            drv.run_cmd(cmd, env)
+    except EmuError as e:
+        rc = e.args[1] if len(e.args) > 1 else 1
+        log(f"error: {e.args[0]}")
+        log(f"keeping intermediate files in {kd}")
+        _write_script(drv, kd)
+        return rc
+    _write_script(drv, kd)
+    if p.dep_mode and not p.dryrun:
+        rc = write_deps(real, p, fwd)
+        if rc != 0:
+            return rc
+    if not p.dryrun and not p.keep and os.environ.get("WGEMU_KEEP") != "1":
+        cleanup(kd, temp, before)
+    return 0
+
+
+def _write_script(drv: Driver, kd: Path) -> None:
+    try:
+        (kd / "wgemu_cmds.sh").write_text("\n".join(drv.script) + "\n")
+    except OSError as e:
+        log(f"warning: cannot write {kd / 'wgemu_cmds.sh'}: {e}")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except EmuError as e:
+        log(f"error: {e.args[0]}")
+        sys.exit(e.args[1] if len(e.args) > 1 else 1)

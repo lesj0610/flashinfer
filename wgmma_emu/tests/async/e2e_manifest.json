@@ -1,0 +1,539 @@
+[
+  {
+    "name": "async.mbarrier.basic",
+    "source": "mbarrier_basic.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "delay"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "mbarrier\\.init\\.layout::v0",
+      "mbarrier\\.check_layout",
+      "mbarrier\\.expect_tx",
+      "mbarrier\\.complete_tx",
+      "mbarrier\\.arrive\\.expect_tx",
+      "mbarrier\\.arrive\\.noComplete\\.release\\.cta",
+      "mbarrier\\.arrive\\.noComplete\\.shared::cta",
+      "mbarrier\\.arrive_drop",
+      "mbarrier\\.pending_count\\.layout::v0",
+      "mbarrier\\.test_wait\\.parity\\.phase_type::primary",
+      "mbarrier\\.try_wait\\.parity\\.phase_type::conditional",
+      "mbarrier\\.try_wait\\.phase_type::primary",
+      "mbarrier\\.try_wait\\.parity\\.acquire\\.cluster",
+      "mbarrier\\.try_wait\\.parity\\.relaxed\\.cluster",
+      "mbarrier\\.test_wait\\.relaxed\\.cluster",
+      "mbarrier\\.arrive\\.release\\.cluster\\.shared::cluster",
+      "mbarrier\\.arrive\\.relaxed\\.cluster",
+      "mbarrier\\.arrive\\.relaxed\\.cta",
+      "fence\\.release\\.sync_restrict::shared::cta\\.cluster",
+      "fence\\.acquire\\.sync_restrict::shared::cluster\\.cluster",
+      "fence\\.mbarrier_init\\.release\\.cluster"
+    ]
+  },
+  {
+    "name": "async.cp_async_mbarrier",
+    "source": "cp_async_mbar.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "delay",
+      "count"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "cp\\.async\\.mbarrier\\.arrive\\.noinc\\.shared::cta",
+      "cp\\.async\\.mbarrier\\.arrive\\.shared::cta",
+      "cp\\.async\\.mbarrier\\.arrive\\.b64"
+    ],
+    "expect_count": [
+      {
+        "kernel": "_Z10k_cp_async.*",
+        "grid": "1,1,1",
+        "bulk_bytes": 0,
+        "tma_bytes": 0,
+        "cpasync_bytes": 4096,
+        "ldg_bytes": 0,
+        "mbar_waits": 128
+      },
+      {
+        "kernel": "_Z10k_cp_async.*",
+        "grid": "1,1,1",
+        "bulk_bytes": 0,
+        "tma_bytes": 0,
+        "cpasync_bytes": 4096,
+        "ldg_bytes": 0,
+        "mbar_waits": 128
+      },
+      {
+        "kernel": "_Z10k_cp_async.*",
+        "grid": "1,1,1",
+        "bulk_bytes": 0,
+        "tma_bytes": 0,
+        "cpasync_bytes": 4096,
+        "ldg_bytes": 0,
+        "mbar_waits": 128
+      }
+    ]
+  },
+  {
+    "name": "async.bulk.copy_reduce",
+    "source": "bulk_copy.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "delay",
+      "count"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "cp\\.async\\.bulk\\.shared::cluster\\.global\\.mbarrier::complete_tx::bytes",
+      "cp\\.async\\.bulk\\.shared::cluster\\.global\\.mbarrier::complete_tx::bytes\\.L2::cache_hint",
+      "cp\\.async\\.bulk\\.shared::cluster\\.global\\.mbarrier::complete_tx::bytes\\.multicast::cluster",
+      "cp\\.async\\.bulk\\.shared::cta\\.global\\.mbarrier::complete_tx::bytes",
+      "cp\\.async\\.bulk\\.global\\.shared::cta\\.bulk_group",
+      "cp\\.async\\.bulk\\.global\\.shared::cta\\.bulk_group\\.L2::cache_hint",
+      "cp\\.async\\.bulk\\.prefetch\\.L2\\.global",
+      "cp\\.async\\.bulk\\.prefetch\\.L2\\.global\\.L2::cache_hint",
+      "cp\\.reduce\\.async\\.bulk\\.global\\.shared::cta\\.bulk_group\\.add\\.u32",
+      "cp\\.reduce\\.async\\.bulk\\.global\\.shared::cta\\.bulk_group\\.min\\.s32",
+      "cp\\.reduce\\.async\\.bulk\\.global\\.shared::cta\\.bulk_group\\.xor\\.b32",
+      "cp\\.reduce\\.async\\.bulk\\.global\\.shared::cta\\.bulk_group\\.add\\.f32",
+      "cp\\.reduce\\.async\\.bulk\\.global\\.shared::cta\\.bulk_group\\.L2::cache_hint\\.max\\.u32",
+      "cp\\.reduce\\.async\\.bulk\\.shared::cluster\\.shared::cta\\.mbarrier::complete_tx::bytes\\.add\\.u32",
+      "cp\\.reduce\\.async\\.bulk\\.shared::cluster\\.shared::cta\\.mbarrier::complete_tx::bytes\\.and\\.b32",
+      "cp\\.async\\.bulk\\.commit_group",
+      "cp\\.async\\.bulk\\.wait_group\\.read",
+      "cp\\.async\\.bulk\\.wait_group",
+      "createpolicy\\.fractional\\.L2::evict_last\\.b64"
+    ],
+    "expect_count": [
+      {
+        "kernel": "_Z6k_bulk.*",
+        "grid": "1,1,1",
+        "bulk_bytes": 6400,
+        "tma_bytes": 0,
+        "cpasync_bytes": 0,
+        "ldg_bytes": 0,
+        "mbar_waits": 256
+      }
+    ]
+  },
+  {
+    "name": "async.tma.tile",
+    "source": "tma_tile.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "delay"
+    ],
+    "expect_violation": false,
+    "shim": true,
+    "covers": [
+      "prefetch\\.tensormap",
+      "cp\\.async\\.bulk\\.prefetch\\.tensor\\.2d\\.L2\\.global\\.tile",
+      "cp\\.async\\.bulk\\.tensor\\.2d\\.shared::cluster\\.global\\.tile\\.mbarrier::complete_tx::bytes",
+      "cp\\.async\\.bulk\\.tensor\\.2d\\.shared::cta\\.global\\.tile\\.mbarrier::complete_tx::bytes",
+      "cp\\.async\\.bulk\\.tensor\\.2d\\.shared::cluster\\.global\\.tile\\.mbarrier::complete_tx::bytes\\.multicast::cluster",
+      "cp\\.async\\.bulk\\.tensor\\.3d\\.shared::cluster\\.global\\.tile\\.mbarrier::complete_tx::bytes",
+      "cp\\.async\\.bulk\\.tensor\\.2d\\.shared::cluster\\.global\\.mbarrier::complete_tx::bytes\\.L2::cache_hint",
+      "cp\\.async\\.bulk\\.tensor\\.2d\\.global\\.shared::cta\\.tile\\.bulk_group",
+      "cp\\.reduce\\.async\\.bulk\\.tensor\\.2d\\.global\\.shared::cta\\.add\\.tile\\.bulk_group",
+      "cp\\.reduce\\.async\\.bulk\\.tensor\\.2d\\.global\\.shared::cta\\.max\\.tile\\.bulk_group\\.L2::cache_hint"
+    ]
+  },
+  {
+    "name": "async.tma.im2col",
+    "source": "tma_im2col.cu",
+    "nvcc_args": [
+      "-Wno-deprecated-declarations"
+    ],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "delay"
+    ],
+    "expect_violation": false,
+    "shim": true,
+    "covers": [
+      "cp\\.async\\.bulk\\.tensor\\.4d\\.shared::cluster\\.global\\.im2col\\.mbarrier::complete_tx::bytes",
+      "cp\\.async\\.bulk\\.prefetch\\.tensor\\.4d\\.L2\\.global\\.im2col",
+      "cp\\.async\\.bulk\\.tensor\\.4d\\.global\\.shared::cta\\.im2col_no_offs\\.bulk_group"
+    ]
+  },
+  {
+    "name": "async.tensormap.replace",
+    "source": "tensormap_replace.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "delay"
+    ],
+    "expect_violation": false,
+    "shim": true,
+    "covers": [
+      "tensormap\\.replace\\.tile\\.global_address\\.alloc_large\\.shared::cta",
+      "tensormap\\.replace\\.tile\\.global_address\\.alloc_same\\.shared::cta",
+      "tensormap\\.replace\\.tile\\.global_address\\.global",
+      "tensormap\\.replace\\.tile\\.global_dim\\.shared::cta",
+      "tensormap\\.replace\\.tile\\.global_dim\\.global",
+      "tensormap\\.replace\\.tile\\.global_dim\\.b1024",
+      "tensormap\\.replace\\.tile\\.global_stride\\.shared::cta",
+      "tensormap\\.replace\\.tile\\.global_stride\\.b1024",
+      "tensormap\\.replace\\.tile\\.box_dim\\.shared::cta",
+      "tensormap\\.replace\\.tile\\.box_dim\\.global",
+      "tensormap\\.replace\\.tile\\.element_stride",
+      "tensormap\\.replace\\.tile\\.rank",
+      "tensormap\\.replace\\.tile\\.elemtype",
+      "tensormap\\.replace\\.tile\\.interleave_layout",
+      "tensormap\\.replace\\.tile\\.swizzle_mode",
+      "tensormap\\.replace\\.tile\\.fill_mode",
+      "tensormap\\.replace\\.tile\\.alloc_small\\.shared::cta",
+      "tensormap\\.replace\\.tile\\.alloc_large\\.shared::cta",
+      "tensormap\\.query\\.alloc_class_large\\.shared::cta",
+      "tensormap\\.query\\.alloc_class_large\\.global",
+      "tensormap\\.query\\.alloc_class_large\\.b1024",
+      "tensormap\\.cp_fenceproxy\\.global\\.shared::cta\\.tensormap::generic\\.release\\.gpu\\.sync\\.aligned",
+      "fence\\.proxy\\.tensormap::generic\\.release\\.gpu",
+      "fence\\.proxy\\.tensormap::generic\\.acquire\\.gpu"
+    ]
+  },
+  {
+    "name": "async.fence.forms",
+    "source": "fence_forms.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "delay"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "fence\\.proxy\\.async\\.shared::cta",
+      "fence\\.proxy\\.async\\.shared::cluster",
+      "fence\\.proxy\\.async\\.global",
+      "fence\\.proxy\\.async",
+      "membar\\.proxy\\.async\\.global",
+      "membar\\.proxy\\.async",
+      "fence\\.proxy\\.async::generic\\.release\\.sync_restrict::shared::cta\\.cluster",
+      "fence\\.proxy\\.async::generic\\.release\\.sync_restrict::shared::cluster::read\\.cluster",
+      "fence\\.proxy\\.async::generic\\.acquire\\.sync_restrict::shared::cluster\\.cluster",
+      "fence\\.sc\\.cluster",
+      "fence\\.acq_rel\\.cluster",
+      "fence\\.release\\.gpu",
+      "fence\\.acquire\\.gpu",
+      "fence\\.release\\.cluster",
+      "fence\\.acquire\\.cluster",
+      "fence\\.sc\\.gpu",
+      "fence\\.proxy\\.alias\\.release\\.gpu",
+      "fence\\.proxy\\.alias\\.release\\.sys",
+      "fence\\.proxy\\.alias\\.acquire\\.gpu",
+      "fence\\.proxy\\.alias\\.acquire\\.sys",
+      "fence\\.alias\\.sync_restrict::read\\.release\\.sys",
+      "fence\\.release\\.sync_restrict::shared::cta\\.cluster",
+      "fence\\.acquire\\.sync_restrict::shared::cluster\\.cluster"
+    ]
+  },
+  {
+    "name": "async.st_red_async.guarded",
+    "source": "st_red_async.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "delay"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "st\\.async\\.shared::cluster\\.mbarrier::complete_tx::bytes\\.u32",
+      "st\\.async\\.shared::cluster\\.mbarrier::complete_tx::bytes\\.v2\\.u32",
+      "st\\.async\\.weak\\.shared::cluster\\.mbarrier::complete_tx::bytes\\.v4\\.b32",
+      "st\\.async\\.shared::cluster\\.mbarrier::complete_tx::bytes\\.b64",
+      "red\\.async\\.relaxed\\.cluster\\.shared::cluster\\.mbarrier::complete_tx::bytes\\.add\\.u32",
+      "red\\.async\\.relaxed\\.cluster\\.shared::cluster\\.mbarrier::complete_tx::bytes\\.min\\.s32",
+      "red\\.async\\.relaxed\\.cluster\\.shared::cluster\\.mbarrier::complete_tx::bytes\\.add\\.u64",
+      "%cluster_nctarank"
+    ]
+  },
+  {
+    "name": "async.neg.st_red_async_executed",
+    "source": "st_red_async.cu",
+    "nvcc_args": [
+      "-DWGEMU_TEST_FORCE_REMOTE=1"
+    ],
+    "modes": [
+      "check"
+    ],
+    "expect_violation": [
+      "st.async-needs-cluster-nctarank-gt-1",
+      "red.async-needs-remote-cta"
+    ],
+    "shim": false,
+    "covers": [
+      "st\\.async",
+      "red\\.async"
+    ]
+  },
+  {
+    "name": "async.neg.bulk_source_overwrite",
+    "source": "neg_bulk_overwrite.cu",
+    "nvcc_args": [],
+    "modes": [
+      "check"
+    ],
+    "expect_violation": [
+      "bulk-source-overwritten-before-wait_group.read"
+    ],
+    "shim": false,
+    "covers": [
+      "cp\\.async\\.bulk\\.global\\.shared::cta\\.bulk_group",
+      "cp\\.async\\.bulk\\.wait_group\\.read"
+    ]
+  },
+  {
+    "name": "async.neg.mbarrier_uninitialized",
+    "source": "neg_mbar_uninit.cu",
+    "nvcc_args": [],
+    "modes": [
+      "check"
+    ],
+    "expect_violation": [
+      "mbarrier-uninitialized",
+      "mbarrier-pending-underflow"
+    ],
+    "shim": false,
+    "covers": [
+      "mbarrier\\.arrive\\.shared::cta"
+    ]
+  },
+  {
+    "name": "async.neg.bulk_shared_to_cluster",
+    "source": "neg_bulk_s2s.cu",
+    "nvcc_args": [],
+    "modes": [
+      "check"
+    ],
+    "expect_violation": [
+      "cp.async.bulk.shared::cluster.shared::cta-needs-remote-cta"
+    ],
+    "shim": false,
+    "covers": [
+      "cp\\.async\\.bulk\\.shared::cluster\\.shared::cta\\.mbarrier::complete_tx::bytes"
+    ]
+  },
+  {
+    "name": "async.shim.cudart_static",
+    "source": "shim_cudart.cu",
+    "nvcc_args": [
+      "-ldl"
+    ],
+    "modes": [
+      "exact",
+      "delay"
+    ],
+    "expect_violation": false,
+    "shim": true,
+    "covers": [
+      "%cluster_nctarank",
+      "\\.reqnctapercluster"
+    ]
+  },
+  {
+    "name": "async.shim.cudart_shared",
+    "source": "shim_cudart.cu",
+    "nvcc_args": [
+      "-cudart=shared",
+      "-ldl"
+    ],
+    "modes": [
+      "exact",
+      "delay"
+    ],
+    "expect_violation": false,
+    "shim": true,
+    "covers": [
+      "%cluster_nctarank",
+      "\\.reqnctapercluster"
+    ]
+  },
+  {
+    "name": "async.shim.cudart_spoof",
+    "source": "shim_cudart.cu",
+    "nvcc_args": [
+      "-DWGEMU_TEST_SPOOF=1",
+      "-ldl"
+    ],
+    "modes": [
+      "exact",
+      "delay"
+    ],
+    "expect_violation": false,
+    "shim": true,
+    "covers": [
+      "%cluster_nctarank",
+      "\\.reqnctapercluster"
+    ]
+  },
+  {
+    "name": "async.count_probe",
+    "source": "count_probe.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "delay",
+      "count"
+    ],
+    "expect_violation": false,
+    "shim": true,
+    "covers": [],
+    "expect_count": [
+      {
+        "kernel": "_Z13k_count_wgmma.*",
+        "grid": "2,1,1",
+        "wgmma[m64n8k16.f32.bf16.bf16]": 16,
+        "wgmma[m64n16k16.f32.bf16.bf16]": 4,
+        "bulk_bytes": 0,
+        "tma_bytes": 0,
+        "cpasync_bytes": 0,
+        "ldg_bytes": 10240,
+        "mbar_waits": 0
+      },
+      {
+        "kernel": "_Z11k_count_tma.*",
+        "grid": "1,1,1",
+        "bulk_bytes": 0,
+        "tma_bytes": 2048,
+        "cpasync_bytes": 0,
+        "ldg_bytes": 0,
+        "mbar_waits": 128
+      }
+    ]
+  },
+  {
+    "name": "async.neg.delay_read_without_wait",
+    "source": "neg_delay_nowait.cu",
+    "nvcc_args": [],
+    "modes": [
+      "delay"
+    ],
+    "expect_violation": [
+      "mismatch"
+    ],
+    "shim": false,
+    "covers": []
+  },
+  {
+    "name": "async.delay_baseline.read_without_wait_exact",
+    "source": "neg_delay_nowait.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": []
+  },
+  {
+    "name": "async.neg.delay_stage_reuse_no_empty_wait",
+    "source": "neg_delay_stage_reuse.cu",
+    "nvcc_args": [
+      "-DREUSE=1"
+    ],
+    "modes": [
+      "delay"
+    ],
+    "expect_violation": [
+      "mismatch"
+    ],
+    "shim": false,
+    "covers": []
+  },
+  {
+    "name": "async.neg.delay_stage_reuse_run_ahead",
+    "source": "neg_delay_stage_reuse.cu",
+    "nvcc_args": [
+      "-DREUSE=2"
+    ],
+    "modes": [
+      "delay"
+    ],
+    "expect_violation": [
+      "async-delay-overlap"
+    ],
+    "shim": false,
+    "covers": []
+  },
+  {
+    "name": "async.neg.delay_stage_reuse_early_empty_arrive",
+    "source": "neg_delay_stage_reuse.cu",
+    "nvcc_args": [
+      "-DREUSE=3"
+    ],
+    "modes": [
+      "delay"
+    ],
+    "expect_violation": [
+      "mismatch"
+    ],
+    "shim": false,
+    "covers": []
+  },
+  {
+    "name": "async.delay_baseline.stage_reuse_1_exact",
+    "source": "neg_delay_stage_reuse.cu",
+    "nvcc_args": [
+      "-DREUSE=1"
+    ],
+    "modes": [
+      "exact"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": []
+  },
+  {
+    "name": "async.delay_baseline.stage_reuse_2_exact",
+    "source": "neg_delay_stage_reuse.cu",
+    "nvcc_args": [
+      "-DREUSE=2"
+    ],
+    "modes": [
+      "exact"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": []
+  },
+  {
+    "name": "async.delay_baseline.stage_reuse_3_exact",
+    "source": "neg_delay_stage_reuse.cu",
+    "nvcc_args": [
+      "-DREUSE=3"
+    ],
+    "modes": [
+      "exact"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": []
+  }
+]
