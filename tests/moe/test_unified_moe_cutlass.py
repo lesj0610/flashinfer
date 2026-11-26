@@ -123,9 +123,11 @@ def test_cutlass_bf16_config_architectures_and_registration():
         assert CutlassMxfp8Mxfp4Config.supported(arch)
     for arch in (100, 103, 107):
         assert CutlassMxfp8Config.supported(arch)
+    # SM90 runs the 4over6 tuples (flashinfer.fused_moe.sm90); the runner rejects the rest.
+    assert CutlassNvfp4Config.supported(90)
+    assert not CutlassMxfp8Mxfp4Config.supported(90)
     assert not CutlassBf16Config.supported(80)
     assert not CutlassW4A16Config.supported(100)
-    assert not CutlassNvfp4Config.supported(90)
     assert not CutlassFp8BlockConfig.supported(100)
     assert not CutlassMxfp8Config.supported(90)
     assert not CutlassMxfp8Config.supported(110)
@@ -2575,6 +2577,30 @@ cutlass_nvfp4_required = pytest.mark.skipif(
 )
 
 
+def _is_sm90_cutlass_nvfp4_4over6_supported() -> bool:
+    """SM90 runs the per-tensor 4over6 SwiGLU tuple (flashinfer.fused_moe.sm90)."""
+    if not torch.cuda.is_available():
+        return False
+    device = torch.device("cuda")
+    if get_compute_capability(device) != (9, 0) or not CutlassNvfp4Config.supported(90):
+        return False
+    from flashinfer.fused_moe.sm90.driver import sm90_fp4_moe_supports
+
+    return is_sm90a_supported(device) and sm90_fp4_moe_supports(
+        "cutlass",
+        per_token=False,
+        nvfp4_4over6=NVFP44Over6Config(),
+        activation_type=SwiGLU().type,
+    )
+
+
+cutlass_nvfp4_4over6_required = pytest.mark.skipif(
+    not _is_cutlass_nvfp4_runtime_supported()
+    and not _is_sm90_cutlass_nvfp4_4over6_supported(),
+    reason="requires SM90/SM100/SM110/SM12x CUTLASS NVFP4 GPU and CUDA toolkit",
+)
+
+
 def _make_nvfp4_case(num_tokens: int = 16, activation=None):
     torch.manual_seed(44)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -2749,7 +2775,7 @@ def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
     _assert_numerically_close(actual, expected, rtol=ref_rtol, atol=ref_atol)
 
 
-@cutlass_nvfp4_required
+@cutlass_nvfp4_4over6_required
 @pytest.mark.parametrize(
     "recipe",
     [

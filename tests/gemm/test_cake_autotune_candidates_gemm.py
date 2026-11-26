@@ -760,6 +760,8 @@ def test_cake_candidates_absent_on_unsupported_arch(monkeypatch, fresh_tuner):
     if _cake_arch():
         pytest.skip("covers architectures without the cake GEMMs")
     compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability == (9, 0):
+        pytest.skip("SM90 serves the cake mm_fp4 per-token path (tests/sm90)")
     cc = compute_capability[0] * 10 + compute_capability[1]
     assert not mm_fp4.is_backend_supported("cake", cc)
     assert not bmm_bf16.is_backend_supported("cake", cc)

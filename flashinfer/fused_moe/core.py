@@ -1635,8 +1635,9 @@ def cutlass_fused_moe(
             - gemm2 weights block scales
             - gemm2 dequant scale
 
-        FP4 below SM100 (SM80 to SM90) runs on records, which hold the weights too, so the
-        weights give only shapes. NVFP4's weights block scales are the records of
+        On SM90 NVFP4 x NVFP4 per-tensor 4over6 runs on these SM100 weights
+        (``flashinfer.fused_moe.sm90``). FP4 below SM90 runs on records, which hold the weights
+        too, so the weights give only shapes. NVFP4's weights block scales are the records of
         :func:`prepare_records_nvfp4_weights`; the input is BF16, quantized as it is routed, or
         NVFP4 with ``input_sf``. Without the two activation global scales the activations stay
         BF16 (W4A16). MXFP4 (int64-packed with MXFP8 or FP8 input; below SM90 also uint8 with
@@ -1985,6 +1986,15 @@ def cutlass_fused_moe(
             and fc1_expert_weights.dtype == torch.uint8
         )
     )
+    if major == 9 and (is_nvfp4 or mxfp4):
+        # SM90 runs the SM100 tuples on the native weights (sm90.driver); MXFP4 is not yet.
+        if not is_nvfp4:
+            raise NotImplementedError(
+                "cutlass_fused_moe MXFP4 is not implemented on SM90 yet."
+            )
+        from .sm90.driver import cutlass_fp4_sm90_moe
+
+        return [cutlass_fp4_sm90_moe(locals(), resolve_nvfp4_4over6(nvfp4_4over6))]
     if major < 10 and (is_nvfp4 or mxfp4):
         # NVFP4 (prepare_records_nvfp4_weights): quant_scales is [a1, w1 records, alpha1, a2,
         # w2 records, alpha2], the 16-bit input quantized as it is routed (or NVFP4 input with
@@ -7890,15 +7900,15 @@ def _trtllm_fp4_nvfp4_4over6_code(
     if nvfp4_4over6 is _UNSET:
         return NVFP4_4OVER6_CODE_FROM_ENV
     resolved = resolve_nvfp4_4over6(nvfp4_4over6)
-    # Below SM100 the records also quantize BF16 hidden states per token.
+    # Below SM90 the records also quantize BF16 hidden states per token.
     quantized = hidden_states.dtype == torch.uint8 or (
         hidden_states.dtype == torch.bfloat16
-        and get_compute_capability(hidden_states.device)[0] < 10
+        and get_compute_capability(hidden_states.device)[0] < 9
     )
     if resolved is not None and (per_token_scale is None or not quantized):
         raise ValueError(
             "nvfp4_4over6 requires per_token_scale with NVFP4 (uint8) "
-            "hidden_states (below SM100 also BF16); no other path has a 4over6 "
+            "hidden_states (below SM90 also BF16); no other path has a 4over6 "
             "requantization. Pass None to turn 4over6 off, or omit it to read the "
             "environment."
         )
@@ -8097,8 +8107,9 @@ def trtllm_fp4_block_scale_moe(
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
-    Below SM100 (SM80 to SM90) NVFP4 runs on records as in
-    :func:`trtllm_fp4_block_scale_routed_moe`, routed by the TRT-LLM routing kernels.
+    SM90 runs NVFP4 x NVFP4 per-token 4over6 on these SM100 weights
+    (``flashinfer.fused_moe.sm90``) and below SM90 NVFP4 runs on records as in
+    :func:`trtllm_fp4_block_scale_routed_moe`, both routed by the TRT-LLM routing kernels.
 
     Parameters
     ----------
@@ -8410,10 +8421,13 @@ def trtllm_fp4_block_scale_moe(
                 "routing_logits must be [num_tokens, num_experts], routing_bias BF16 or FP32 "
                 "[num_experts]."
             )
+        # SM90 runs the SM100 tuples on the native weights (sm90.driver), with the ids.
+        sm90 = get_compute_capability(hidden_states.device)[0] == 9
         # Records look each slot's expert up as they route, unless the ids are replayed,
         # local to an EP rank (fewer local experts than routed) or returned unfinalized.
         gather = (
-            routing_replay_out is not None
+            sm90
+            or routing_replay_out is not None
             or local_expert_offset
             or local_num_experts != routing_logits.shape[1]
             or not do_finalize
@@ -8422,7 +8436,12 @@ def trtllm_fp4_block_scale_moe(
             routing_logits, routing_bias, routing_method_type, top_k, n_group, topk_group,
             routed_scaling_factor, norm_topk_prob, enable_pdl, _nfse, bool(gather),
         )  # fmt: skip
-        res = _trtllm_fp4_records_moe(locals(), ids, weights, *slot_experts)
+        if sm90:
+            from .sm90.driver import trtllm_fp4_sm90_moe
+
+            res = trtllm_fp4_sm90_moe(locals(), ids, weights)
+        else:
+            res = _trtllm_fp4_records_moe(locals(), ids, weights, *slot_experts)
         if routing_replay_out is not None:  # a call that runs
             routing_replay_out[: ids.shape[0]].copy_(ids[:, :top_k])
         return res
@@ -8535,7 +8554,8 @@ def trtllm_fp4_block_scale_routed_moe(
        ``PackedScoreIdx`` in ``include/flashinfer/trtllm/fused_moe/RoutingKernel.h``).
     2. Unpacked format: ``topk_ids`` is a tuple ``(topk_ids, topk_weights)``.
 
-    Below SM100 (SM80 to SM90) NVFP4 runs on the records of
+    SM90 runs NVFP4 x NVFP4 per-token 4over6 on these SM100 weights
+    (``flashinfer.fused_moe.sm90``). Below SM90 NVFP4 runs on the records of
     :func:`prepare_records_nvfp4_weights` in ``gemm1_weights_scale`` and
     ``gemm2_weights_scale``; the weights are not read. ``hidden_states`` is NVFP4 as
     below, BF16 quantized as it is routed under an FP32 [1] ``hidden_states_scale`` (per
@@ -8809,6 +8829,11 @@ def trtllm_fp4_block_scale_routed_moe(
             weights = torch.cat(
                 (weights, torch.ones_like(shared, dtype=weights.dtype)), 1
             )
+        if get_compute_capability(hidden_states.device)[0] == 9:
+            # SM90 runs the SM100 tuples on the native weights (sm90.driver).
+            from .sm90.driver import trtllm_fp4_sm90_moe
+
+            return trtllm_fp4_sm90_moe(locals(), ids, weights)
         return _trtllm_fp4_records_moe(locals(), ids, weights)
     localized = _flatten_localized_moe_args(
         localized_weights, localized_streams, localized_sm_count, hidden_states.device

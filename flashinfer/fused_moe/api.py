@@ -574,8 +574,9 @@ _CUTILE_SUPPORTED_ACTIVATIONS = (
 )
 
 # NVFP4 CUTLASS fused MoE matches the flat-API skip: SM100/SM110/SM12x.
-# Major 10/11/12 covers SM100/103/107, SM110, and SM120/121.
-_CUTLASS_NVFP4_ARCHS = (100, 103, 107, 110, 120, 121)
+# Major 10/11/12 covers SM100/103/107, SM110, and SM120/121. SM90 runs its
+# per-tensor 4over6 configurations through flashinfer.fused_moe.sm90.
+_CUTLASS_NVFP4_ARCHS = (90, 100, 103, 107, 110, 120, 121)
 
 # Per-tensor FP8 follows the dense CUTLASS architecture list.
 _CUTLASS_FP8_ARCHS = _CUTLASS_BF16_ARCHS
@@ -614,12 +615,13 @@ class TrtllmFp4Config:
     ``supported(arch)`` reflects the routed-MoE cubin manifest. Variant-specific
     restrictions are applied by ``TrtllmFp4RoutedRunner.check_support()``:
     NVFP4/MXFP4 support SM100/SM103/SM107, while W4A16 supports SM100/SM107
-    and remains disabled on SM103.
+    and remains disabled on SM103. SM90 runs NVFP4 x NVFP4 per-token 4over6
+    on the same view (``flashinfer.fused_moe.sm90``).
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in _TRTLLM_ROUTED_ARCHS
+        return arch in _TRTLLM_ROUTED_ARCHS or arch == 90
 
     @staticmethod
     def prepare_weights(
@@ -2184,7 +2186,8 @@ class CutlassNvfp4Config:
     ``TrtllmFp4Config.prepare_activations``.
 
     This config is not in the default backend search list. Select it
-    explicitly with ``BackendOptions((CutlassNvfp4Config(),))``.
+    explicitly with ``BackendOptions((CutlassNvfp4Config(),))``. SM90 runs
+    its per-tensor 4over6 configurations (``flashinfer.fused_moe.sm90``).
     """
 
     @classmethod
@@ -2578,15 +2581,17 @@ class CuteDslConfig:
     ``prepare_weights`` is static: even when called through a config instance,
     pass ``swap_ab=True`` explicitly to select that layout.
     W4A16 always uses activations on B; False selects its in-kernel transpose
-    for compatibility with the original 64-row layout.
+    for compatibility with the original 64-row layout. SM90 runs W4A4
+    per-token 4over6 on the same view (``flashinfer.fused_moe.sm90``).
     """
 
     swap_ab: bool = False
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM100, SM103 (Blackwell) + SM107 (Rubin) — tighten when CuteDSL adds more targets
-        return arch in (100, 103, 107)
+        # SM100, SM103 (Blackwell) + SM107 (Rubin) — tighten when CuteDSL adds more targets;
+        # SM90 through flashinfer.fused_moe.sm90.
+        return arch in (100, 103, 107) or arch == 90
 
     @staticmethod
     def prepare_weights(
@@ -2902,12 +2907,13 @@ class B12xW4A16Config:
         return "B12xW4A16Config()"
 
 
-_RECORDS_NVFP4_ARCHS = (80, 86, 87, 89, 90)
+# SM90 runs the SM100 configs' own views instead (flashinfer.fused_moe.sm90).
+_RECORDS_NVFP4_ARCHS = (80, 86, 87, 89)
 
 
 @dataclass(frozen=True)
 class RecordsNvfp4Bf16Config:
-    """SM80 to SM90 NVFP4-weight x BF16-activation backend on the records kernels.
+    """SM80 to SM89 NVFP4-weight x BF16-activation backend on the records kernels.
 
     Records hold each expert's E2M1 codes and block scales together in the
     MMA fragment order of the BF16 ``mma.sync`` kernels
@@ -2976,7 +2982,7 @@ class RecordsNvfp4Bf16Config:
 
 @dataclass(frozen=True)
 class RecordsNvfp4Config(RecordsNvfp4Bf16Config):
-    """SM80 to SM90 NVFP4-weight x NVFP4-activation backend on the records kernels.
+    """SM80 to SM89 NVFP4-weight x NVFP4-activation backend on the records kernels.
 
     The W4A4 peer of :class:`RecordsNvfp4Bf16Config` over the same view, with
     :class:`TrtllmFp4Config`'s NVFP4 x NVFP4 support: its routing modes,
@@ -2997,7 +3003,7 @@ class RecordsNvfp4Config(RecordsNvfp4Bf16Config):
 
 @dataclass(frozen=True)
 class RecordsMxfp4Config:
-    """SM80 to SM90 MXFP4-weight backend on the records kernels.
+    """SM80 to SM89 MXFP4-weight backend on the records kernels.
 
     :class:`TrtllmFp4Config`'s MXFP4 x MXFP8 and MXFP4 x BF16 support, and
     :class:`CuTileMxfp4Config`'s MXFP4 x MXFP4 (BF16 hidden states, packed

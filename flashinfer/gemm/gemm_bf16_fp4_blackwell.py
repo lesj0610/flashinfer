@@ -146,9 +146,9 @@ WARP_TILE_M = {
 
 def _require_blackwell_source_arch(device: torch.device) -> None:
     major, minor = get_compute_capability(device)
-    if (major, minor) not in ((10, 0), (10, 3)):
+    if (major, minor) not in ((9, 0), (10, 0), (10, 3)):
         raise NotImplementedError(
-            "the source-built BF16 x FP4 backends require SM100 or SM103; "
+            "the source-built BF16 x FP4 backends require SM90, SM100 or SM103; "
             f"got SM{major}{minor}"
         )
 

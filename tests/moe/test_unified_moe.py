@@ -2677,6 +2677,30 @@ sm100_required = pytest.mark.skipif(
 )
 
 
+def _sm90_runs(entry: str, **tuple_kwargs) -> bool:
+    """Whether SM90 runs this NVFP4 tuple of ``entry`` (flashinfer.fused_moe.sm90)."""
+    if not torch.cuda.is_available() or get_compute_capability(
+        torch.device("cuda")
+    ) != (9, 0):
+        return False
+    from flashinfer.fused_moe.sm90.driver import sm90_fp4_moe_supports
+
+    return sm90_fp4_moe_supports(entry, **tuple_kwargs)
+
+
+# TRT-LLM NVFP4 per-token 4over6 with SwiGLU, which SM90 runs too.
+sm100_or_sm90_trtllm_4over6_required = pytest.mark.skipif(
+    not _is_unified_nvfp4_arch()
+    and not _sm90_runs(
+        "trtllm",
+        per_token=True,
+        nvfp4_4over6=NVFP44Over6Config(),
+        activation_type=ActivationType.Swiglu,
+    ),
+    reason="Unified NVFP4 per-token 4over6 MoE requires SM100, SM103, SM107 or SM90",
+)
+
+
 cute_dsl_sm100_required = pytest.mark.skipif(
     not (
         torch.cuda.is_available()
@@ -4034,8 +4058,8 @@ def _assert_recipe_matches_env(
     assert torch.equal(none_under_env_on, env_off)
 
 
-@sm100_required
 class TestTrtllmFp4UnpackedContract:
+    @sm100_required
     @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
     def test_pack_inputs_forwards_separate_routing_tensors(self, weights_dtype):
         from flashinfer.fused_moe.core import MoeRunnerInputs, RoutingInputMode
@@ -4088,6 +4112,7 @@ class TestTrtllmFp4UnpackedContract:
         )
         assert inputs.launch_state.static_kwargs["local_expert_offset"] == 32
 
+    @sm100_required
     @pytest.mark.parametrize(
         "activation",
         [
@@ -4202,6 +4227,7 @@ class TestTrtllmFp4UnpackedContract:
 
         torch.testing.assert_close(captured, eager)
 
+    @sm100_or_sm90_trtllm_4over6_required
     @pytest.mark.parametrize(
         "recipe",
         [

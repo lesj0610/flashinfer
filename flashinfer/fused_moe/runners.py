@@ -602,6 +602,32 @@ def _cutlass_activation_params(
     return params
 
 
+def _check_sm90_fp4_moe(
+    runner: "MoERunner",
+    per_token: bool,
+    activations: tuple[type[ActivationConfig], ...],
+) -> None:
+    """Reject on SM90 what ``flashinfer.fused_moe.sm90`` does not run yet: anything but NVFP4 x
+    NVFP4 4over6, ``per_token`` (else per tensor), with ``activations`` at their default
+    parameters and no fused shared experts."""
+    config = runner.config
+    quant, activation = config.quant, config.activation
+    if (
+        quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4)
+        or bool(quant.per_token_scale) != per_token
+        or type(activation) not in activations
+        or activation != type(activation)()
+        or config.experts.num_fused_shared_experts
+        or resolve_nvfp4_4over6(quant.nvfp4_4over6) is None
+    ):
+        names = ", ".join(cls.__name__ for cls in activations)
+        mode = "per-token" if per_token else "per-tensor"
+        raise NotImplementedError(
+            f"SM90 FP4 MoE: {type(runner).__name__} outside NVFP4 x NVFP4 {mode} 4over6 "
+            f"with {names} at default parameters is not implemented on SM90 yet."
+        )
+
+
 class MoERunner(TunableRunner):
     """Unified MoE runner lifecycle: validate, build once, then execute.
 
@@ -2596,6 +2622,88 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
             w2_scale,
             fc2_dequant,
         ]
+
+    # SM90 runs flashinfer.fused_moe.sm90 (per-tensor 4over6) on the same inputs.
+    def _check_support(self) -> None:
+        super()._check_support()
+        if self._device_arch == 90:
+            _check_sm90_fp4_moe(self, False, (SwiGLU, SwiGLUStep, ReLU2))
+
+    def _build(self) -> None:
+        if self._device_arch != 90:
+            super()._build()
+            return
+        # The SM90 module is built per recipe on the first call; no CUTLASS module.
+        self._activation_params = _cutlass_activation_params(
+            self.config.activation, self.config.routing.num_experts, self.device
+        )
+        self._config_activation_params = dict(self._activation_params)
+
+    def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
+        if self._device_arch != 90:  # SM90 allocates its own workspace per call
+            super()._ensure_workspace(num_tokens, hidden_size)
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        if self._device_arch != 90:
+            return super().get_valid_tactics(inputs, _profile)
+        from .sm90.driver import sm90_fp4_valid_tactics
+
+        self._require_built()
+        self._validate_input_count(inputs)
+        return sm90_fp4_valid_tactics(
+            "cutlass",
+            resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6),
+            int(self.config.activation.type),
+            False,
+        )
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if self._device_arch != 90:
+            return super().forward(inputs, tactic, do_preparation, **kwargs)
+        from .sm90.driver import cutlass_fp4_sm90_moe, default_sm90_fp4_tactic
+
+        self._require_built()
+        self._validate_input_count(inputs)
+        if do_preparation:
+            return inputs[0]
+        if tactic is None or tactic == -1:
+            tactic = default_sm90_fp4_tactic(
+                inputs[1].shape[0],
+                self.config.routing.top_k,
+                self.config.routing.num_experts,
+            )
+        # Per-expert overrides from the weight view (the config's own are its defaults).
+        overrides = {
+            name: value
+            for name, value in self._activation_params.items()
+            if value is not None
+            and value is not self._config_activation_params.get(name)
+        }
+        cutlass_fp4_sm90_moe(
+            dict(
+                overrides,
+                input=inputs[1],
+                token_selected_experts=inputs[2],
+                token_final_scales=inputs[3],
+                fc1_expert_weights=inputs[4],
+                fc2_expert_weights=inputs[5],
+                quant_scales=self._quant_scales(inputs),
+                input_sf=self._input_sf(inputs),
+                output=inputs[0],
+                output_dtype=torch.bfloat16,
+                activation_type=self.config.activation.type,
+                tune_max_num_tokens=self.config.execution.tune_max_num_tokens,
+                tactic=tactic,
+            ),
+            resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6),
+        )
+        return inputs[0]
 
     def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         return [
@@ -5067,6 +5175,9 @@ class CuteDslRunner(MoERunner):
                 "Otherwise GEMM1's epilogue emits NVFP4 directly and has no "
                 "4over6 variant."
             )
+        if getattr(self, "_sm90", False):
+            # flashinfer.fused_moe.sm90 runs the per-token W4A4 4over6 tuples.
+            _check_sm90_fp4_moe(self, True, (SwiGLU, ReLU2))
         self._assert_rubin_cute_dsl_available()
 
     def _assert_rubin_cute_dsl_available(self) -> None:
@@ -5135,6 +5246,10 @@ class CuteDslRunner(MoERunner):
         self._inner: Any = None
         self._forward_kwargs: dict[str, Any] = {}
         self.tuning_config = TuningConfig()
+        # SM90 runs through cute_dsl_fused_moe's SM90 branch (flashinfer.fused_moe.sm90).
+        self._sm90 = (
+            self.device.type == "cuda" and get_compute_capability(self.device)[0] == 9
+        )
 
     def _build(self) -> None:
         """Create the shape-independent CuTe DSL tuning runner."""
@@ -5204,7 +5319,56 @@ class CuteDslRunner(MoERunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         self._require_built()
+        if self._sm90:
+            from .sm90.driver import sm90_fp4_valid_tactics
+
+            return sm90_fp4_valid_tactics(
+                "cute_dsl",
+                resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6),
+                int(self.config.activation.type),
+                True,
+            )
         return self._inner.get_valid_tactics(inputs, profile)
+
+    def _forward_sm90(self, inputs: List[torch.Tensor], tactic: Any) -> torch.Tensor:
+        """SM90: the per-token W4A4 list through ``cute_dsl_fused_moe``'s SM90 branch."""
+        from .cute_dsl.fused_moe import cute_dsl_fused_moe
+        from .sm90.driver import default_sm90_fp4_tactic
+
+        (
+            x,
+            x_sf,
+            ids,
+            weights,
+            w1,
+            w1_sf,
+            w1_alpha,
+            fc2_in,
+            w2,
+            w2_sf,
+            w2_alpha,
+            pt,
+            out,
+        ) = inputs
+        routing, experts = self.config.routing, self.config.experts
+        local = experts.local_num_experts or routing.num_experts
+        if (
+            tactic is None or tactic == -1
+        ):  # untuned: D7 default rather than a nested autotune
+            tactic = default_sm90_fp4_tactic(x.shape[0], routing.top_k, local)
+        return cute_dsl_fused_moe(
+            x, x_sf, ids, weights, w1, w1_sf, w1_alpha, fc2_in, w2, w2_sf, w2_alpha,
+            routing.num_experts, routing.top_k,
+            num_local_experts=local,
+            local_expert_offset=experts.local_expert_offset,
+            output_dtype=out.dtype,
+            moe_output=out,
+            activation_type=int(self.config.activation.type),
+            per_token_scale=pt,
+            tactic=tactic,
+            swap_ab=self.swap_ab,
+            **self._forward_kwargs,
+        )  # fmt: skip
 
     def _cache_key_extras(self) -> tuple:
         extras = super()._cache_key_extras() + (
@@ -5223,6 +5387,8 @@ class CuteDslRunner(MoERunner):
         **kwargs: Any,
     ) -> torch.Tensor:
         self._require_built()
+        if self._sm90:
+            return self._forward_sm90(inputs, tactic)
         return self._inner.forward(
             inputs,
             tactic=tactic,
@@ -5715,6 +5881,10 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                     f"{type(self).__name__} does not support SiTU on SM107 with "
                     "the currently pinned Rubin BMM artifact."
                 )
+            if compute_capability == (9, 0):
+                # flashinfer.fused_moe.sm90 runs the per-token 4over6 tuples on this view.
+                _check_sm90_fp4_moe(self, True, (SwiGLU, ReLU2))
+                return
             if pair in (
                 (QuantFormat.NVFP4, QuantFormat.NVFP4),
                 (QuantFormat.MXFP4, QuantFormat.MXFP8),
@@ -5764,6 +5934,9 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         self._dtype_weights = dtype_weights
         self._fp8_quantization_type = Fp8QuantizationType.NoneFp8
         self._per_token = bool(self.config.quant.per_token_scale)
+        # SM90 runs flashinfer.fused_moe.sm90 instead of the trtllm-gen module.
+        device = torch.device(device)
+        self._sm90 = device.type == "cuda" and get_compute_capability(device)[0] == 9
 
         # enable_pdl=None means "auto" — resolve once here exactly like the
         # high-level wrapper does before building its MoERunner, because the raw
@@ -5806,10 +5979,23 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             ),
         )
 
+    def _build(self) -> None:
+        if not self._sm90:  # the SM90 module is built per recipe on the first call
+            super()._build()
+
     def get_valid_tactics(  # type: ignore[override]
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
         self._require_built()
+        if self._sm90:
+            from .sm90.driver import sm90_fp4_valid_tactics
+
+            return sm90_fp4_valid_tactics(
+                "trtllm",
+                resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6),
+                self._activation_type,
+                True,
+            )
         # The inner runner reads num_tokens from inputs + its own instance key;
         # no launch kwargs are needed for tactic enumeration.
         return self._inner.get_valid_tactics(inputs, profile)
@@ -5822,12 +6008,109 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         **kwargs: Any,
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
+        if self._sm90:
+            return self._forward_sm90(inputs, tactic, kwargs.pop("launch_state", None))
         # Finalized calls write into inputs[0]; unfinalized calls return the flat
         # API's three-tensor result. Launch kwargs come from the same packed call
         # even when another pack_inputs invocation interleaves before forward.
         return self._forward_inner(
             inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
         )
+
+    def _sm90_tuning_config(
+        self, moe_inputs: Any, hidden_size: int, routing_input_mode: Any
+    ) -> TuningConfig:
+        """The trtllm-gen runner's tuning config (``_make_tuning_config``), built without it."""
+        from ..tllm_enums import SfLayout
+        from .core import RoutingInputMode
+        from .shared.tuning import (
+            make_moe_tuning_config,
+            make_repeating_tensor_initializer,
+            moe_topk_ids_init,
+        )
+
+        num_experts = self.config.routing.num_experts
+        packed = routing_input_mode != RoutingInputMode.UnpackedPrecomputed
+        ids = moe_inputs.topk_ids
+        init = (
+            make_repeating_tensor_initializer(
+                ids, num_experts=num_experts, packed=packed
+            )
+            if ids is not None and ids.numel() > 0
+            else moe_topk_ids_init(num_experts, packed=packed)
+        )
+        return make_moe_tuning_config(
+            moe_inputs,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            fp8_quantization_type=self._fp8_quantization_type,
+            init_packed_topk_ids=init,
+            tune_max_num_tokens=self._tune_max_num_tokens,
+            act_sf_layout=SfLayout.layout_linear,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
+
+    def _forward_sm90(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any,
+        launch_state: _TrtllmLaunchState | None,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        """SM90: route as the trtllm-gen kernel does, then run ``flashinfer.fused_moe.sm90``."""
+        from .core import MoeRunnerInputs, RoutingInputMode, _trtllm_routing_sm80
+        from .sm90.driver import default_sm90_fp4_tactic, trtllm_fp4_sm90_moe
+
+        if launch_state is None:
+            launch_state = getattr(inputs, "launch_state", None)
+        if not isinstance(launch_state, _TrtllmLaunchState):
+            raise RuntimeError(
+                "TRTLLM forward requires the launch state returned by pack_inputs."
+            )
+        kw = dict(launch_state.static_kwargs)
+        m = MoeRunnerInputs.from_list(list(inputs))
+        top_k = self.config.routing.top_k
+        mode = kw.pop("routing_input_mode")
+        if (
+            mode == RoutingInputMode.FromLogits
+        ):  # norm_topk_prob as the trtllm-gen runner
+            ids, weights = _trtllm_routing_sm80(
+                m.routing_logits, kw["routing_bias"], kw["routing_method_type"], top_k,
+                kw["n_group"], kw["topk_group"], kw["routed_scaling_factor"], True,
+                kw["enable_pdl"],
+            )  # fmt: skip
+        elif mode == RoutingInputMode.PackedPrecomputed:
+            ids, weights = m.topk_ids >> 16, m.expert_weights
+        else:
+            ids, weights = m.topk_ids, m.expert_weights
+        if tactic == -1:  # untuned: D7 default rather than a nested autotune
+            tactic = default_sm90_fp4_tactic(
+                m.hidden_states.shape[0], top_k, self._num_local_experts
+            )
+        # check_support pinned the activation to its defaults, which prepare's gemm1 scalars
+        # (the SwiGLU gate-alpha placeholder) only restate.
+        for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+            kw.pop(name)
+        res = trtllm_fp4_sm90_moe(
+            dict(
+                kw,
+                hidden_states=m.hidden_states,
+                hidden_states_scale=m.hidden_states_scale,
+                per_token_scale=m.per_token_scale,
+                gemm1_lora_delta=m.gemm1_lora_delta,
+                output=m.output,
+                activation_type=self._activation_type,
+                nvfp4_4over6=self.config.quant.nvfp4_4over6,
+                local_num_experts=self._num_local_experts,
+                intermediate_size=self._intermediate_size,
+                tune_max_num_tokens=self._tune_max_num_tokens,
+                _nfse=self._num_fused_shared_experts,
+                tactic=tactic,
+            ),
+            ids,
+            weights,
+        )
+        return m.output if kw["do_finalize"] else res
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -6018,6 +6301,14 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             enable_pdl=self._enable_pdl,
         )
 
+        if self._sm90:
+            return _TrtllmPackedInputs(
+                moe_inputs.to_list(),
+                tuning_config=self._sm90_tuning_config(
+                    moe_inputs, hidden_size, routing_input_mode
+                ),
+                launch_state=_TrtllmLaunchState(static_kwargs),
+            )
         self._ensure_inner(hidden_size)
         # Reuse the inner runner's tuning-config builder so the num_tokens
         # buckets honor ExecutionConfig.tune_max_num_tokens (CR5).
@@ -9306,7 +9597,7 @@ class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
 
 
 # ---------------------------------------------------------------------------
-# SM80 to SM90 records runners - NVFP4 weights on BF16 mma.sync
+# SM80 to SM89 records runners - NVFP4 weights on BF16 mma.sync
 # ---------------------------------------------------------------------------
 
 
@@ -9350,7 +9641,7 @@ class RecordsNvfp4Bf16Runner(MoERunner):
         super()._check_support()
         major, minor = get_compute_capability(self.device)
         if major * 10 + minor not in _RECORDS_NVFP4_ARCHS:
-            raise RuntimeError(f"{type(self).__name__} requires SM80 to SM90.")
+            raise RuntimeError(f"{type(self).__name__} requires SM80 to SM89.")
         if self._finalize_only and not self.config.finalize.do_finalize:
             raise NotImplementedError(
                 f"{type(self).__name__} requires do_finalize=True."

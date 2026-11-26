@@ -1,4 +1,4 @@
-"""FP4 MoE below SM100 (SM80 to SM90) on the records of prepare_records_nvfp4_weights and
+"""FP4 MoE below SM90 (SM80 to SM89) on the records of prepare_records_nvfp4_weights and
 prepare_records_mxfp4_weights: the flat APIs (cutlass, TRT-LLM routed and from logits,
 CuTe-DSL) against a dequantized reference and against each other."""
 
@@ -37,8 +37,8 @@ from tests.quantization.test_helpers.utils_fp4 import cast_from_fp4
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or get_compute_capability(torch.device("cuda"))[0] not in (8, 9),
-    reason="records NVFP4 MoE runs on SM80 to SM90",
+    or get_compute_capability(torch.device("cuda"))[0] != 8,
+    reason="records NVFP4 MoE runs on SM80 to SM89",
 )
 
 E, H, I, K = 8, 512, 256, 2

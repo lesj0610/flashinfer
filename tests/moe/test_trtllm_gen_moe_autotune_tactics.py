@@ -404,27 +404,50 @@ def test_nvfp4_per_token_all_tactics_are_correct(
     monkeypatch: pytest.MonkeyPatch, activation_type: ActivationType
 ):
     """Every advertised per-token NVFP4 tactic must be numerically correct."""
-    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+    major = get_compute_capability(torch.device(device="cuda"))[0]
+    if major == 9:  # flashinfer.fused_moe.sm90 runs the tuple it reports
+        from flashinfer.fused_moe.sm90.driver import (
+            Sm90Fp4MoeRunner,
+            sm90_fp4_moe_supports,
+            sm90_fp4_valid_tactics,
+        )
+        from flashinfer.quantization.nvfp4_quantization_utils import (
+            NVFP44Over6Config,
+        )
+
+        recipe = NVFP44Over6Config()  # what nvfp4_4over6_env(True) selects
+        if not sm90_fp4_moe_supports(
+            "trtllm",
+            per_token=True,
+            nvfp4_4over6=recipe,
+            activation_type=activation_type,
+        ):
+            pytest.skip(f"SM90 does not run per-token {activation_type.name} yet.")
+    elif major not in [10]:
         pytest.skip("Only work on SM100 / SM103.")
 
     torch.manual_seed(42)
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module(
-        enable_rubin=get_compute_capability(torch.device(device="cuda")) == (10, 7)
-    ).build_and_load()
-    valid_tactics = _enumerate_valid_tactics(
-        moe_op,
-        "NvFP4xNvFP4",
-        top_k=8,
-        hidden_size=2048,
-        intermediate_size=768,
-        num_experts=128,
-        num_tokens=4096,
-        use_per_token_scaling=True,
-        activation_type=activation_type,
-    )
+    if major == 9:
+        valid_tactics = sm90_fp4_valid_tactics("trtllm", recipe, activation_type, True)
+        runner_cls = Sm90Fp4MoeRunner
+    else:
+        moe_op = gen_trtllm_gen_fused_moe_sm100_module(
+            enable_rubin=get_compute_capability(torch.device(device="cuda")) == (10, 7)
+        ).build_and_load()
+        valid_tactics = _enumerate_valid_tactics(
+            moe_op,
+            "NvFP4xNvFP4",
+            top_k=8,
+            hidden_size=2048,
+            intermediate_size=768,
+            num_experts=128,
+            num_tokens=4096,
+            use_per_token_scaling=True,
+            activation_type=activation_type,
+        )
+        runner_cls = get_trtllm_moe_sm100_module().MoERunner
     assert valid_tactics
 
-    moe_module = get_trtllm_moe_sm100_module()
     real_autotune = autotuner_module.autotune
     monkeypatch.setattr(
         autotuner_module, "autotune", lambda _enabled: real_autotune(True)
@@ -434,7 +457,7 @@ def test_nvfp4_per_token_all_tactics_are_correct(
     for tactic in valid_tactics:
         tactic = list(tactic)
         monkeypatch.setattr(
-            moe_module.MoERunner,
+            runner_cls,
             "get_valid_tactics",
             lambda self, inputs, profile, tactic=tactic: [tactic],
         )

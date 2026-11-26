@@ -49,6 +49,7 @@ from .trtllm_gen_metainfo import (
     RUBIN_CUBIN_ARCHS,
     write_filtered_metainfo,
 )
+from .utils import write_if_different
 from .windows_header_overlay import get_windows_header_overlay
 
 
@@ -289,6 +290,95 @@ def gen_w4a16_moe_sm80_module(
         extra_include_paths=[nv_internal, nv_internal / "include"],
         use_fast_math=False,
     )
+
+
+#: GEMM instantiation parts of ``csrc/fp4_moe_sm90.cu`` (variant x APath), one source each
+#: so that the wgmma kernels compile in parallel. Must match ``kNumParts`` there.
+FP4_MOE_SM90_PARTS = 10
+
+
+def fp4_sm90_recipe_bits(recipe) -> int:
+    """``fp4_sm90`` recipe bits (``kRecipe*``) of a resolved ``NVFP44Over6Config`` or None."""
+    from ..fused_moe.sm90.spec import (
+        RECIPE_4OVER6,
+        RECIPE_E4M3_MAX_256,
+        RECIPE_ERR_MSE,
+        RECIPE_FAST_MATH,
+    )
+
+    if recipe is None:
+        return 0
+    return (
+        RECIPE_4OVER6
+        | (RECIPE_E4M3_MAX_256 if recipe.e4m3_max == 256 else 0)
+        | (RECIPE_ERR_MSE if recipe.err_mode_name == "MSE" else 0)
+        | (RECIPE_FAST_MATH if recipe.err_use_fast_math else 0)
+    )
+
+
+def gen_fp4_moe_sm90_module(
+    recipe=None, exact: bool = False, act: Optional[int] = None, f16: bool = False
+) -> JitSpec:
+    """SM90 (wgmma) FP4 MoE: prep, the two GEMMs, row quantization and finalize
+    (``csrc/fp4_moe_sm90.cu``), sm_90a only. A module per NVFP4 ``recipe`` (an
+    ``NVFP44Over6Config`` or None), ``exact`` (FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH),
+    ``act`` (an ``ActivationType``) and ``f16`` (FP16 wgmma B operand instead of BF16). The
+    FP4 quantizers run in software (FLASHINFER_FP4_SW_CVT). Numeric flags as the SM100 MoE
+    modules and the "90" quantization module: ``-use_fast_math`` (``gen_jit_spec``'s
+    default) and the comparison-based E2M1 conversion, so the in-kernel quantizations give
+    their bits."""
+    from ..quantization.nvfp4_quantization_utils import nvfp4_4over6_cache_key
+    from ..tllm_enums import ActivationType
+
+    if act is None:
+        raise ValueError("gen_fp4_moe_sm90_module needs the activation type")
+    act_type = ActivationType(act)
+    name = f"fp4_moe_sm90_{nvfp4_4over6_cache_key(recipe)}_act{int(act_type)}"
+    name += ("_exact" if exact else "") + ("_f16" if f16 else "")
+    defines = [
+        "ENABLE_BF16",
+        "ENABLE_FP8",
+        "ENABLE_FP4",
+        "FLASHINFER_FP4_SW_CVT",
+        "FP4_MOE_SM90_SPLIT=1",
+        f"FP4_SM90_RECIPE={fp4_sm90_recipe_bits(recipe)}",
+        f"FP4_SM90_ACT={int(act_type)}",
+        f"FP4_SM90_GATED={int(act_type.is_gated)}",
+        f"FP4_SM90_F16={int(f16)}",
+        f"FLASHINFER_FP4_SM90_EXACT={int(exact)}",
+    ]
+    # Each part instantiates one (GEMM variant, APath) of the kernel table.
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / name
+    parts = []
+    for part in range(FP4_MOE_SM90_PARTS):
+        path = gen_directory / f"fp4_moe_sm90_part{part}.cu"
+        write_if_different(
+            path, f'#define FP4_MOE_SM90_PART {part}\n#include "fp4_moe_sm90.cu"\n'
+        )
+        parts.append(path)
+    nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
+    return gen_jit_spec(
+        name,
+        [jit_env.FLASHINFER_CSRC_DIR / "fp4_moe_sm90.cu", *parts],
+        extra_cuda_cflags=sm90a_nvcc_flags + [f"-D{d}" for d in defines],
+        extra_include_paths=[nv_internal, nv_internal / "include"],
+    )
+
+
+def gen_fp4_moe_sm90_aot_modules() -> List[JitSpec]:
+    """The SM90 FP4 MoE modules built ahead of time: the two E4M3 bounds of the default
+    4over6 recipe, every activation the entry points accept, BF16 and FP16 outputs. Other
+    recipes and FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH compile on first use."""
+    from ..quantization.nvfp4_quantization_utils import NVFP44Over6Config
+    from ..tllm_enums import ActivationType
+
+    acts = (ActivationType.Swiglu, ActivationType.SwigluStep, ActivationType.Relu2)
+    return [
+        gen_fp4_moe_sm90_module(NVFP44Over6Config(e4m3_max=e4m3_max), act=act, f16=f16)
+        for e4m3_max in (448, 256)
+        for act in acts
+        for f16 in (False, True)
+    ]
 
 
 def gen_cutlass_fused_moe_module(

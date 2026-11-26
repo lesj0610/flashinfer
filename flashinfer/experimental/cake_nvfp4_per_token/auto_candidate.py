@@ -94,7 +94,7 @@ def _cake_fp4_gemm_layout_serves(
         for d in (b_device, sfa_device, sfb_device, alpha_device, out_device)
     ):
         return False
-    if get_compute_capability(device) not in ((10, 0), (10, 3)):
+    if get_compute_capability(device) not in ((9, 0), (10, 0), (10, 3)):
         return False
     cake_backend = _cake_backend()
     cols = cake_backend.padded_sf_cols(2 * kh)

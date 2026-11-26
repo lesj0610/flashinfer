@@ -71,6 +71,21 @@ FP8_DTYPE = torch.float8_e4m3fn
 set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
 
 
+def _skip_unless_sm90_runs(use_4over6: bool, activation_type) -> None:
+    """On SM90, skip the NVFP4 tuples flashinfer.fused_moe.sm90 does not run yet."""
+    if torch.cuda.get_device_capability()[0] != 9:
+        return
+    from flashinfer.fused_moe.sm90.driver import sm90_fp4_moe_supports
+
+    if not sm90_fp4_moe_supports(
+        "cutlass",
+        per_token=False,
+        nvfp4_4over6=NVFP44Over6Config() if use_4over6 else None,
+        activation_type=activation_type,
+    ):
+        pytest.skip("SM90 does not run this NVFP4 MoE tuple yet.")
+
+
 def make_situ_scales(num_experts):
     """Per-expert SiTU-GLU tanh scales, deliberately different from DEFAULT_SITU_BETA /
     DEFAULT_SITU_LINEAR_BETA so a kernel silently falling back to those would fail."""
@@ -1334,8 +1349,8 @@ def test_moe_fp8(
 # use_autotune=True is regression coverage for issue #4003 (NVFP4 autotune crash).
 @pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
+    torch.cuda.get_device_capability()[0] not in [9, 10, 11, 12],
+    reason="NVFP4 is only supported on SM90, SM100, SM110 and SM120/SM121",
 )
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4(
@@ -1351,6 +1366,7 @@ def test_moe_nvfp4(
     use_4over6,
     use_autotune,
 ):
+    _skip_unless_sm90_runs(use_4over6, activation_type)
     # Skip invalid configurations
     if top_k > num_experts:
         pytest.skip(
@@ -1578,13 +1594,14 @@ def _nvfp4_recipe_case(device):
     ],
 )
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
+    torch.cuda.get_device_capability()[0] not in [9, 10, 11, 12],
+    reason="NVFP4 is only supported on SM90, SM100, SM110 and SM120/SM121",
 )
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_pinned_recipe_matches_env(recipe, use_4over6):
     """``nvfp4_4over6=`` selects, bit for bit, the quantizer the environment
     selects, and ``None`` ignores an environment that turns 4over6 on."""
+    _skip_unless_sm90_runs(use_4over6, ActivationType.Swiglu)
     device = torch.device("cuda:0")
     kwargs = _nvfp4_recipe_case(device)
 
@@ -3065,8 +3082,9 @@ def test_moe_nvfp4_unswizzled_input_sf():
 @pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.skipif(
     not is_sm100a_supported(torch.device("cuda"))
-    and not is_sm12x_supported(torch.device("cuda")),
-    reason="NVFP4 is only supported on SM100+",
+    and not is_sm12x_supported(torch.device("cuda"))
+    and torch.cuda.get_device_capability()[0] != 9,
+    reason="NVFP4 is only supported on SM90 and SM100+",
 )
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_unaligned_hidden_size(
@@ -3087,6 +3105,7 @@ def test_moe_nvfp4_unaligned_hidden_size(
     pads the scale columns, inflating numel(). This caused weight_scale_vec_size
     to be computed incorrectly (e.g. 31 instead of 32). See issue #2847.
     """
+    _skip_unless_sm90_runs(use_4over6, activation_type)
     if top_k > num_experts:
         pytest.skip(
             f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"

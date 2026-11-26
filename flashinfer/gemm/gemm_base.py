@@ -7321,7 +7321,7 @@ def _get_sm100_block_scaled_tactics(
 # this; the other FP4 backends never see a per-token alpha because
 # _heuristic_func_mm_fp4 drops them and _check_mm_fp4_problem_size rejects them
 # when requested explicitly.
-_CUTE_DSL_PER_TOKEN_ALPHA_CCS = (100, 103)
+_CUTE_DSL_PER_TOKEN_ALPHA_CCS = (90, 100, 103)
 
 
 def _is_per_token_alpha(alpha_tensor) -> bool:
@@ -9031,7 +9031,7 @@ def _check_mm_fp4_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([90, 100, 103, 107, 110, 120, 121])
 def _cudnn_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -9074,7 +9074,7 @@ def _cudnn_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([90, 100, 103, 107])
 def _trtllm_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -9102,7 +9102,7 @@ def _trtllm_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([90, 100, 103, 107, 110, 120, 121])
 def _cutlass_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -9131,7 +9131,7 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 120, 121])
+@supported_compute_capability([90, 100, 103, 107, 120, 121])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -9183,7 +9183,7 @@ def _cute_dsl_gemm_fp4_requirement(
             if backend != "cute-dsl":
                 return False
             raise ValueError(
-                "CuTe-DSL FP4 GEMM per-token alpha is implemented on SM100/SM103 "
+                "CuTe-DSL FP4 GEMM per-token alpha is implemented on SM90/SM100/SM103 "
                 f"only, got SM{major}{minor}."
             )
     _check_cute_dsl_availability()
@@ -9191,7 +9191,7 @@ def _cute_dsl_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([90, 100, 103, 107])
 def _cutedsl_low_latency_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -9229,7 +9229,7 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([120, 121])
+@supported_compute_capability([90, 120, 121])
 def _b12x_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -11008,6 +11008,27 @@ def mm_fp4(
         tuning_config = _MM_FP4_TUNING_CONFIG_8x4
     else:
         tuning_config = _MM_FP4_TUNING_CONFIG_128x4
+
+    if (major, minor) == (9, 0):
+        # SM90: every backend name runs the wgmma GEMM on its own operand format, after the
+        # requirement checks of the name above.
+        from .sm90_fp4_dense import sm90_mm_fp4
+
+        return sm90_mm_fp4(
+            a,
+            b,
+            a_descale,
+            b_descale,
+            alpha,
+            out_dtype,
+            out,
+            block_size,
+            use_nvfp4,
+            workspace_buffer,
+            backends=list(backends),
+            use_8x4_sf_layout=use_8x4_sf_layout,
+            tuning_config=tuning_config,
+        )
 
     backend_to_runner_factory = {
         "cudnn": lambda: _cudnn_gemm_fp4_runner(tuning_config),

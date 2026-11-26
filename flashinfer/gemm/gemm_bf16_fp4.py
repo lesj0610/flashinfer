@@ -70,7 +70,7 @@ def _check_mm_bf16_fp4_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([90, 100, 103, 107, 110, 120, 121])
 def _cudnn_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -109,7 +109,7 @@ def _cute_dsl_uses_sm100_layout(major: int, minor: int) -> bool:
     return (major, minor) in ((10, 0), (10, 3), (10, 7))
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([90, 100, 103, 107, 110, 120, 121])
 def _cute_dsl_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -124,12 +124,17 @@ def _cute_dsl_bf16_fp4_requirement(
 ):
     major, minor = get_compute_capability(a.device)
     cc = major * 10 + minor
-    expected_dtype = (
-        torch.uint8 if _cute_dsl_uses_sm100_layout(major, minor) else torch.int32
-    )
-    if b.dtype != expected_dtype:
+    expected_dtypes: Tuple[torch.dtype, ...]
+    if cc == 90:
+        # SM90 runs the weight of either SM100+ prep: uint8 (SM10x) or int32 (SM12x).
+        expected_dtypes = (torch.uint8, torch.int32)
+    elif _cute_dsl_uses_sm100_layout(major, minor):
+        expected_dtypes = (torch.uint8,)
+    else:
+        expected_dtypes = (torch.int32,)
+    if b.dtype not in expected_dtypes:
         raise ValueError(
-            f"cute-dsl bf16 x fp4 on SM{cc} expects the {expected_dtype} weight "
+            f"cute-dsl bf16 x fp4 on SM{cc} expects the {expected_dtypes[0]} weight "
             "returned by prepare_bf16_fp4_weights(..., backend='cute-dsl'); "
             f"got {b.dtype}."
         )
@@ -137,7 +142,7 @@ def _cute_dsl_bf16_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([90, 100, 103])
 def _blackwell_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -326,6 +331,13 @@ def mm_bf16_fp4(
         ``(M, N)`` tensor of ``out_dtype``.
     """
     out_dtype = out_dtype or a.dtype
+    if get_compute_capability(a.device) == (9, 0):
+        # SM90: every backend name runs the wgmma GEMM on its own prepared format.
+        from .sm90_fp4_dense import sm90_mm_bf16_fp4
+
+        return sm90_mm_bf16_fp4(
+            a, b, b_descale, alpha, backend=backend, out_dtype=out_dtype, out=out
+        )
     if backend == "cute-dsl-native":
         from .kernels.native_bf16_fp4.runner import run
 
