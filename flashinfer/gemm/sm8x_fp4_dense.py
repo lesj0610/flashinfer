@@ -622,15 +622,23 @@ def _lora_epilogue(
     gate: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     out: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
 ) -> None:
-    """``out = c + s * (d @ l1.T) + bias`` from the FP32 ``c``, rounded once. A ``gate`` equal
-    to zero (read on the device) keeps ``c`` bitwise; without ``d`` the term is left out."""
+    """``out = alpha * c + s * (d @ l1.T) + bias`` from the FP32 ``c``, rounded once; ``s=None``
+    is the SVDQuant form ``alpha * (c + d @ l1.T) + bias``, one scale on the summed terms as
+    the SM100 epilogue. A ``gate`` equal to zero (read on the device) keeps the base bitwise;
+    without ``d`` the term is left out; ``alpha=None`` is one."""
+    base = c if alpha is None else c * alpha.reshape(1)
     if d is not None:
-        lora = c.addcmul(d.float() @ l1.float().t(), s.reshape(1))
-        c = lora if gate is None else torch.where(gate.reshape(1) == 0, c, lora)
+        prod = d.float() @ l1.float().t()
+        if s is not None:
+            lora = base.addcmul(prod, s.reshape(1))
+        else:
+            lora = c + prod if alpha is None else (c + prod) * alpha.reshape(1)
+        base = lora if gate is None else torch.where(gate.reshape(1) == 0, base, lora)
     if bias is not None:
-        c = c + bias.float()
-    out.copy_(c)
+        base = base + bias.float()
+    out.copy_(base)
 
 
 @functools.cache
@@ -666,15 +674,16 @@ def sm8x_mm_nvfp4_lora(
     bias: Optional[torch.Tensor],
     out: torch.Tensor,
 ) -> None:
-    """``mm_nvfp4_svdquant`` and ``mm_nvfp4_lora`` on SM8x: the FP32 ``alpha * (a @ b.T)`` of
-    the NVFP4 ``a`` ``(M, K/2)`` and ``b`` ``(N, K/2)`` with their 128x4-swizzled scales, then
-    ``_lora_epilogue``."""
+    """``mm_nvfp4_svdquant`` and ``mm_nvfp4_lora`` on SM8x: the FP32 ``a @ b.T`` of the NVFP4
+    ``a`` ``(M, K/2)`` and ``b`` ``(N, K/2)`` with their 128x4-swizzled scales, then
+    ``_lora_epilogue`` applies ``alpha`` (``s=None``: once, after the LoRA term)."""
     m, n = int(out.shape[0]), int(out.shape[1])
     if m == 0:
         return
     acc = torch.empty((m, n), dtype=torch.float32, device=a.device)
     inputs = [
-        a, b.t(), _flat_bytes(a_sf), _flat_bytes(b_sf), alpha, torch.float32, acc, 16, True,
+        a, b.t(), _flat_bytes(a_sf), _flat_bytes(b_sf), _ones(a.device), torch.float32,
+        acc, 16, True,
     ]  # fmt: skip
     chosen, tactic = AutoTuner.get().choose_one(
         "mm_nvfp4_lora_sm8x",
@@ -683,4 +692,4 @@ def sm8x_mm_nvfp4_lora(
         inputs,
     )
     chosen(inputs=inputs, tactic=tactic)
-    _lora_epilogue(acc, d, l1, s, gate, bias, out)
+    _lora_epilogue(acc, d, l1, s, gate, bias, out, alpha)

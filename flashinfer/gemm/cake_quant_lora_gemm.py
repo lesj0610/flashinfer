@@ -1259,7 +1259,8 @@ def _run(
 
         alpha = scale_views["alpha"]
         if adapter_state == "prepared":
-            lora = (d, lora_adapter.b_folded, alpha, lora_adapter.lora_scale)
+            # alpha once on the summed terms (s=None), as SVDQuant.
+            lora = (d, lora_adapter.b_folded, None, lora_adapter.lora_scale)
         elif d is not None and lora_b is not None and lora_scale is not None:
             lora = (d, lora_b, lora_scale, lora_scale)
         else:
