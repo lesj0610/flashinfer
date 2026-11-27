@@ -502,9 +502,9 @@ inline bool aligned(const void* p, uintptr_t bytes) {
 
 }  // namespace prep_detail
 
-// Bytes of PrepArgs::workspace (int32 per (sort chunk, local expert); 0 for dense).
+// Bytes of PrepArgs::workspace for a routed prep: int32 per (sort chunk, local expert). Sized from
+// the shape alone, since the MoE layout is made before topk_ids is bound; a dense prep uses none.
 inline size_t fp4_sm90_prep_workspace_bytes(const PrepArgs& a) {
-  if (a.topk_ids == nullptr) return 0;
   int64_t const total = int64_t(a.tokens) * a.top_k;
   int64_t const chunks = (total + prep_detail::kChunk - 1) / prep_detail::kChunk;
   return size_t(chunks * a.num_local_experts) * sizeof(int32_t);
