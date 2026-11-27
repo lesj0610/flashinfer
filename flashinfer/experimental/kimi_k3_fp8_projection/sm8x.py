@@ -22,7 +22,9 @@ with the scale's exact inverse in ``workspace.q``); the GEMM / decode launch run
 groupwise SM8x GEMM on it against a row-major copy of the prepared weight (one per
 prepared weight) and its FP32 UE8M0 scales; the fused decode launch does both. The
 launcher's receipts are host records naming the planned launch; the scratch of a
-workspace lives as long as the workspace, so a captured graph keeps it.
+workspace (per ``workspace.q`` region, so disjoint workspaces carved from one
+allocation never share it) lives as long as the workspace, so a captured graph keeps
+it.
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ _RECEIPT_MIN_BYTES = 64
 _IDS = itertools.count(1)
 # id -> (program, stage) of every live planned receipt (dropped with the receipt)
 _RECEIPTS: dict[int, tuple[Sm8xProgram, Sm8xStage]] = {}
-# workspace storage -> {(name, shape, dtype): buffer}
+# workspace storage -> {(workspace.q address, name, shape, dtype): buffer}
 _SCRATCH: WeakIdKeyDictionary = WeakIdKeyDictionary()
 # prepared weight -> (row-major weight bytes, FP32 weight scales)
 _WEIGHTS: WeakIdKeyDictionary = WeakIdKeyDictionary()
@@ -51,14 +53,17 @@ _WORKSPACE_Q = ("a_q", "A", "X")
 _WORKSPACE_SF = ("a_sf", "SFA", "SFX")
 
 
-def _scratch(storage, name, shape, dtype, device) -> torch.Tensor:
+def _scratch(q, name, shape, dtype) -> torch.Tensor:
+    """The buffer ``name`` of the workspace whose activation is ``q``: one per
+    ``q`` region of its storage, as concurrent runs on disjoint workspaces need."""
+    storage = q.untyped_storage()
     buffers = _SCRATCH.get(storage)
     if buffers is None:
         buffers = _SCRATCH[storage] = {}
-    key = (name, shape, dtype)
+    key = (q.data_ptr(), name, shape, dtype)
     buffer = buffers.get(key)
     if buffer is None:
-        buffer = buffers[key] = torch.empty(shape, dtype=dtype, device=device)
+        buffer = buffers[key] = torch.empty(shape, dtype=dtype, device=q.device)
     return buffer
 
 
@@ -88,15 +93,13 @@ class Sm8xStage:
         K, n, device = int(prepared.K), int(prepared.n_valid), q.device
         nka = K // 128
         self.shape, self.ldo, self.out_ptr = (M, K, n), ldo, out_ptr
-        storage = q.untyped_storage()
         self.q = q.view(M, nka, 128)
         self.gsa = sf[: M * nka * 4].view(torch.float32).view(M, nka)
         if self.quant:
             self.lo, self.hi = (
-                _scratch(storage, name, (M, nka), torch.bfloat16, device)
-                for name in ("lo", "hi")
+                _scratch(q, name, (M, nka), torch.bfloat16) for name in ("lo", "hi")
             )
-            self.t = _scratch(storage, "t", (M, nka), torch.float32, device)
+            self.t = _scratch(q, "t", (M, nka), torch.float32)
         if not self.gemm:
             return
         self.w, self.gsb = _weight(prepared)
@@ -108,23 +111,21 @@ class Sm8xStage:
         width, kp = _pad(n, 8), _pad(K, 32)
         self.target = None
         if not self.direct:
-            self.target = _scratch(
-                storage, "target", (M, width), torch.bfloat16, device
-            )
+            self.target = _scratch(q, "target", (M, width), torch.bfloat16)
         # the GEMM's activation and output offsets are 32-bit
         step = M
         if M * max(kp, width) > _I32_MAX and M > 1:
             step = max(1, _I32_MAX // max(kp, width))
-        self.act = _scratch(storage, "act", (step, kp), torch.bfloat16, device)
+        self.act = _scratch(q, "act", (step, kp), torch.bfloat16)
         x = q.view(torch.uint8)
         self.chunks = []
         for r0 in range(0, M, step):
             m = min(step, M - r0)
             blocks = -(-m // _ROWS)
             ints = (1 + 2 * blocks, blocks * _ROWS)
-            meta, rowmap = _scratch(
-                storage, ("ints", r0), (sum(ints),), torch.int32, device
-            ).split(ints)
+            meta, rowmap = _scratch(q, ("ints", r0), (sum(ints),), torch.int32).split(
+                ints
+            )
             self.chunks.append(
                 (r0, m, blocks, x[r0 : r0 + m].reshape(-1), meta, rowmap)
             )

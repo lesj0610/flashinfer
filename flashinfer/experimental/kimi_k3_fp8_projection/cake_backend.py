@@ -265,7 +265,9 @@ DEC_QUANT_WARPS = (
 )
 DEC_RES_SLOTS = 4  # work items per CTA the resident decode instance can hold
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-# SM8x keeps the SM100 route, plan and launch sequence; sm8x.py runs each launch
+# SM8x runs the B200 schedule: the facts (sm_100a, 148 SMs) select the sm_100a route,
+# plan and launch sequence (never the sm_103a tables), and sm8x.py runs each planned
+# launch; the SM count only shapes that plan, whose grids SM8x does not launch
 SM8X_COMPUTE_CAPABILITIES = frozenset({(8, 0), (8, 6), (8, 7), (8, 9)})
 
 
