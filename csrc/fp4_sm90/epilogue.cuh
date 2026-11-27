@@ -19,8 +19,8 @@
 // Numerics follow the SM100+ path each entry point runs:
 //  - NVFP4 output quantization (per-tensor recipes, cutlass doActivation): g = T(acc alpha), plus
 //    the bias in FP32, the activation in FP32, T(y), then cvt_warp_fp16_to_fp4 under the recipe
-//    with fq_global as the encode scale. The stored value is code x E4M3 SF (exact in BF16/FP16);
-//    1 / fq_global belongs to GEMM2's alpha.
+//    with fq_global (one or the expert's) as the encode scale. The stored value is code x E4M3 SF
+//    (exact in BF16/FP16); 1 / fq_global belongs to GEMM2's alpha.
 //  - Per-token scales (tok_scale): T(acc x (alpha x s)) with FTZ products, the bias after the
 //    rounding; Relu2 propagates NaN. GEMM2: T(acc x (alpha x s) + bias).
 //  - Otherwise (W4A16, GEMM2, dense): T(act(acc alpha + bias)), no rounding before the activation.
@@ -561,7 +561,8 @@ struct Epilogue {
           }
         }
         epi::wg_bar(1 + wg);
-        const float fq_global = ep.fq_global != nullptr ? __ldg(ep.fq_global) : 1.f;
+        const float fq_global =
+            ep.fq_global != nullptr ? __ldg(ep.fq_global + (ep.fq_per_expert ? expert : 0)) : 1.f;
         for (int it = tid; it < kNc * kBlocks; it += 128) {
           const int tl = it / kBlocks, blk = it % kBlocks;
           const int r = ch * kNc + tl, c0 = wcol0 + 16 * blk;

@@ -294,7 +294,7 @@ def gen_w4a16_moe_sm80_module(
 
 #: GEMM instantiation parts of ``csrc/fp4_moe_sm90.cu`` (variant x APath), one source each
 #: so that the wgmma kernels compile in parallel. Must match ``kNumParts`` there.
-FP4_MOE_SM90_PARTS = 10
+FP4_MOE_SM90_PARTS = 12
 
 
 def fp4_sm90_recipe_bits(recipe) -> int:

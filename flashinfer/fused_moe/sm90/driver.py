@@ -144,13 +144,12 @@ _ENTRY_ACTIVATIONS = {
 
 def sm90_fp4_moe_supports(entry: str, *, per_token: bool, activation_type: int) -> bool:
     """Whether SM90 runs this NVFP4 x NVFP4 tuple of ``entry`` (``"trtllm"``, ``"cutlass"`` or
-    ``"cute_dsl"``): per-token activation scales for TRT-LLM and CuTe DSL, per-tensor for
-    CUTLASS, and an activation the entry runs on SM90. The entry points reject the rest on
+    ``"cute_dsl"``): per-token activation scales for CuTe DSL, per-tensor for CUTLASS, either
+    for TRT-LLM, and an activation the entry runs on SM90. The entry points reject the rest on
     SM90 with ``NotImplementedError``."""
-    return (
-        per_token == (entry != "cutlass")
-        and ActivationType(activation_type) in _ENTRY_ACTIVATIONS[entry]
-    )
+    return (entry == "trtllm" or per_token == (entry != "cutlass")) and ActivationType(
+        activation_type
+    ) in _ENTRY_ACTIVATIONS[entry]
 
 
 def sm90_fp4_valid_tactics(
@@ -553,8 +552,8 @@ def trtllm_fp4_sm90_moe(
     a: Dict[str, Any], ids: torch.Tensor, weights: torch.Tensor
 ) -> List[torch.Tensor]:
     """``trtllm_fp4_block_scale_moe`` / ``_routed_moe`` (their arguments ``a``; ``tactic`` an SM90
-    tactic or -1) on SM90 with the global expert ``ids`` and BF16 ``weights``: NVFP4 x NVFP4
-    per token."""
+    tactic or -1) on SM90 with the global expert ``ids`` and BF16 ``weights``: NVFP4 x NVFP4,
+    per token or per tensor."""
     x, x_scale, pt = a["hidden_states"], a["hidden_states_scale"], a["per_token_scale"]
     act = ActivationType(a["activation_type"])
     s1, s_gate, s2 = (
@@ -582,7 +581,6 @@ def trtllm_fp4_sm90_moe(
     if (
         x.dtype != torch.uint8
         or x_scale is None
-        or pt is None
         or act not in (ActivationType.Swiglu, ActivationType.Relu2)
         or unsupported
         or a.get("_nfse")
@@ -591,13 +589,15 @@ def trtllm_fp4_sm90_moe(
         or a["gemm1_weights"].dtype != torch.uint8
     ):
         raise _not_on_sm90(
-            "TRT-LLM FP4 MoE outside NVFP4 x NVFP4 per-token with Swiglu or Relu2 "
+            "TRT-LLM FP4 MoE outside NVFP4 x NVFP4 with Swiglu or Relu2 "
             f"(set: {unsupported})"
         )
     if "hidden_states_scale_layout" in a:  # SM100's: linear only
         resolve_moe_act_sf_layout(a["hidden_states_scale_layout"])
     tokens, hidden = x.shape[0], x.shape[1] * 2
-    if pt.dtype != torch.float32 or pt.numel() != tokens or not pt.is_contiguous():
+    if pt is not None and (
+        pt.dtype != torch.float32 or pt.numel() != tokens or not pt.is_contiguous()
+    ):
         raise ValueError("per_token_scale must be FP32 [num_tokens], contiguous.")
     if x_scale.numel() != tokens * (hidden // 16):
         raise _not_on_sm90(
@@ -631,11 +631,23 @@ def trtllm_fp4_sm90_moe(
         scale_kind="nvfp4",
     )
     # As SM100: GEMM1 under the gate scalar, GEMM2 input under output1_scale_scalar (gated over
-    # the gate scalar, folded into GEMM2's alpha since the rows are requantized per token).
+    # the gate scalar). Per token the rows are requantized per token, so it folds into GEMM2's
+    # alpha; per tensor it is GEMM1's NVFP4 output global scale, as SM100's FC1 output.
     alpha1 = _per_expert(s_gate, experts)
     fc2 = _per_expert(s1, experts)
     fc2 = fc2 / alpha1 if gated else fc2
-    alpha2 = _per_expert(s2, experts) * fc2
+    alpha2 = _per_expert(s2, experts)
+    if pt is None:
+        epi1 = Sm90EpilogueSpec(
+            int(act),
+            fq=Fq.NVFP4,
+            recipe=fp4_sm90_recipe_bits(None),
+            alpha=alpha1,
+            fq_global=fc2.contiguous(),
+        )
+    else:
+        epi1 = Sm90EpilogueSpec(int(act), alpha=alpha1)
+        alpha2 = alpha2 * fc2
     return sm90_fp4_moe(
         x.view(torch.uint8),
         x_scale.view(torch.uint8).reshape(tokens, hidden // 16),
@@ -649,7 +661,7 @@ def trtllm_fp4_sm90_moe(
             a["local_expert_offset"],
             experts,
         ),
-        Sm90EpilogueSpec(int(act), alpha=alpha1),
+        epi1,
         Sm90EpilogueSpec(int(ActivationType.Identity), gemm2=True, alpha=alpha2),
         out=out if finalize else None,
         tactic=a.get("tactic", -1),

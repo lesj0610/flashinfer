@@ -169,14 +169,15 @@ struct EpiArgs {
   const void* bias;        // per expert [rows], BF16 or FP16 (bias_f16); null = none
   void* out;               // output
   int64_t out_ld;          // elements between output rows
-  const float* fq_global;  // device fp32 scalar: global scale of the epilogue quantization (Fq !=
-                           // kNone); null = 1
+  const float* fq_global;  // device fp32 scalar or per expert (fq_per_expert): global scale of
+                           // the epilogue quantization (Fq != kNone); null = 1
   uint8_t act;             // flashinfer.tllm_enums.ActivationType value
   uint8_t fq;              // Fq (same as epi_fq(Cfg::kEpi); kept for runtime checks)
   uint8_t recipe;          // kRecipe* bits (same as epi_recipe(Cfg::kEpi))
   uint8_t out_f16;         // 1: FP16 output, 0: BF16 output
   uint8_t out_tiled;       // 1: write GEMM2 input tiles (expert order, SW128); 0: row-major
   uint8_t bias_f16;        // 1: FP16 bias, 0: BF16 bias
+  uint8_t fq_per_expert;   // 1: fq_global is [E_local] (TRT-LLM's per-expert scalars)
 };
 
 // Persistent schedule written by prep. Expanded rows p are sorted by local expert; expert e owns

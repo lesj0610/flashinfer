@@ -3911,6 +3911,16 @@ def run_moe_test(
             gemm1_lora_delta if gemm1_lora_delta is not None else gemm1_lora_args
         ),
         moe_gemm_backend=moe_gemm_backend,
+        bias_or_activation_params=any(
+            t is not None
+            for t in (
+                gemm1_bias,
+                gemm2_bias,
+                gemm1_alpha,
+                gemm1_beta,
+                gemm1_clamp_limit,
+            )
+        ),
     )
 
     torch.cuda.synchronize()

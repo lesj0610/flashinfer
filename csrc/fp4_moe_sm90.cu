@@ -47,21 +47,25 @@ constexpr int kMaxStages = 32;
 
 // GEMM variants: compile-time weight format and epilogue.
 enum Variant : int {
-  kG1TokenTrtllm = 0,  // GEMM1 -> BF16 rows (token-wise row_quant next), TRTLLM-shuffled weights
-  kG1TokenSwz = 1,     // same, 128x4 weights (CuTe DSL)
-  kG1TensorSwz = 2,    // GEMM1 -> NVFP4 epilogue quantization into GEMM2 B tiles (cutlass)
-  kG2Trtllm = 3,       // GEMM2, TRTLLM-shuffled weights
-  kG2Swz = 4,          // GEMM2, 128x4 weights
-  kNumVariants = 5,
+  kG1TokenTrtllm = 0,   // GEMM1 -> BF16 rows (token-wise row_quant next), TRTLLM-shuffled weights
+  kG1TokenSwz = 1,      // same, 128x4 weights (CuTe DSL)
+  kG1TensorSwz = 2,     // GEMM1 -> NVFP4 epilogue quantization into GEMM2 B tiles (cutlass)
+  kG2Trtllm = 3,        // GEMM2, TRTLLM-shuffled weights
+  kG2Swz = 4,           // GEMM2, 128x4 weights
+  kG1TensorTrtllm = 5,  // GEMM1 -> NVFP4 epilogue quantization, TRTLLM-shuffled weights (trtllm)
+  kNumVariants = 6,
 };
 constexpr int kNumParts = kNumVariants * 2;  // x APath; FP4_MOE_SM90_PARTS in Python
 
 template <int V>
 struct VariantOf {
-  static constexpr AFmt kA =
-      (V == kG1TokenTrtllm || V == kG2Trtllm) ? AFmt::kNvfp4TrtllmShuffled : AFmt::kNvfp4Swz128x4;
-  static constexpr bool kGemm2 = V >= kG2Trtllm;
-  static constexpr Fq kFq = V == kG1TensorSwz ? Fq::kNvfp4 : Fq::kNone;
+  static constexpr AFmt kA = (V == kG1TokenTrtllm || V == kG2Trtllm || V == kG1TensorTrtllm)
+                                 ? AFmt::kNvfp4TrtllmShuffled
+                                 : AFmt::kNvfp4Swz128x4;
+  static constexpr bool kGemm2 = V == kG2Trtllm || V == kG2Swz;
+  static constexpr Fq kFq = (V == kG1TensorSwz || V == kG1TensorTrtllm) ? Fq::kNvfp4 : Fq::kNone;
+  // TRT-LLM's per-tensor path has no 4over6 recipe (as SM100): no kernels in recipe modules.
+  static constexpr bool kBuilt = !(V == kG1TensorTrtllm && kModuleRecipe != 0);
   static constexpr int kEpi =
       epi_code(kFq, kFq == Fq::kNone ? 0 : kModuleRecipe, !kGemm2 && kModuleGated, kGemm2);
 };
@@ -77,7 +81,7 @@ constexpr int kNumShapes = sizeof(kShapes) / sizeof(kShapes[0]);
 // Largest stage count whose shared memory fits; 0 when fewer than 2 fit (shape dropped, D7).
 template <int CM, int N, int V, APath AP, int S = kMaxStages>
 constexpr int max_stages() {
-  if constexpr (S < 2) {
+  if constexpr (S < 2 || !VariantOf<V>::kBuilt) {
     return 0;
   } else if constexpr (fp4_sm90_gemm_smem_bytes<
                            Cfg<CM, N, S, VariantOf<V>::kA, kModuleF16, VariantOf<V>::kEpi, AP>>() <=
@@ -157,6 +161,7 @@ FP4_MOE_SM90_EXTERN_V(1)
 FP4_MOE_SM90_EXTERN_V(2)
 FP4_MOE_SM90_EXTERN_V(3)
 FP4_MOE_SM90_EXTERN_V(4)
+FP4_MOE_SM90_EXTERN_V(5)
 #undef FP4_MOE_SM90_EXTERN_V
 #undef FP4_MOE_SM90_EXTERN
 #endif
@@ -173,6 +178,7 @@ int dispatch_gemm(int variant, APath ap, const GemmArgs& args, int cta_m, int n,
     FP4_MOE_SM90_CASE(2)
     FP4_MOE_SM90_CASE(3)
     FP4_MOE_SM90_CASE(4)
+    FP4_MOE_SM90_CASE(5)
     default:
       return 0;
   }
@@ -189,6 +195,7 @@ void stages_of(int variant, APath ap, int* out) {
     FP4_MOE_SM90_CASE(2)
     FP4_MOE_SM90_CASE(3)
     FP4_MOE_SM90_CASE(4)
+    FP4_MOE_SM90_CASE(5)
     default:
       for (int i = 0; i < kNumShapes; ++i) out[i] = 0;
   }
@@ -196,8 +203,8 @@ void stages_of(int variant, APath ap, int* out) {
 }
 
 int gemm1_variant(bool per_token, AFmt w1_fmt) {
-  if (!per_token) return kG1TensorSwz;
-  return w1_fmt == AFmt::kNvfp4TrtllmShuffled ? kG1TokenTrtllm : kG1TokenSwz;
+  if (w1_fmt == AFmt::kNvfp4TrtllmShuffled) return per_token ? kG1TokenTrtllm : kG1TensorTrtllm;
+  return per_token ? kG1TokenSwz : kG1TensorSwz;
 }
 
 int gemm2_variant(AFmt w2_fmt) { return w2_fmt == AFmt::kNvfp4TrtllmShuffled ? kG2Trtllm : kG2Swz; }
@@ -396,8 +403,6 @@ void fp4_moe_sm90_run(
   TVM_FFI_ICHECK(a2.pair == Pair::kNone) << "w2 takes no gate/up pairing";
   TVM_FFI_ICHECK(a1.num_experts == num_local_experts && a2.num_experts == num_local_experts)
       << "w1 and w2 must hold num_local_experts experts";
-  TVM_FFI_ICHECK(per_token || a1.fmt == AFmt::kNvfp4Swz128x4)
-      << "per-tensor NVFP4 takes 128x4 weights (cutlass_fused_moe)";
   TVM_FFI_ICHECK_EQ(alpha1.numel(), num_local_experts) << "alpha1 must be [num_local_experts]";
   TVM_FFI_ICHECK_EQ(alpha2.numel(), num_local_experts) << "alpha2 must be [num_local_experts]";
   TVM_FFI_ICHECK_EQ(src_permuted.numel(), rows) << "src_permuted must be [num_tokens * top_k]";
@@ -418,7 +423,9 @@ void fp4_moe_sm90_run(
   if (fq_global.has_value()) {
     CHECK_INPUT_AND_TYPE(fq_global.value(), dl_float32);
     CHECK_DEVICE(fq_global.value(), x);
-    TVM_FFI_ICHECK_EQ(fq_global.value().numel(), 1) << "fq_global must be a scalar";
+    TVM_FFI_ICHECK(fq_global.value().numel() == 1 ||
+                   (!per_token && fq_global.value().numel() == num_local_experts))
+        << "fq_global must be a scalar (per tensor also [num_local_experts])";
   }
   // GEMM1 activation parameters (cutlass_fused_moe's ActivationParams)
   for (const Optional<TensorView>* p : {&act_x, &act_y, &act_z}) {
@@ -547,6 +554,7 @@ void fp4_moe_sm90_run(
   const float* const fq_g =
       fq_global.has_value() ? static_cast<const float*>(fq_global.value().data_ptr()) : nullptr;
   g1.epi.fq_global = per_token ? nullptr : fq_g;
+  g1.epi.fq_per_expert = fq_global.has_value() && fq_global.value().numel() > 1;
   g1.epi.act = static_cast<uint8_t>(act);
   g1.epi.fq = static_cast<uint8_t>(per_token ? Fq::kNone : Fq::kNvfp4);
   g1.epi.recipe = per_token ? 0 : kModuleRecipe;

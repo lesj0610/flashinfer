@@ -314,6 +314,7 @@ def skip_checks(
     zero_hidden_states=False,
     gemm1_lora_delta=None,
     moe_gemm_backend=None,
+    bias_or_activation_params=False,
 ):
     """Common skip logic for all tests."""
     from tests.moe.trtllm_gen_fused_moe_utils import MoeGemmBackend
@@ -321,7 +322,19 @@ def skip_checks(
     if moe_gemm_backend is None:
         moe_gemm_backend = MoeGemmBackend.TRTLLM
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10]:
+    # SM90 runs the NVFP4 x NVFP4 tuples FlashInfer reports it runs (flashinfer.fused_moe.sm90).
+    sm90_runs = (
+        type(moe_impl).__name__ == "FP4Moe"
+        and moe_impl.quant_mode == QuantMode.FP4_NVFP4_NVFP4
+        and moe_gemm_backend == MoeGemmBackend.TRTLLM
+        and gemm1_lora_delta is None
+        and not routing_config.get("num_fused_shared_experts", 0)
+        and not bias_or_activation_params
+        and sm90_fp4_moe_runs(
+            "trtllm", per_token=False, activation_type=activation_type
+        )
+    )
+    if compute_capability[0] not in [10] and not sm90_runs:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
 
     # Check moe_impl class by name to avoid circular imports
