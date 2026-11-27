@@ -56,6 +56,7 @@
 #include <type_traits>
 
 #include "flashinfer/exception.h"
+#include "moe_layout.h"
 #include "params.cuh"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/quantization.h"
@@ -75,7 +76,7 @@ namespace tk = tensorrt_llm::kernels;
 
 constexpr int kSortThreads = 256;
 constexpr int kSortWarps = kSortThreads / 32;
-constexpr int kChunk = 4096;  // routing entries per sort CTA
+constexpr int kChunk = moe_layout::kPrepChunk;  // routing entries per sort CTA
 constexpr int kScanThreads = 1024;
 constexpr int kTileThreads = 128;  // one B row per CTA iteration
 constexpr int kMaxTileCtas = 4096;
@@ -505,9 +506,7 @@ inline bool aligned(const void* p, uintptr_t bytes) {
 // Bytes of PrepArgs::workspace for a routed prep: int32 per (sort chunk, local expert). Sized from
 // the shape alone, since the MoE layout is made before topk_ids is bound; a dense prep uses none.
 inline size_t fp4_sm90_prep_workspace_bytes(const PrepArgs& a) {
-  int64_t const total = int64_t(a.tokens) * a.top_k;
-  int64_t const chunks = (total + prep_detail::kChunk - 1) / prep_detail::kChunk;
-  return size_t(chunks * a.num_local_experts) * sizeof(int32_t);
+  return moe_layout::prep_workspace_bytes(a.tokens, a.top_k, a.num_local_experts);
 }
 
 // Routing sort, n-tile list and GEMM1 B tiles (x_tiles null: sort and list only). Dense

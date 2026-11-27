@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "fp4_sm90/kernel.cuh"
+#include "fp4_sm90/moe_layout.h"
 #include "fp4_sm90/params.cuh"
 
 #if !defined(FP4_SM90_RECIPE) || !defined(FP4_SM90_ACT) || !defined(FP4_SM90_GATED) || \
@@ -218,50 +219,9 @@ __global__ void gather_token_scale(const float* __restrict__ token_scale,
   if (p < rows && p < *count) out[p] = token_scale[permuted_src[p] / top_k];
 }
 
-constexpr size_t kAlign = 256;
-inline size_t align_up(size_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
-
-inline int max_tiles_of(int rows, int n, int num_local_experts) {
-  const int bound = (rows + n - 1) / n + num_local_experts;
-  return bound < rows ? bound : rows;
-}
-
-// B tile bytes of one GEMM: max_tiles n-tiles x ceil(K / 128) K tiles x n rows x 256 B.
-inline size_t b_tiles_bytes(int max_tiles, int k, int n) {
-  return size_t(max_tiles) * size_t((k + 127) / 128) * size_t(n) * 256;
-}
-
-struct Layout {
-  size_t expert_offset, expert_tile_base, permuted_src, tile_expert, tile_n0, num_tiles;
-  size_t tok1, tok2, x_tiles, act, x2_tiles, prep, total;
-};
-
-Layout make_layout(const PrepArgs& prep, int inter, bool per_token) {
-  const size_t rows = size_t(prep.tokens) * prep.top_k;
-  const size_t experts = size_t(prep.num_local_experts) + 1;
-  Layout l{};
-  size_t at = 0;
-  auto take = [&at](size_t bytes) {
-    const size_t off = at;
-    at += align_up(bytes);
-    return off;
-  };
-  l.expert_offset = take(experts * 4);
-  l.expert_tile_base = take(experts * 4);
-  l.permuted_src = take(rows * 4);
-  l.tile_expert = take(size_t(prep.max_tiles) * 4);
-  l.tile_n0 = take(size_t(prep.max_tiles) * 4);
-  l.num_tiles = take(4);
-  l.tok1 = take(per_token ? rows * 4 : 0);
-  l.tok2 = take(per_token ? rows * 4 : 0);
-  l.x_tiles = take(b_tiles_bytes(prep.max_tiles, prep.k, prep.n));
-  // per token: BF16 GEMM1 rows for row_quant; per tensor: GEMM2 B tiles written by GEMM1
-  l.act = take(per_token ? rows * size_t(inter) * 2 : b_tiles_bytes(prep.max_tiles, inter, prep.n));
-  l.x2_tiles = take(per_token ? b_tiles_bytes(prep.max_tiles, inter, prep.n) : 0);
-  l.prep = take(fp4_sm90_prep_workspace_bytes(prep));
-  l.total = at;
-  return l;
-}
+using moe_layout::kAlign;
+using moe_layout::Layout;
+using moe_layout::max_tiles_of;
 
 PrepArgs prep_shape(int64_t tokens, int64_t top_k, int64_t num_experts, int64_t local_expert_offset,
                     int64_t num_local_experts, int64_t hidden, int64_t x_fmt, int64_t quantize,
@@ -382,9 +342,23 @@ int64_t fp4_moe_sm90_workspace_bytes(int64_t tokens, int64_t top_k, int64_t num_
                                      int64_t hidden, int64_t inter, int64_t x_fmt, int64_t quantize,
                                      bool per_token, int64_t n) {
   TVM_FFI_ICHECK(valid_n(n)) << "n must be a power of two in [8, 256]";
-  const PrepArgs p = prep_shape(tokens, top_k, num_experts, local_expert_offset, num_local_experts,
-                                hidden, x_fmt, quantize, n);
-  return static_cast<int64_t>(make_layout(p, static_cast<int>(inter), per_token).total);
+  return static_cast<int64_t>(
+      moe_layout::make_layout(tokens, top_k, num_local_experts, hidden, inter, n, per_token).total);
+}
+
+// Offsets {src_permuted, y, end} in a caller's buffer from its 256 B aligned start: the layout of
+// workspace_bytes, then src_permuted and y of the calls that do not return them.
+Array<int64_t> fp4_moe_sm90_scratch(int64_t tokens, int64_t top_k, int64_t num_local_experts,
+                                    int64_t hidden, int64_t inter, bool per_token, int64_t n,
+                                    int64_t out_bytes, bool carve_src, bool carve_y) {
+  TVM_FFI_ICHECK(valid_n(n)) << "n must be a power of two in [8, 256]";
+  const size_t layout =
+      moe_layout::make_layout(tokens, top_k, num_local_experts, hidden, inter, n, per_token).total;
+  const moe_layout::Scratch s =
+      moe_layout::scratch_layout(layout, size_t(tokens) * size_t(top_k), size_t(hidden),
+                                 size_t(out_bytes), carve_src, carve_y);
+  return Array<int64_t>(std::vector<int64_t>{
+      static_cast<int64_t>(s.src_off), static_cast<int64_t>(s.y_off), static_cast<int64_t>(s.end)});
 }
 
 // Tactics (cta_m, n, stages of GEMM1) whose GEMM1 and GEMM2 kernels both hold 2 or more stages.
@@ -634,7 +608,8 @@ void fp4_moe_sm90_run(
 
   const PrepArgs shape = prep_shape(tokens, top_k, num_experts, local_expert_offset,
                                     num_local_experts, hidden, x_fmt, quantize, n);
-  const Layout l = make_layout(shape, inter, per_token);
+  const Layout l =
+      moe_layout::make_layout(tokens, top_k, num_local_experts, hidden, inter, n, per_token);
   TVM_FFI_ICHECK_GE(static_cast<size_t>(workspace.numel()), l.total)
       << "workspace must hold " << l.total << " bytes";
   uint8_t* ws = static_cast<uint8_t*>(workspace.data_ptr());
@@ -873,6 +848,7 @@ void fp4_moe_sm90_run(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_moe_sm90_run, fp4_moe_sm90_run);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_moe_sm90_workspace_bytes, fp4_moe_sm90_workspace_bytes);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_moe_sm90_scratch, fp4_moe_sm90_scratch);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_moe_sm90_tactics, fp4_moe_sm90_tactics);
 
 #endif  // FP4_MOE_SM90_PART

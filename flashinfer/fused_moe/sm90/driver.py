@@ -481,10 +481,41 @@ class Sm90Fp4MoeRunner(TunableRunner):
             self.per_token,
             n,
         )
-        workspace = torch.empty(size, dtype=torch.uint8, device=x.device)
-        src_permuted = torch.empty(tokens * top_k, dtype=torch.int32, device=x.device)
         out_dtype = self.epi2.out_dtype
-        y = torch.empty(tokens * top_k, hidden, dtype=out_dtype, device=x.device)
+        lora, act_out = kwargs.get("gemm1_lora_delta"), None
+        rows = tokens * top_k
+        # The scratch is cut from the caller's buffer; what the call returns is allocated.
+        buf = kwargs.get("workspace_buffer")
+        carve_src = buf is not None and self.do_finalize and lora is None
+        carve_y = buf is not None and self.do_finalize
+        if buf is None:
+            workspace = torch.empty(size, dtype=torch.uint8, device=x.device)
+        else:
+            src_off, y_off, end = module.fp4_moe_sm90_scratch(
+                tokens,
+                top_k,
+                self.num_local_experts,
+                hidden,
+                inter,
+                self.per_token,
+                n,
+                out_dtype.itemsize,
+                carve_src,
+                carve_y,
+            )
+            pad = -buf.data_ptr() % _WORKSPACE_ALIGN
+            _check_workspace_buffer(buf, x.device, pad + end)
+            raw = buf.view(torch.uint8)[pad : pad + end]
+            workspace = raw[:size]
+        if carve_src:
+            src_permuted = raw[src_off : src_off + 4 * rows].view(torch.int32)
+        else:
+            src_permuted = torch.empty(rows, dtype=torch.int32, device=x.device)
+        if carve_y:
+            y_bytes = rows * hidden * out_dtype.itemsize
+            y = raw[y_off : y_off + y_bytes].view(out_dtype).view(rows, hidden)
+        else:
+            y = torch.empty(rows, hidden, dtype=out_dtype, device=x.device)
         if self.do_finalize and out is None:
             out = torch.empty(tokens, hidden, dtype=out_dtype, device=x.device)
         fc2_input_out = kwargs.get("fc2_input_out")
@@ -497,7 +528,6 @@ class Sm90Fp4MoeRunner(TunableRunner):
                 fc2_input_out[2],
             ]
         )
-        lora, act_out = kwargs.get("gemm1_lora_delta"), None
         if lora is not None:  # the activation by expanded row, zero past GEMM2's K
             width = lora.shape[2] // 2
             act_out = (torch.zeros if width > inter else torch.empty)(
@@ -573,6 +603,7 @@ def sm90_fp4_moe(
     fc2_input_out: Optional[Sequence[torch.Tensor]] = None,
     gemm1_lora_delta: Optional[torch.Tensor] = None,
     keep_unrouted: bool = False,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """SM90 FP4 MoE: prep, GEMM1, row quantization (token-wise), GEMM2, finalize.
 
@@ -641,6 +672,13 @@ def sm90_fp4_moe(
     keep_unrouted : bool
         Finalize leaves the ``out`` rows of tokens without a local expert as they are (the
         all-to-all behavior of SM100's unfused finalize) instead of writing zeros.
+
+    workspace_buffer : Optional[torch.Tensor]
+        int8/uint8 1-D CUDA buffer (SM100's checks, 128 B aligned) that holds the call's scratch
+        from its next 256 B boundary: ``cutlass_fused_moe_workspace_size`` bytes always fit.
+        Tensors the call returns (``y`` and ``src_permuted`` of ``do_finalize=False``,
+        ``src_permuted`` with ``gemm1_lora_delta``) are allocated, not cut from it. Not passed
+        to autotuning, which allocates its own.
 
     Returns
     -------
@@ -724,6 +762,8 @@ def sm90_fp4_moe(
         extra.update(fc2_input_out=fc2_input_out)
     if gemm1_lora_delta is not None:
         extra.update(gemm1_lora_delta=gemm1_lora_delta)
+    if workspace_buffer is not None:
+        extra.update(workspace_buffer=workspace_buffer)
     return runner(inputs, tactic=tactic, **extra)
 
 
@@ -766,6 +806,41 @@ def _check_per_expert_param(
         )
     if not t.is_contiguous():
         raise RuntimeError(f"{n} must be contiguous.")
+
+
+#: Start alignment of ``csrc/fp4_moe_sm90.cu``'s workspace; SM100's buffer view is 128 B aligned.
+_WORKSPACE_ALIGN = 256
+
+
+def _check_workspace_buffer(ws: torch.Tensor, device: torch.device, need: int) -> None:
+    """SM100's checks of a ``workspace_buffer`` (its getWorkspaceInfo), in its order and words;
+    ``need`` bytes from the view's start, its alignment padding included. As the binding's
+    TVM_FFI_ICHECK, which Python raises as ``RuntimeError``."""
+    if ws.dtype not in (torch.int8, torch.uint8):
+        raise RuntimeError(
+            "workspace_buffer dtype must be int8 or uint8, got "
+            f"{str(ws.dtype).replace('torch.', '')}"
+        )
+    if ws.dim() != 1:
+        raise RuntimeError(f"workspace_buffer must be 1-D, got ndim={ws.dim()}")
+    if ws.device.type != "cuda":
+        raise RuntimeError("workspace_buffer must be a CUDA tensor")
+    if ws.device.index != device.index:
+        raise RuntimeError(
+            f"workspace_buffer device ({ws.device.index}) does not match input "
+            f"device ({device.index})"
+        )
+    if ws.shape[0] < need:
+        raise RuntimeError(
+            f"workspace_buffer too small: need {need} bytes, got {ws.shape[0]}"
+        )
+    if not ws.is_contiguous():
+        raise RuntimeError("workspace_buffer must be contiguous")
+    if ws.data_ptr() % 128 != 0:
+        raise RuntimeError(
+            "workspace_buffer data pointer must be 128-byte aligned "
+            "(torch.empty on CUDA satisfies this by default)"
+        )
 
 
 # ---------------------------------------------------------------------------------------
@@ -1105,7 +1180,7 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
     profile_ids = a.get("profile_ids")
     if profile_ids is not None and len(profile_ids) != 2:
         raise ValueError("profile_ids must contain [gemm1_profile, gemm2_profile]")
-    unsupported = [n for n in ("workspace_buffer",) if a.get(n) is not None]
+    unsupported = []
     # As SM100: -1 keeps a GEMM's default tactic without the tuner; SM100 tactic ids mean
     # nothing here.
     if profile_ids is not None and list(profile_ids) != [-1, -1]:
@@ -1227,6 +1302,7 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
         tune_max_num_tokens=a.get("tune_max_num_tokens", 8192),
         # As SM100's unfused finalize: under all-to-all the rows without a local expert stay
         keep_unrouted=a.get("enable_alltoall", False) and ep_size > 1,
+        workspace_buffer=a.get("workspace_buffer"),
     )
     return out
 
