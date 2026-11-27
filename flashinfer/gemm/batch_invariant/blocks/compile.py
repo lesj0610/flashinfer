@@ -18,6 +18,7 @@ import cutlass.cute as cute
 
 from ....batch_invariant import jit
 from ..generator import Knobs
+from ..heuristic import SM8X_FAMILY
 from .kernel import BiasBlockGemm, BlockGemm, ScaledBlockGemm
 from .operands import ALIGN, IN_DT, OUT_DT, can_implement  # noqa: F401  (re-exported)
 
@@ -73,7 +74,12 @@ def get_compiled_gemm(
     family (devices of two architectures in one process get their own callables; the module on disk is per architecture
     already). A placement: which CTA computes which tile, never the bits. ``bias``: the biased bf16 chain,
     ``kernel(a3, b3, c3, bias)`` with the (N,) bf16 bias, for the direct stores only (the split's partial kernel never
-    takes it: its fixup adds the bias)."""
+    takes it: its fixup adds the bias). On the SM8x family the same calls run `blocks.sm8x`'s body."""
+    if family == SM8X_FAMILY:
+        from .sm8x import gemm_callable
+
+        assert in_fmt != "bf16" and not bias, "SM8x runs the fp8 classes"
+        return gemm_callable(chunks, cfg.cta_chunks and chunks > 1, out_fmt)
     in_dt, al = IN_DT[in_fmt], ALIGN[in_fmt]
     in_cta = cfg.cta_chunks and chunks > 1
     direct = chunks == 1 or in_cta

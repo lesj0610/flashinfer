@@ -100,7 +100,7 @@ def _mx_family(arch, op: str = "mm_mxfp8") -> str:
     """The architecture family behind ``arch``: a family name (``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``), a compute
     capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device.
     """
-    from ..gemm.batch_invariant.heuristic import PART_TABLE, family_of
+    from ..gemm.batch_invariant.heuristic import PART_TABLE, SM8X_FAMILY, family_of
 
     if arch is None:
         if not torch.cuda.is_available():
@@ -109,17 +109,26 @@ def _mx_family(arch, op: str = "mm_mxfp8") -> str:
                 "capability or a device) when no CUDA device is available: the block-scaled class is the architecture's"
             )
         arch = torch.device("cuda", torch.cuda.current_device())
-    if isinstance(arch, torch.device):
-        from .support import compute_capability
-
-        return family_of(compute_capability(arch))
     if isinstance(arch, str):
         if arch not in PART_TABLE:
             raise ValueError(
                 f"fingerprint({op!r}) takes arch as one of {sorted(PART_TABLE)}, a compute capability or a device, not {arch!r}"
             )
         return arch
-    return family_of(tuple(arch))
+    if isinstance(arch, torch.device):
+        from .support import compute_capability
+
+        arch = compute_capability(arch)
+    family = family_of(tuple(arch))
+    if family == SM8X_FAMILY and op not in _SM8X_FINGERPRINT_OPS:
+        raise BatchInvariantUnsupportedError(
+            f"batch_invariant: {op} has no SM8x class; compute capability {tuple(arch)} is not a part of its mode"
+        )
+    return family
+
+
+#: The block-scaled classes the SM8x parts run (`gemm.batch_invariant.blocks.sm8x`).
+_SM8X_FINGERPRINT_OPS = ("mm_mxfp8", "mm_fp4")
 
 
 def _mm_mxfp8_fingerprint(

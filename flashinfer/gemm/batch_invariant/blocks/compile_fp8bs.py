@@ -19,6 +19,7 @@ import cutlass.cute as cute
 
 from ....batch_invariant import jit
 from ..generator import Knobs
+from ..heuristic import SM8X_FAMILY
 from ..spec import BLOCK_K
 from .blockscale_fp8 import IN_FMT, BlockScaleFp8Gemm
 from .operands import ALIGN, IN_DT, OUT_DT
@@ -48,6 +49,10 @@ def get_compiled_fp8bs(
     scale tensors read as they are with 16-byte-aligned bases) are part of the cache key as for the dense kernels
     (``blocks/compile.py``): placements, never the bits."""
     assert cfg.well_formed(IN_FMT), cfg
+    if family == SM8X_FAMILY:
+        from .sm8x_fp8bs import fp8bs_callable
+
+        return fp8bs_callable(MODULE, out_fmt)
     in_dt, al = IN_DT[IN_FMT], ALIGN[IN_FMT]
     out_dt, oal = OUT_DT[out_fmt], ALIGN[out_fmt]
     grid = cfg.grid_clusters or clusters

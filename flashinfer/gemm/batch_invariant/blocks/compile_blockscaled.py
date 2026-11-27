@@ -21,6 +21,7 @@ import cutlass.cute as cute
 
 from ....batch_invariant import jit
 from ..generator import Knobs
+from ..heuristic import SM8X_FAMILY
 from ..spec import ALPHA_GIVEN, SF_ATOM_KBLOCKS, SF_ATOM_ROWS
 from .blockscaled import PLANS, BlockScaledGemm, ScaledBlockScaledGemm
 from .operands import ALIGN, OUT_DT
@@ -65,6 +66,10 @@ def get_compiled_blockscaled(
     C)`` operand views, the output with L = 1) -- convert in the epilogue; the fixed-chunk split (batch index = K chunk)
     stores fp32 partials that the dense module's fixup folds and converts. ``clusters`` and ``family`` are part of the cache
     key as for the dense kernels (``blocks/compile.py``): placements, never the bits."""
+    if family == SM8X_FAMILY:
+        from .sm8x_blockscaled import blockscaled_callable
+
+        return blockscaled_callable(chunks, cfg.swap_ab, in_fmt, out_fmt)
     return compile_blockscaled(cfg, chunks, clusters, in_fmt, out_fmt, MODULE)
 
 

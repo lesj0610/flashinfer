@@ -87,9 +87,12 @@ register_self_served(
 )  # both flag values run the class: its errors advise no fallback
 #: The compute capabilities the classes are stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
 MM_BF16_ARCHS = ((10, 0), (10, 3), (10, 7))
-BMM_FP8_ARCHS = MM_BF16_ARCHS
-MM_MXFP8_ARCHS = MM_BF16_ARCHS
-MM_FP4_ARCHS = MM_BF16_ARCHS
+#: SM80 / SM86 / SM87 / SM89 run the per-tensor fp8, MXFP8, FP4 and block-scale fp8 classes through the SM80 mma.sync
+#: bodies (`blocks.sm8x`), the architecture's own MMA step of each class.
+SM8X_ARCHS = ((8, 0), (8, 6), (8, 7), (8, 9))
+BMM_FP8_ARCHS = SM8X_ARCHS + MM_BF16_ARCHS
+MM_MXFP8_ARCHS = SM8X_ARCHS + MM_BF16_ARCHS
+MM_FP4_ARCHS = SM8X_ARCHS + MM_BF16_ARCHS
 MM_MXW48_ARCHS = MM_BF16_ARCHS
 _ALIGN = 8  # bf16 / fp16 elements per 16 bytes
 _ALIGN_FP8 = 16  # fp8 elements per 16 bytes
@@ -110,7 +113,7 @@ MM_MXW48_API_OUT_DTYPES = MM_MXFP8_API_OUT_DTYPES
 MM_MXW48_OUT_DTYPES = MM_MXFP8_OUT_DTYPES
 #: The block-scale fp8 class of :func:`flashinfer.gemm_fp8_nt_groupwise` (``scale_granularity_mnk = (1, 128, 128)``).
 CLASS_FP8BS = "gemm.e4m3.kblock128"
-GEMM_FP8BS_ARCHS = MM_BF16_ARCHS
+GEMM_FP8BS_ARCHS = SM8X_ARCHS + MM_BF16_ARCHS
 GEMM_FP8BS_API_OUT_DTYPES = MM_MXFP8_API_OUT_DTYPES
 GEMM_FP8BS_OUT_DTYPES = MM_MXFP8_OUT_DTYPES
 _ONES: Dict[
@@ -187,9 +190,13 @@ def _co_resident_clusters(
     A failed query (logged) gives the part's nominal capacity; the next call asks again, up to ``_QUERY_ATTEMPTS`` times
     in all, after which the nominal capacity is kept for the process like an answer (a launch parameter: the bits never
     depend on it)."""
-    from .heuristic import capacity_for
+    from .heuristic import SM8X_FAMILY, capacity_for
 
     key = (device_index, cluster_size)
+    if key not in _CO_RESIDENT and family == SM8X_FAMILY:
+        # no thread block clusters before SM90 (the query fails with an invalid cluster size); the SM8x bodies
+        # never read the grid, which stays a cache key only
+        _CO_RESIDENT[key] = max(1, sm_count // cluster_size)
     if key not in _CO_RESIDENT:
         try:
             _CO_RESIDENT[key] = _query_co_resident_clusters(device_index, cluster_size)

@@ -142,6 +142,12 @@ def _group_rows(
     rowmap.view(max_blocks, r).copy_(torch.where(j < cnt[:, None], row, -1))
 
 
+def row_tile(m: int) -> int:
+    """The smallest GEMM row tile (the runners' tactics) holding ``m`` rows, 64 beyond: a placement,
+    never the bits."""
+    return next((r for r in (8, 16, 32) if m <= r), 64)
+
+
 def _run_fp8(
     a: torch.Tensor,
     b: torch.Tensor,

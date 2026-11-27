@@ -77,7 +77,15 @@ PARTS: Tuple[Tuple[str, int], ...] = (
     ("sm_103", 148),
     ("sm_103", 152),
 )
-FAMILY_OF_CC = {(10, 0): "sm_100", (10, 3): "sm_103", (10, 7): "sm_107"}
+#: The SM8x parts run the classes through the SM80 mma.sync bodies (`blocks.sm8x`): one family, no part of the
+#: dispatcher's model (its ranking borrows a modelled part's table; the bits never depend on the pick).
+SM8X_FAMILY = "sm_80"
+FAMILY_OF_CC = {
+    (10, 0): "sm_100",
+    (10, 3): "sm_103",
+    (10, 7): "sm_107",
+    **{cc: SM8X_FAMILY for cc in ((8, 0), (8, 6), (8, 7), (8, 9))},
+}
 
 
 def family_of(cc: Tuple[int, int]) -> str:

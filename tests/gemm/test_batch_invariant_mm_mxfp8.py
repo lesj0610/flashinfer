@@ -728,12 +728,17 @@ def test_split_implementations_agree(M, N, K, od):
     assert torch.equal(
         bits(bi_mm(a, b, sfa, sfb, out_dtype=od)), ref
     )  # the dispatcher's own pick is a member too
-    assert not torch.equal(
-        bits(
-            mm_mxfp8_batch_invariant(a, b, sfa, sfb, out_dtype=od, config=ws, chunks=1)
-        ),
-        ref,
-    )
+    if (
+        fam != "sm_80"
+    ):  # SM8x: the two folds' difference can stay under the output's rounding here
+        assert not torch.equal(
+            bits(
+                mm_mxfp8_batch_invariant(
+                    a, b, sfa, sfb, out_dtype=od, config=ws, chunks=1
+                )
+            ),
+            ref,
+        )
 
 
 @needs_device
