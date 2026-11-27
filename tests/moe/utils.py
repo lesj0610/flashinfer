@@ -836,27 +836,12 @@ def _fp4_quantize_per_expert(weight, global_scale, sf_vec_size):
     return torch.stack(quantized), torch.cat([sf.reshape(-1) for sf in scales])
 
 
-def create_moe_tensors(
-    num_tokens: int,
-    hidden_size: int,
-    intermediate_size: int,
-    num_experts: int,
-    num_local_experts: int,
-    top_k: int,
-    device: str = "cuda",
-    seed: int = 42,
-    gated: bool = True,
-    use_per_token_activation: bool = False,
-    interleave_gated_weights: bool = True,
-    use_nontrivial_alphas: bool = True,
-    vary_block_scales: bool = False,
-    swap_ab: bool = False,
-):
-    """Create properly quantized MoE tensors for testing.
+def _quantize_moe_input(x_bf16, sf_vec_size, use_per_token_activation):
+    """Quantize the MoE input to NVFP4, per token or with global scale 1.
 
-    CuTe SM100 kernels consume interleaved gated weights and the tests exercise
-    nontrivial per-expert alpha scales. B12x kernels use the opposite settings;
-    callers should use :func:`create_b12x_moe_tensors` for that configuration.
+    Returns ``(x_quantized, x_sf, x_ref, x_per_token_scale)``: ``x_ref`` is the
+    dequantized input (times its token scale per token), ``x_per_token_scale``
+    is None per tensor.
     """
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.quantization import (
@@ -868,15 +853,8 @@ def create_moe_tensors(
         current_nvfp4_4over6_config,
         make_nvfp4_global_scale,
     )
-    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
-    torch.manual_seed(seed)
-    sf_vec_size = 16
-
-    # Input
-    x_bf16 = (
-        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
-    )
+    device = x_bf16.device
     x_per_token_scale = None
     if use_per_token_activation:
         x_global_scale = make_nvfp4_global_scale(
@@ -918,6 +896,44 @@ def create_moe_tensors(
             is_sf_swizzled_layout=False,
         ).to(device)
         x_ref = x_ref.float()
+    return x_quantized, x_sf, x_ref, x_per_token_scale
+
+
+def create_moe_tensors(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_local_experts: int,
+    top_k: int,
+    device: str = "cuda",
+    seed: int = 42,
+    gated: bool = True,
+    use_per_token_activation: bool = False,
+    interleave_gated_weights: bool = True,
+    use_nontrivial_alphas: bool = True,
+    vary_block_scales: bool = False,
+    swap_ab: bool = False,
+):
+    """Create properly quantized MoE tensors for testing.
+
+    CuTe SM100 kernels consume interleaved gated weights and the tests exercise
+    nontrivial per-expert alpha scales. B12x kernels use the opposite settings;
+    callers should use :func:`create_b12x_moe_tensors` for that configuration.
+    """
+    from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+    torch.manual_seed(seed)
+    sf_vec_size = 16
+
+    # Input
+    x_bf16 = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
+    )
+    x_quantized, x_sf, x_ref, x_per_token_scale = _quantize_moe_input(
+        x_bf16, sf_vec_size, use_per_token_activation
+    )
     x_sf = x_sf.unsqueeze(-1)
 
     # Routing
@@ -1068,6 +1084,7 @@ def create_relu2_moe_tensors(
     device: str = "cuda",
     seed: int = 42,
     vary_block_scales: bool = False,
+    use_per_token_activation: bool = False,
 ):
     """Create MoE tensors for ReLU2 (non-gated: w1_rows = n, not 2*n)."""
     from flashinfer.fp4_quantization import fp4_quantize
@@ -1079,12 +1096,8 @@ def create_relu2_moe_tensors(
     x_bf16 = (
         torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
     )
-    a1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    x_quantized, x_sf = fp4_quantize(
-        x_bf16,
-        global_scale=a1_gs,
-        sf_vec_size=sf_vec_size,
-        is_sf_swizzled_layout=False,
+    x_quantized, x_sf, x_ref, x_per_token_scale = _quantize_moe_input(
+        x_bf16, sf_vec_size, use_per_token_activation
     )
     x_sf = x_sf.unsqueeze(-1)
 
@@ -1160,6 +1173,8 @@ def create_relu2_moe_tensors(
         "x": x_quantized,
         "x_sf": x_sf,
         "x_bf16": x_bf16,
+        "x_ref": x_ref,
+        "x_per_token_scale": x_per_token_scale,
         "token_selected_experts": selected_experts,
         "token_final_scales": routing_weights,
         "w1_weight": w1_q,

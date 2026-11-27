@@ -190,6 +190,16 @@ sm100_or_sm90_w4a4_4over6_required = pytest.mark.skipif(
     reason="Requires CuteDSL MoE target SM100, SM103, SM107 or SM90",
 )
 
+# W4A4 SwiGLU per tensor, which SM90 runs too.
+sm90_w4a4_per_tensor_required = pytest.mark.skipif(
+    not sm90_fp4_moe_runs(
+        "cute_dsl",
+        per_token=False,
+        activation_type=ActivationType.Swiglu,
+    ),
+    reason="Requires an SM90 GPU",
+)
+
 mxfp8_required = pytest.mark.skipif(
     not (
         torch.cuda.is_available()
@@ -3325,6 +3335,157 @@ class TestCuteDslFusedMoeFunctional:
             raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
         _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
+
+
+# =============================================================================
+# Test Class: SM90 entry (cute_dsl_fused_moe on Hopper)
+# =============================================================================
+
+
+@cute_dsl_available
+@sm90_w4a4_per_tensor_required
+class TestCuteDslFusedMoeSm90:
+    """``cute_dsl_fused_moe`` W4A4 on SM90: per-tensor activation scales and SwiGLU
+    ``swiglu_alpha``/``swiglu_beta``/``swiglu_limit``, as SM100 takes them."""
+
+    @staticmethod
+    def _run(
+        activation_type,
+        use_per_token_activation,
+        swap_ab,
+        swiglu=None,
+        num_tokens=128,
+        hidden_size=256,
+        intermediate_size=512,
+        num_experts=256,
+        top_k=2,
+        fc2_input_scale_tail=None,
+    ):
+        from flashinfer import cute_dsl_fused_moe
+
+        _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            gated=gated,
+            swap_ab=swap_ab,
+            use_per_token_activation=use_per_token_activation,
+        )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(tensors, "w4a4")
+        if (
+            fc2_input_scale_tail is not None
+        ):  # values after element 0, which must go unread
+            scale = api_inputs["fc2_input_scale"].reshape(-1)
+            api_inputs["fc2_input_scale"] = torch.cat(
+                [scale, fc2_input_scale_tail.to(scale)]
+            )
+        scalars = {} if swiglu is None else swiglu
+        result = cute_dsl_fused_moe(
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation_type=activation_type,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode("w4a4", swap_ab),
+            quant_mode="w4a4",
+            swap_ab=swap_ab,
+            **scalars,
+            **api_inputs,
+        )
+        assert result.shape == (num_tokens, hidden_size)
+        assert result.dtype == torch.bfloat16
+        assert not torch.isnan(result).any()
+
+        def reference(**swiglu_scalars):
+            return _compute_moe_quant_mode_reference(
+                tensors,
+                "w4a4",
+                swap_ab=swap_ab,
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation_type=activation_type,
+                **swiglu_scalars,
+                **reference_inputs,
+            )
+
+        return result, reference(**scalars), reference
+
+    @staticmethod
+    def _assert_close(result, ref):
+        # SM90 (wgmma) accumulates in another order than the swap-AB reference models.
+        passed, percent_within, atol = check_accuracy(result, ref)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    @pytest.mark.parametrize(
+        "use_per_token_activation", [False, True], ids=["per-tensor", "per-token"]
+    )
+    @pytest.mark.parametrize(
+        "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
+    )
+    def test_w4a4_accuracy(self, activation_type, use_per_token_activation, swap_ab):
+        """D02: per-tensor W4A4 (and the per-token one) at the default parameters."""
+        result, ref, _ = self._run(activation_type, use_per_token_activation, swap_ab)
+        self._assert_close(result, ref)
+
+    def test_fc2_input_scale_element_zero(self):
+        """Per tensor, SM100's GEMM1 epilogue reads element 0 of ``fc2_input_scale``."""
+        result, ref, _ = self._run(
+            ActivationType.Swiglu,
+            False,
+            False,
+            fc2_input_scale_tail=torch.full((3,), float("nan")),
+        )
+        self._assert_close(result, ref)
+
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    @pytest.mark.parametrize(
+        "use_per_token_activation", [False, True], ids=["per-tensor", "per-token"]
+    )
+    @pytest.mark.parametrize(
+        "swiglu",
+        [
+            pytest.param(
+                dict(swiglu_alpha=1.702, swiglu_beta=1.0, swiglu_limit=7.0), id="oai"
+            ),
+            pytest.param(dict(swiglu_limit=0.1), id="limit-only"),
+            pytest.param(
+                dict(swiglu_alpha=0.5, swiglu_beta=0.25, swiglu_limit=0.2),
+                id="all-bind",
+            ),
+        ],
+    )
+    def test_swiglu_params_accuracy(self, swiglu, use_per_token_activation, swap_ab):
+        """D05: non-default ``swiglu_*`` scalars, broadcast to every expert."""
+        result, ref, reference = self._run(
+            ActivationType.Swiglu, use_per_token_activation, swap_ab, swiglu=swiglu
+        )
+        default_ref = reference()
+
+        def rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
+            return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+        # The scalars must change the result, or the comparison below is vacuous.
+        assert rel_err(ref, default_ref) > 0.1
+        assert rel_err(result, ref) < 0.5 * rel_err(result, default_ref)
+        self._assert_close(result, ref)
 
 
 # =============================================================================

@@ -157,6 +157,7 @@ from tests.moe.test_cute_dsl_fused_moe import (  # noqa: E402
 from tests.moe.utils import (  # noqa: E402
     assert_trtllm_packed_call_contract,
     create_relu2_moe_tensors,
+    quant_dequant_fp4_reference,
     sm90_fp4_moe_runs,
 )
 
@@ -2723,6 +2724,7 @@ def _make_packs_and_config(
     activation=None,
     quant: QuantConfig = _NVFP4_NVFP4,
     swap_ab: bool = False,
+    use_per_token_activation: bool = False,
 ):
     """Build (act_pack, weight_pack, config, tensors_dict) for a given shape.
 
@@ -2747,6 +2749,7 @@ def _make_packs_and_config(
         num_experts=num_experts,
         num_local_experts=local_num_experts,
         top_k=top_k,
+        use_per_token_activation=use_per_token_activation,
         **({} if isinstance(activation, ReLU2) else {"swap_ab": swap_ab}),
     )
 
@@ -2756,6 +2759,7 @@ def _make_packs_and_config(
         hidden_states_scale=None if w4a16 else tensors["x_sf"].squeeze(-1),
         topk_ids=tensors["token_selected_experts"],
         topk_weights=tensors["token_final_scales"],
+        per_token_scale=tensors.get("x_per_token_scale"),
     )
 
     weight_pack = MoEWeightPack()
@@ -2811,7 +2815,14 @@ def _make_packs_and_config(
 # ---------------------------------------------------------------------------
 
 
-def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False):
+def _compute_ref(
+    act_pack,
+    tensors,
+    shape,
+    activation=None,
+    wrong_formula=False,
+    use_per_token_activation=False,
+):
     """bf16 ground-truth MoE output for the given pack + shape.
 
     ``wrong_formula`` evaluates a deliberately different activation over the
@@ -2835,6 +2846,8 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
             situ_beta=activation.gate_scale,
             situ_linear_beta=activation.linear_scale,
         )
+    elif isinstance(activation, SwiGLUStep):
+        activation_kwargs.update(swiglu_limit=activation.limit)
     return compute_reference_moe_fp4(
         hidden_states=tensors["x_bf16"].float().cuda(),
         gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
@@ -2849,6 +2862,7 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
         hidden_size=shape["hidden_size"],
         intermediate_size=shape["intermediate_size"],
         fc2_input_scale=tensors["fc2_input_scale"],
+        use_per_token_activation=use_per_token_activation,
         **activation_kwargs,
     )
 
@@ -5357,3 +5371,502 @@ def test_ranking_relevant_dimension_changes_both_cache_keys(dimension, override)
     assert str(base.get_cache_key_extras([])) != str(other.get_cache_key_extras([])), (
         f"{dimension} does not change get_cache_key_extras()"
     )
+
+
+# ---------------------------------------------------------------------------
+# SM90 NVFP4 x NVFP4 unified runners
+# ---------------------------------------------------------------------------
+#
+# ``flashinfer.fused_moe.sm90`` runs these through the unified runners: TRT-LLM
+# (per token: SwiGLU, SwiGLUStep, ReLU2; per tensor: also SiTU; any
+# activation parameters; fused shared experts) and CuTe DSL (per token or per
+# tensor: SwiGLU at any alpha, beta, limit, and ReLU2).  The guard tests need
+# no GPU; the accuracy tests need an SM90 GPU and compare each prepare -> pack
+# -> forward run with the PyTorch reference, plus a wrong-formula control.
+
+sm90_unified_required = pytest.mark.skipif(
+    not sm90_fp4_moe_runs(
+        "trtllm", per_token=False, activation_type=ActivationType.Swiglu
+    ),
+    reason="Requires an SM90 GPU",
+)
+
+_SM90_PER_TENSOR = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+_SM90_PER_TOKEN = QuantConfig(
+    weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4, per_token_scale=True
+)
+_SM90_SHAPE = dict(hidden_size=1024, intermediate_size=512, num_experts=8, top_k=2)
+_SM90_CONTROL_SWIGLU = SwiGLU(alpha=0.25, beta=2.0, limit=0.5)
+
+
+def _sm90_reference(
+    tensors,
+    act_pack,
+    activation,
+    *,
+    per_token,
+    hidden_states=None,
+    alpha_scale=1.0,
+    wrong_formula=False,
+    num_experts=None,
+):
+    """``compute_reference_moe_fp4`` of ``activation`` over the NVFP4 weights the kernel reads.
+
+    The weights are those of ``tensors`` quantized with global scale 1, as
+    ``prepare_trtllm_fp4_weights`` and ``create_moe_tensors`` quantize them, so the
+    reference carries the kernel's weight rounding: once a clamp binds, that rounding
+    moves outputs by up to the clamp itself.
+    """
+    num_experts = num_experts or _SM90_SHAPE["num_experts"]
+    kwargs = dict(activation_type=activation.type, wrong_formula=wrong_formula)
+    if isinstance(activation, SwiGLU):
+        kwargs.update(
+            swiglu_alpha=activation.alpha,
+            swiglu_beta=activation.beta,
+            swiglu_limit=activation.limit,
+        )
+    elif isinstance(activation, SiTU):
+        kwargs.update(
+            activation_type=ActivationType.Swiglu,
+            situ_beta=activation.gate_scale,
+            situ_linear_beta=activation.linear_scale,
+        )
+    elif isinstance(activation, SwiGLUStep):
+        kwargs.update(swiglu_limit=activation.limit)
+    return compute_reference_moe_fp4(
+        hidden_states=(tensors["x_ref"] if hidden_states is None else hidden_states),
+        gemm1_weights=_sm90_fp4_weight(tensors["w1_weight_bf16"]),
+        gemm2_weights=_sm90_fp4_weight(tensors["w2_weight_bf16"]),
+        gemm1_alpha=torch.full_like(tensors["w1_alpha"], alpha_scale),
+        gemm2_alpha=torch.ones_like(tensors["w2_alpha"]),
+        token_selected_experts=act_pack.topk_ids,
+        token_final_scales=act_pack.topk_weights,
+        num_tokens=act_pack.num_tokens,
+        num_experts=num_experts,
+        top_k=_SM90_SHAPE["top_k"],
+        hidden_size=_SM90_SHAPE["hidden_size"],
+        intermediate_size=_SM90_SHAPE["intermediate_size"],
+        fc2_input_scale=tensors["fc2_input_scale"],
+        use_per_token_activation=per_token,
+        **kwargs,
+    )
+
+
+def _sm90_fp4_weight(weight):
+    """``weight`` [E, rows, k] through NVFP4 with global scale 1, dequantized."""
+    experts, rows, k = weight.shape
+    one = torch.ones(1, dtype=torch.float32, device=weight.device)
+    flat = quant_dequant_fp4_reference(weight.reshape(experts * rows, k), one)
+    return flat.reshape(experts, rows, k)
+
+
+def _sm90_control_kwargs(activation):
+    """The reference of a different formula over the same weights, for the control."""
+    if isinstance(activation, SiTU):
+        return dict(activation=SiTU(gate_scale=0.25, linear_scale=0.5))
+    if isinstance(activation, SwiGLUStep):
+        return dict(activation=SwiGLUStep(limit=0.5 if activation.limit >= 1 else 7.0))
+    if isinstance(activation, ReLU2):
+        return dict(activation=activation, wrong_formula=True)
+    return dict(activation=_SM90_CONTROL_SWIGLU)
+
+
+def _sm90_agreement(actual, reference):
+    actual, reference = actual.float(), reference.float()
+    atol = 0.05 + 0.5 * reference.std().item()
+    close = (actual - reference).abs() < atol + 0.1 * reference.abs()
+    return close.float().mean().item()
+
+
+def _sm90_assert_formula(actual, reference, control, label):
+    """``actual`` matches ``reference`` within FP4 noise and is told from ``control``."""
+    for name, tensor in (("output", actual), ("reference", reference)):
+        assert torch.isfinite(tensor).all(), f"{label}: {name} is not finite"
+    passed, pct, atol = check_accuracy(actual, reference)
+    assert passed, f"{label}: {pct * 100:.2f}% within tolerance (atol={atol:.4f})"
+    agreement = _sm90_agreement(actual, reference)
+    assert agreement >= 0.97, f"{label}: only {agreement * 100:.2f}% agree"
+    control_agreement = _sm90_agreement(actual, control)
+    assert control_agreement < 0.97, (
+        f"{label}: also agrees with the wrong formula at {control_agreement * 100:.2f}%"
+    )
+
+
+def _sm90_x_scale(tensors):
+    return tensors["x_sf"].squeeze(-1)
+
+
+def _sm90_trtllm_case(activation, per_token, *, boost=False):
+    """One unified TRT-LLM forward: ``(output, reference, control)``.
+
+    ``boost`` (SwiGLUStep) makes the clamp bind. Per token it scales the activations by
+    64 and the GEMM1 scalars by 2, as ``test_cuda_graph_replay_matches_eager``, so the
+    clamp binds in both the global and the per-token dequantization. Per tensor the
+    activations keep their global scale and the GEMM1 scalars go to 16.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_tokens = 16
+    shape = _SM90_SHAPE
+    tensors = create_moe_tensors(
+        num_tokens=num_tokens,
+        hidden_size=shape["hidden_size"],
+        intermediate_size=shape["intermediate_size"],
+        num_experts=shape["num_experts"],
+        num_local_experts=shape["num_experts"],
+        top_k=shape["top_k"],
+        gated=activation.is_gated,
+        use_per_token_activation=per_token,
+        use_nontrivial_alphas=False,
+    )
+    if boost and per_token:
+        tensors["x_per_token_scale"] *= 64.0
+        tensors["x_ref"] *= 64.0
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=shape["num_experts"], top_k=shape["top_k"]),
+        quant=_SM90_PER_TOKEN if per_token else _SM90_PER_TENSOR,
+        experts=ExpertConfig(
+            intermediate_size=shape["intermediate_size"],
+            local_num_experts=shape["num_experts"],
+        ),
+        activation=activation,
+    )
+    runner = _build_direct_runner(TrtllmFp4RoutedRunner, config, device)
+    act_pack = MoEActivationPack(
+        hidden_states_q=tensors["x"],
+        hidden_states_scale=_sm90_x_scale(tensors),
+        topk_ids=tensors["token_selected_experts"],
+        topk_weights=tensors["token_final_scales"].to(torch.bfloat16),
+        per_token_scale=tensors["x_per_token_scale"],
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+    )
+    prepared = TrtllmFp4Config.prepare_weights(
+        tensors["w1_weight_bf16"],
+        tensors["w2_weight_bf16"],
+        num_local_experts=shape["num_experts"],
+        hidden_size=shape["hidden_size"],
+        intermediate_size=shape["intermediate_size"],
+        activation=activation,
+        quant=config.quant,
+        device=device,
+    )
+    alpha_scale = 1.0
+    if boost:
+        alpha_scale = 2.0 if per_token else 16.0
+        for key in ("output1_scale_scalar", "output1_scale_gate_scalar"):
+            prepared[key] = torch.full_like(prepared[key], alpha_scale)
+        if "gemm1_clamp_limit" in prepared:
+            prepared["gemm1_clamp_limit"] /= alpha_scale
+    weight_pack = MoEWeightPack()
+    weight_pack.prepare_for(runner.backend_key, prepared)
+    output = runner.forward(runner.pack_inputs(act_pack, weight_pack), tactic=-1)
+    torch.cuda.synchronize()
+    reference = _sm90_reference(
+        tensors, act_pack, activation, per_token=per_token, alpha_scale=alpha_scale
+    )
+    control = _sm90_reference(
+        tensors,
+        act_pack,
+        per_token=per_token,
+        alpha_scale=alpha_scale,
+        **_sm90_control_kwargs(activation),
+    )
+    return output.clone(), reference, control
+
+
+@sm90_unified_required
+@pytest.mark.parametrize(
+    ("activation", "per_token", "boost"),
+    [
+        pytest.param(SwiGLUStep(), True, True, id="per-token-swiglu-step"),
+        pytest.param(
+            SwiGLUStep(limit=0.05), True, False, id="per-token-swiglu-step-05"
+        ),
+        pytest.param(
+            SwiGLU(alpha=1.7, beta=1.0, limit=7.0), True, False, id="per-token-oai"
+        ),
+        pytest.param(
+            SwiGLU(alpha=1.7, beta=1.0, limit=0.25),
+            True,
+            False,
+            id="per-token-oai-limit",
+        ),
+        pytest.param(SwiGLU(), False, False, id="per-tensor-swiglu"),
+        pytest.param(
+            SwiGLU(alpha=1.7, beta=1.0, limit=7.0), False, False, id="per-tensor-oai"
+        ),
+        pytest.param(
+            SwiGLU(alpha=1.7, beta=1.0, limit=0.25),
+            False,
+            False,
+            id="per-tensor-oai-limit",
+        ),
+        pytest.param(SwiGLUStep(), False, True, id="per-tensor-swiglu-step"),
+        pytest.param(
+            SwiGLUStep(limit=0.05), False, False, id="per-tensor-swiglu-step-05"
+        ),
+        pytest.param(
+            SiTU(gate_scale=2.0, linear_scale=3.0), False, False, id="per-tensor-situ"
+        ),
+        pytest.param(ReLU2(), False, False, id="per-tensor-relu2"),
+    ],
+)
+def test_sm90_trtllm_unified_matches_reference(activation, per_token, boost):
+    output, reference, control = _sm90_trtllm_case(activation, per_token, boost=boost)
+    _sm90_assert_formula(output, reference, control, repr(activation))
+
+
+@sm90_unified_required
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["swap_ab0", "swap_ab1"])
+@pytest.mark.parametrize("per_token", [False, True], ids=["per-tensor", "per-token"])
+@pytest.mark.parametrize(
+    "activation",
+    [
+        pytest.param(SwiGLU(), id="swiglu"),
+        pytest.param(SwiGLU(alpha=1.7, beta=1.0, limit=7.0), id="oai"),
+        pytest.param(SwiGLU(alpha=1.7, beta=1.0, limit=0.25), id="oai-limit"),
+        pytest.param(ReLU2(), id="relu2"),
+    ],
+)
+def test_sm90_cute_dsl_unified_matches_reference(activation, per_token, swap_ab):
+    num_tokens = 8
+    quant = _SM90_PER_TOKEN if per_token else _SM90_PER_TENSOR
+    act_pack, weight_pack, config, tensors = _make_packs_and_config(
+        num_tokens,
+        activation=activation,
+        quant=quant,
+        swap_ab=swap_ab,
+        use_per_token_activation=per_token,
+        **_SM90_SHAPE,
+    )
+    config = dataclasses.replace(
+        config,
+        backend=BackendOptions(candidates=(CuteDslConfig(swap_ab=swap_ab),)),
+    )
+    layer = MoELayer(config)
+    runner = layer.runners[0]
+    layer._select_winner = lambda *_: (runner, -1)
+    actual = layer(act_pack, weight_pack)
+
+    def reference(activation, wrong_formula=False):
+        return _compute_ref(
+            act_pack,
+            tensors,
+            _SM90_SHAPE,
+            activation,
+            wrong_formula=wrong_formula,
+            use_per_token_activation=per_token,
+        )
+
+    control = reference(**_sm90_control_kwargs(activation))
+    _sm90_assert_formula(actual, reference(activation), control, repr(activation))
+
+
+@sm90_unified_required
+def test_sm90_trtllm_fused_shared_experts_match_explicit_routing():
+    """FromLogits with a fused shared expert equals the explicit routing it implies.
+
+    ``_trtllm_routing_sm80`` yields the ids and weights (the shared expert's slot last)
+    the runner routes with, which an unfused runner over ``num_experts + 1`` rows then
+    takes precomputed; the outputs must be bit-identical and match the reference.
+    """
+    from flashinfer.fused_moe.core import _trtllm_routing_sm80
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_tokens, hidden, inter = 16, 1024, 512
+    num_experts, top_k, shared = 64, 2, 1
+    rows = num_experts + shared
+    tensors = create_moe_tensors(
+        num_tokens=num_tokens,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        num_experts=rows,
+        num_local_experts=rows,
+        top_k=top_k,
+        use_nontrivial_alphas=False,
+    )
+    logits = torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device)
+    bias = torch.randn(num_experts, dtype=torch.bfloat16, device=device)
+    method = RoutingMethodType.DeepSeekV3
+    ids, weights = _trtllm_routing_sm80(
+        logits, bias, int(method), top_k, 8, 4, 2.5, True, None, shared
+    )
+    assert ids.shape == (num_tokens, top_k + shared)
+    assert (ids[:, -shared:] >= num_experts).all()
+
+    def build(routing, experts):
+        config = MoEConfig(
+            routing=routing,
+            quant=_SM90_PER_TENSOR,
+            experts=experts,
+            activation=SwiGLU(),
+        )
+        return _build_direct_runner(TrtllmFp4RoutedRunner, config, device)
+
+    fused = build(
+        RoutingConfig(
+            num_experts=num_experts,
+            top_k=top_k,
+            method=method,
+            n_group=8,
+            topk_group=4,
+            routed_scaling_factor=2.5,
+        ),
+        ExpertConfig(intermediate_size=inter, num_fused_shared_experts=shared),
+    )
+    explicit = build(
+        RoutingConfig(num_experts=rows, top_k=top_k + shared),
+        ExpertConfig(intermediate_size=inter, local_num_experts=rows),
+    )
+    weight_pack = MoEWeightPack()
+    weight_pack.prepare_for(
+        fused.backend_key,
+        TrtllmFp4Config.prepare_weights(
+            tensors["w1_weight_bf16"],
+            tensors["w2_weight_bf16"],
+            num_local_experts=rows,
+            hidden_size=hidden,
+            intermediate_size=inter,
+            device=device,
+        ),
+    )
+    common = dict(
+        hidden_states_q=tensors["x"], hidden_states_scale=_sm90_x_scale(tensors)
+    )
+    from_logits = MoEActivationPack(
+        **common,
+        routing_logits=logits,
+        routing_bias=bias,
+        routing_input_mode=RoutingInputMode.FromLogits,
+    )
+    precomputed = MoEActivationPack(
+        **common,
+        topk_ids=ids,
+        topk_weights=weights,
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+    )
+    out_fused = fused.forward(fused.pack_inputs(from_logits, weight_pack), tactic=-1)
+    out_fused = out_fused.clone()
+    out_explicit = explicit.forward(
+        explicit.pack_inputs(precomputed, weight_pack), tactic=-1
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_fused, out_explicit, rtol=0, atol=0)
+    reference = compute_reference_moe_fp4(
+        hidden_states=tensors["x_ref"],
+        gemm1_weights=tensors["w1_weight_bf16"],
+        gemm2_weights=tensors["w2_weight_bf16"],
+        gemm1_alpha=tensors["w1_alpha"],
+        gemm2_alpha=tensors["w2_alpha"],
+        token_selected_experts=ids,
+        token_final_scales=weights,
+        num_tokens=num_tokens,
+        num_experts=rows,
+        top_k=top_k + shared,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        fc2_input_scale=tensors["fc2_input_scale"],
+    )
+    passed, pct, atol = check_accuracy(out_fused, reference)
+    assert passed, f"{pct * 100:.2f}% within tolerance (atol={atol:.4f})"
+
+
+class TestSm90Fp4RunnerGuards:
+    """What the SM90 branch of ``check_support`` opens and keeps rejecting (no GPU)."""
+
+    @staticmethod
+    def _config(activation, per_token, **experts):
+        return MoEConfig(
+            routing=RoutingConfig(num_experts=32, top_k=2),
+            quant=_SM90_PER_TOKEN if per_token else _SM90_PER_TENSOR,
+            experts=ExpertConfig(intermediate_size=512, **experts),
+            activation=activation,
+        )
+
+    @staticmethod
+    def _trtllm(monkeypatch, config):
+        import flashinfer.utils as utils
+
+        runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
+        runner.config = config
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (9, 0))
+        return runner
+
+    @staticmethod
+    def _cute_dsl(config):
+        runner = CuteDslRunner.__new__(CuteDslRunner)
+        runner.config = config
+        runner._sm90 = True
+        return runner
+
+    @pytest.mark.parametrize(
+        ("activation", "per_token"),
+        [
+            (SwiGLU(alpha=1.7, beta=1.0, limit=7.0), True),
+            (SwiGLUStep(), True),
+            (SwiGLUStep(limit=0.05), True),
+            (ReLU2(), True),
+            (SwiGLU(alpha=1.7, beta=1.0, limit=7.0), False),
+            (SwiGLUStep(limit=0.05), False),
+            (SiTU(), False),
+            (ReLU2(), False),
+        ],
+    )
+    def test_trtllm_accepts(self, monkeypatch, activation, per_token):
+        runner = self._trtllm(monkeypatch, self._config(activation, per_token))
+        assert runner.check_support() is None
+
+    @pytest.mark.parametrize(
+        ("activation", "per_token"),
+        [(GeGLU(), True), (GeGLU(), False), (SiTU(), True)],
+    )
+    def test_trtllm_still_rejects(self, monkeypatch, activation, per_token):
+        runner = self._trtllm(monkeypatch, self._config(activation, per_token))
+        with pytest.raises(NotImplementedError, match="SM90 FP4 MoE"):
+            runner.check_support()
+
+    def test_trtllm_accepts_fused_shared_experts(self, monkeypatch):
+        config = MoEConfig(
+            routing=RoutingConfig(
+                num_experts=64,
+                top_k=2,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=8,
+                topk_group=4,
+                routed_scaling_factor=2.5,
+            ),
+            quant=_SM90_PER_TENSOR,
+            experts=ExpertConfig(intermediate_size=512, num_fused_shared_experts=1),
+        )
+        assert self._trtllm(monkeypatch, config).check_support() is None
+
+    @pytest.mark.parametrize("per_token", [False, True])
+    @pytest.mark.parametrize(
+        "activation", [SwiGLU(), SwiGLU(alpha=1.7, beta=1.0, limit=7.0), ReLU2()]
+    )
+    def test_cute_dsl_accepts(self, activation, per_token):
+        runner = self._cute_dsl(self._config(activation, per_token))
+        assert runner.check_support() is None
+
+    @pytest.mark.parametrize("per_token", [False, True])
+    @pytest.mark.parametrize("activation", [SiTU(), GeGLUTanh()])
+    def test_cute_dsl_still_rejects(self, activation, per_token):
+        runner = self._cute_dsl(self._config(activation, per_token))
+        with pytest.raises(NotImplementedError, match="SM90 FP4 MoE"):
+            runner.check_support()
+
+    def test_cute_dsl_still_rejects_fused_shared_experts(self):
+        config = MoEConfig(
+            routing=RoutingConfig(
+                num_experts=64,
+                top_k=2,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=8,
+                topk_group=4,
+                routed_scaling_factor=2.5,
+            ),
+            quant=_SM90_PER_TENSOR,
+            experts=ExpertConfig(intermediate_size=512, num_fused_shared_experts=1),
+        )
+        with pytest.raises(NotImplementedError, match="fused shared experts"):
+            self._cute_dsl(config).check_support()

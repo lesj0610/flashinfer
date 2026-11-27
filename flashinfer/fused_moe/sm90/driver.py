@@ -50,6 +50,7 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
     ActivationType,
 )
+from ...utils import check_shape_dtype_device
 from ..shared.validation import resolve_moe_act_sf_layout
 from ..utils import make_hybrid_bucket_mapper, map_to_hybrid_bucket
 from .spec import (
@@ -116,6 +117,10 @@ def _check_localized(
     )
     if not shards:
         return None
+    if (
+        a.get("routing_metadata") is not None
+    ):  # core.py's check of the SM100 op, first in it
+        raise ValueError("localized_weights does not support routing_metadata")
     for ok, what in (
         (
             x.dtype == a["gemm1_weights"].dtype == torch.uint8,
@@ -137,7 +142,6 @@ def _check_localized(
             "does not support padded (valid) dimensions.",
         ),
         (a.get("workspace_buffer") is None, "does not support workspace_buffer."),
-        (a.get("routing_metadata") is None, "does not support routing metadata."),
     ):
         if not ok:
             raise RuntimeError(f"Localized MoE {what}")
@@ -246,13 +250,13 @@ _TRTLLM_PER_TOKEN_ACTIVATIONS = (
 
 def sm90_fp4_moe_supports(entry: str, *, per_token: bool, activation_type: int) -> bool:
     """Whether SM90 runs this NVFP4 x NVFP4 tuple of ``entry`` (``"trtllm"``, ``"cutlass"`` or
-    ``"cute_dsl"``): per-token activation scales for CuTe DSL, per-tensor for CUTLASS, either
-    for TRT-LLM, and an activation the entry runs on SM90. The entry points reject the rest on
-    SM90 with ``NotImplementedError``."""
+    ``"cute_dsl"``): per-tensor activation scales for CUTLASS, either for TRT-LLM and CuTe DSL,
+    and an activation the entry runs on SM90. The entry points reject the rest on SM90 with
+    ``NotImplementedError``."""
     acts = _ENTRY_ACTIVATIONS[entry]
     if entry == "trtllm" and per_token:
         acts = _TRTLLM_PER_TOKEN_ACTIVATIONS
-    return (entry == "trtllm" or per_token == (entry != "cutlass")) and ActivationType(
+    return (entry != "cutlass" or not per_token) and ActivationType(
         activation_type
     ) in acts
 
@@ -1023,6 +1027,13 @@ def trtllm_fp4_sm90_moe(
         ActivationType.Situ: ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
         ActivationType.SwigluStep: ("gemm1_clamp_limit",),
     }.get(act, ())
+    # SM100's FP4 launcher passes them on for any activation, with its per-expert checks only
+    # under fused shared experts, and the non-gated kernels ignore them: accepted, not read
+    ignored = (
+        ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+        if act in (ActivationType.Relu2, ActivationType.Identity)
+        else ()
+    )
     biases = ("gemm1_bias", "gemm2_bias")
     # SM100 has no SiTU GEMM1 kernel with a BiasType::Mn delta
     lora_ok = () if act == ActivationType.Situ else ("gemm1_lora_delta",)
@@ -1070,7 +1081,7 @@ def trtllm_fp4_sm90_moe(
             "gemm1_lora_delta",
             "routing_metadata",
         )
-        if a.get(n) is not None and n not in params + biases + lora_ok
+        if a.get(n) is not None and n not in params + ignored + biases + lora_ok
     ]
     if (
         x.dtype != torch.uint8
@@ -1103,13 +1114,16 @@ def trtllm_fp4_sm90_moe(
     rh = _infer_trtllm_moe_output_hidden_size(hidden, vh)
     _check_valid_hidden_size_supports_finalize(vh, finalize, hidden)
     if finalize and out is not None:
-        if (
-            out.dtype != torch.bfloat16
-            or out.dim() != 2
-            or out.shape[0] != tokens
-            or not 0 < out.shape[1] <= hidden
-        ):
-            raise _not_on_sm90("an output other than BF16 [num_tokens, <= hidden]")
+        # core.py's checks of the SM100 op, in its order
+        check_shape_dtype_device(out, None, torch.bfloat16, x.device, "output")
+        if out.dim() != 2 or out.shape[1] == 0:  # SM100 fails these in its launcher
+            raise _not_on_sm90("an output other than 2-D with columns")
+        assert out.shape[0] == tokens, (
+            f"output.shape[0]={out.shape[0]} must be equal to {tokens}"
+        )
+        assert out.shape[1] <= hidden, (
+            f"output.shape[1]={out.shape[1]} must be less than or equal to {hidden}"
+        )
         if vh is not None and out.shape[1] != vh:
             raise ValueError(
                 f"output.shape[1] must equal valid_hidden_size={vh} when "
@@ -1162,14 +1176,15 @@ def trtllm_fp4_sm90_moe(
                 raise RuntimeError(f"{n} must be {d}D.")
             if t is not None and t.shape[0] != experts:
                 raise RuntimeError(f"{n} dim 0 {each}")
-    for n in params:
+    for n in params + ignored:
         t = a.get(n)
         if n in first:
             continue
         if nfse:
             _check_per_expert_param(t, n, x, experts)
         elif (
-            t is not None
+            n not in ignored
+            and t is not None
             and (
                 t.dtype != torch.float32
                 or t.shape != (experts,)
@@ -1477,37 +1492,53 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
 def cute_dsl_fp4_sm90_moe(
     a: Dict[str, Any], activation: ActivationType, swap_ab: bool
 ) -> torch.Tensor:
-    """``cute_dsl_fused_moe`` (its arguments ``a``) on SM90: W4A4 per token, weights in
-    the CuTe DSL layout (group interleave 64, or 16 with ``swap_ab``)."""
+    """``cute_dsl_fused_moe`` (its arguments ``a``) on SM90: W4A4 per token or per tensor,
+    weights in the CuTe DSL layout (group interleave 64, or 16 with ``swap_ab``). Per tensor
+    ``x`` is quantized by the caller, ``w1_alpha`` dequantizes GEMM1, ``fc2_input_scale`` is
+    GEMM2's input encode scale and ``w2_alpha`` carries its inverse, as SM100's tuple.
+    SwiGLU's ``swiglu_alpha``, ``swiglu_beta`` and ``swiglu_limit`` (SM100's scalars, in real
+    units) run as ``SwigluBias`` with those scalars for every expert."""
     x, x_sf, pt = a["x"], a["x_sf"], a["per_token_scale"]
     recipe = resolve_nvfp4_4over6(a["nvfp4_4over6"]) if pt is not None else None
     swiglu = (a["swiglu_alpha"], a["swiglu_beta"], a["swiglu_limit"])
     defaults = (DEFAULT_SWIGLU_ALPHA, DEFAULT_SWIGLU_BETA, DEFAULT_SWIGLU_LIMIT)
     output_dtype = a["output_dtype"]
+    if a["quant_mode"] == "w4a4":  # SM100's checks of these inputs, in its order
+        if x.dtype is not torch.uint8:
+            raise TypeError("quant_mode='w4a4' requires packed uint8 input")
+        if x_sf is None:
+            raise ValueError("x_sf is required for block-scaled MoE")
+        if a["fc2_input_scale"] is None:
+            raise ValueError("fc2_input_scale is required when quant_mode='w4a4'")
     if (
         a["quant_mode"] != "w4a4"
-        or pt is None
         or activation not in (ActivationType.Swiglu, ActivationType.Relu2)
-        or swiglu != defaults
         or a["situ_beta"] is not None
         or a["clamped_relu2_limit"] is not None
         or a["routing_weights_before_fc2"]
         or a["localized_weights"] is not None
-        or output_dtype not in (torch.bfloat16, torch.float16)
-        or x.dtype != torch.uint8
-        or x_sf is None
-        or a["fc2_input_scale"] is None
     ):
         raise _not_on_sm90(
-            "CuTe DSL FP4 MoE outside W4A4 per-token with Swiglu or Relu2 at the "
-            "default activation parameters"
+            "CuTe DSL FP4 MoE outside W4A4 with Swiglu or Relu2 (per-token or per-tensor "
+            "activation scales)"
         )
     tokens, hidden = x.shape[0], x.shape[1] * 2
-    if pt.dtype != torch.float32 or pt.numel() != tokens or not pt.is_contiguous():
+    if pt is not None and (
+        pt.dtype != torch.float32 or pt.numel() != tokens or not pt.is_contiguous()
+    ):
         raise ValueError("per_token_scale must be FP32 [num_tokens], contiguous.")
-    # As SM100's per-token quantizer: the GEMM2 input rows under this inverse global scale.
+    # As SM100's quantizer of the GEMM2 input: its rows under this global (encode) scale, one
+    # for all experts. Per tensor, SM100's GEMM1 epilogue reads element 0 through a float32
+    # device pointer, so only such a tensor is taken (an empty one fails in the reshape); per
+    # token, SM100's quantizer takes exactly one value, tensor or float.
     gsi = a["fc2_input_scale"]
-    if isinstance(gsi, torch.Tensor):
+    if pt is None:
+        if not isinstance(gsi, torch.Tensor) or gsi.dtype != torch.float32:
+            raise TypeError("per-tensor fc2_input_scale must be a float32 tensor")
+        if gsi.device != x.device:
+            raise ValueError("per-tensor fc2_input_scale must be on the input device")
+        gsi = gsi.reshape(-1)[:1].reshape(1)
+    elif isinstance(gsi, torch.Tensor):
         gsi = gsi.float().reshape(1).contiguous().to(x.device)
     else:
         gsi = torch.tensor([float(gsi)], dtype=torch.float32, device=x.device)
@@ -1515,6 +1546,9 @@ def cute_dsl_fp4_sm90_moe(
         raise TypeError("x_sf must have dtype uint8 or float8_e4m3fn")
     if x_sf.numel() != tokens * (hidden // 16):
         raise ValueError("x_sf must be linear: [num_tokens, hidden / 16] E4M3 scales.")
+    from ..cute_dsl.fused_moe import _intermediate_c_dtype
+
+    _intermediate_c_dtype(output_dtype)  # SM100's GEMM2 dtype check: BF16 or FP16 only
     w1w, w2w = a["w1_weight"], a["w2_weight"]
     inter = w2w.shape[2] * 2
     gated = activation.is_gated
@@ -1543,6 +1577,28 @@ def cute_dsl_fp4_sm90_moe(
     ids = a["token_selected_experts"]
     if ids.shape[1:] != (a["top_k"],):
         raise ValueError("token_selected_experts must be [num_tokens, top_k].")
+    act1, act_params = activation, (None, None, None)
+    if activation == ActivationType.Swiglu and swiglu != defaults:
+        # SM100's kernel: the gate clamped above and the up both ways at the limit, then
+        # gate * sigmoid(alpha * gate) * (up + beta); the scalars hold for every expert.
+        act1 = ActivationType.SwigluBias
+        act_params = tuple(
+            torch.full((local,), float(v), dtype=torch.float32, device=x.device)
+            for v in swiglu
+        )
+    if pt is not None:
+        epi1 = Sm90EpilogueSpec(
+            int(act1), alpha=a["w1_alpha"], act_params=act_params, fq_global=gsi
+        )
+    else:
+        epi1 = Sm90EpilogueSpec(
+            int(act1),
+            fq=Fq.NVFP4,
+            recipe=fp4_sm90_recipe_bits(None),
+            alpha=a["w1_alpha"],
+            act_params=act_params,
+            fq_global=gsi,
+        )
     sm90_fp4_moe(
         x.view(torch.uint8),
         x_sf.view(torch.uint8).reshape(tokens, hidden // 16),
@@ -1556,7 +1612,7 @@ def cute_dsl_fp4_sm90_moe(
             a["local_expert_offset"],
             local,
         ),
-        Sm90EpilogueSpec(int(activation), alpha=a["w1_alpha"], fq_global=gsi),
+        epi1,
         Sm90EpilogueSpec(
             int(ActivationType.Identity),
             gemm2=True,

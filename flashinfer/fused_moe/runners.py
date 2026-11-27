@@ -604,36 +604,55 @@ def _cutlass_activation_params(
 
 def _check_sm90_fp4_moe(
     runner: "MoERunner",
-    per_token: bool,
+    per_token: Optional[bool],
     activations: Optional[tuple[type[ActivationConfig], ...]],
+    *,
+    any_params: bool = False,
+    shared_experts: bool = False,
 ) -> None:
     """Reject on SM90 what ``flashinfer.fused_moe.sm90`` does not run yet: anything but NVFP4 x
-    NVFP4, ``per_token`` (else per tensor), with ``activations`` at their default parameters
-    (None: the runner's own activations) and no fused shared experts."""
+    NVFP4, ``per_token`` (None: per token or per tensor), with ``activations`` (None: the
+    runner's own) at their default parameters, or at any with ``any_params``, and with fused
+    shared experts only when ``shared_experts``."""
     config = runner.config
     quant, activation = config.quant, config.activation
     if (
         quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4)
-        or bool(quant.per_token_scale) != per_token
+        or (per_token is not None and bool(quant.per_token_scale) != per_token)
         or (
             activations is not None
             and (
-                type(activation) not in activations or activation != type(activation)()
+                type(activation) not in activations
+                or (not any_params and activation != type(activation)())
             )
         )
-        or config.experts.num_fused_shared_experts
+        or (config.experts.num_fused_shared_experts and not shared_experts)
     ):
         names = (
             "its activations"
             if activations is None
             else ", ".join(cls.__name__ for cls in activations)
-            + " at default parameters"
+            + ("" if any_params else " at default parameters")
         )
-        mode = "per-token" if per_token else "per-tensor"
+        mode = (
+            "per-token or per-tensor"
+            if per_token is None
+            else "per-token"
+            if per_token
+            else "per-tensor"
+        )
         raise NotImplementedError(
             f"SM90 FP4 MoE: {type(runner).__name__} outside NVFP4 x NVFP4 {mode} "
             f"with {names} is not implemented on SM90 yet."
         )
+
+
+def _sm90_epilogue_activation(activation: ActivationConfig) -> int:
+    """The activation SM90's GEMM1 epilogue runs: SwiGLU at non-default parameters is its
+    ``SwigluBias`` (the module, and so the tactics, are keyed on it)."""
+    if isinstance(activation, SwiGLU) and activation != SwiGLU():
+        return int(ActivationType.SwigluBias)
+    return int(activation.type)
 
 
 class MoERunner(TunableRunner):
@@ -5177,8 +5196,9 @@ class CuteDslRunner(MoERunner):
                 "4over6 variant."
             )
         if getattr(self, "_sm90", False):
-            # flashinfer.fused_moe.sm90 runs the per-token W4A4 4over6 tuples.
-            _check_sm90_fp4_moe(self, True, (SwiGLU, ReLU2))
+            # flashinfer.fused_moe.sm90 runs W4A4, per token or per tensor, with ReLU2 and
+            # SwiGLU at any alpha, beta and limit (its SM100 scalars).
+            _check_sm90_fp4_moe(self, None, (SwiGLU, ReLU2), any_params=True)
         self._assert_rubin_cute_dsl_available()
 
     def _assert_rubin_cute_dsl_available(self) -> None:
@@ -5323,34 +5343,29 @@ class CuteDslRunner(MoERunner):
         if self._sm90:
             from .sm90.driver import sm90_fp4_valid_tactics
 
+            per_token = bool(self.config.quant.per_token_scale)
             return sm90_fp4_valid_tactics(
                 "cute_dsl",
-                resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6),
-                int(self.config.activation.type),
-                True,
+                resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
+                if per_token
+                else None,
+                _sm90_epilogue_activation(self.config.activation),
+                per_token,
             )
         return self._inner.get_valid_tactics(inputs, profile)
 
     def _forward_sm90(self, inputs: List[torch.Tensor], tactic: Any) -> torch.Tensor:
-        """SM90: the per-token W4A4 list through ``cute_dsl_fused_moe``'s SM90 branch."""
+        """SM90: the W4A4 list (per token with ``per_token_scale`` before the output) through
+        ``cute_dsl_fused_moe``'s SM90 branch."""
         from .cute_dsl.fused_moe import cute_dsl_fused_moe
         from .sm90.driver import default_sm90_fp4_tactic
 
-        (
-            x,
-            x_sf,
-            ids,
-            weights,
-            w1,
-            w1_sf,
-            w1_alpha,
-            fc2_in,
-            w2,
-            w2_sf,
-            w2_alpha,
-            pt,
-            out,
-        ) = inputs
+        per_token = bool(self.config.quant.per_token_scale)
+        x, x_sf, ids, weights, w1, w1_sf, w1_alpha, fc2_in, w2, w2_sf, w2_alpha = (
+            inputs[:11]
+        )
+        pt = inputs[11] if per_token else None
+        out = inputs[-1]
         routing, experts = self.config.routing, self.config.experts
         local = experts.local_num_experts or routing.num_experts
         if (
@@ -5364,10 +5379,10 @@ class CuteDslRunner(MoERunner):
             local_expert_offset=experts.local_expert_offset,
             output_dtype=out.dtype,
             moe_output=out,
-            activation_type=int(self.config.activation.type),
             per_token_scale=pt,
             tactic=tactic,
             swap_ab=self.swap_ab,
+            **_cute_dsl_activation_kwargs(self.config.activation),
             **self._forward_kwargs,
         )  # fmt: skip
 
@@ -5883,8 +5898,19 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                     "the currently pinned Rubin BMM artifact."
                 )
             if compute_capability == (9, 0):
-                # flashinfer.fused_moe.sm90 runs the per-token 4over6 tuples on this view.
-                _check_sm90_fp4_moe(self, True, (SwiGLU, ReLU2))
+                # flashinfer.fused_moe.sm90 runs NVFP4 x NVFP4 with the activations of
+                # trtllm_fp4_sm90_moe (per token: SwiGLU, SwiGLUStep and ReLU2) at any
+                # parameters, and fused shared experts. GeGLU stays closed until SM90 matches
+                # what its gemm1 alpha, beta and limit do.
+                _check_sm90_fp4_moe(
+                    self,
+                    None,
+                    (SwiGLU, SwiGLUStep, ReLU2)
+                    if self.config.quant.per_token_scale
+                    else (SwiGLU, SwiGLUStep, SiTU, ReLU2),
+                    any_params=True,
+                    shared_experts=True,
+                )
                 return
             if pair in (
                 (QuantFormat.NVFP4, QuantFormat.NVFP4),
@@ -5993,9 +6019,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
             return sm90_fp4_valid_tactics(
                 "trtllm",
-                resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6),
-                self._activation_type,
-                True,
+                resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
+                if self._per_token
+                else None,
+                _sm90_epilogue_activation(self.config.activation),
+                self._per_token,
             )
         # The inner runner reads num_tokens from inputs + its own instance key;
         # no launch kwargs are needed for tactic enumeration.
@@ -6078,7 +6106,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             ids, weights = _trtllm_routing_sm80(
                 m.routing_logits, kw["routing_bias"], kw["routing_method_type"], top_k,
                 kw["n_group"], kw["topk_group"], kw["routed_scaling_factor"], True,
-                kw["enable_pdl"],
+                kw["enable_pdl"], self._num_fused_shared_experts,
             )  # fmt: skip
         elif mode == RoutingInputMode.PackedPrecomputed:
             ids, weights = m.topk_ids >> 16, m.expert_weights
@@ -6088,10 +6116,21 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             tactic = default_sm90_fp4_tactic(
                 m.hidden_states.shape[0], top_k, self._num_local_experts
             )
-        # check_support pinned the activation to its defaults, which prepare's gemm1 scalars
-        # (the SwiGLU gate-alpha placeholder) only restate.
+        # Only the scalars the activation reads go on: SwiGLU's and SiTU's alpha, beta and limit
+        # (SwiGLU at its defaults is the plain kernel), SwiGLUStep's limit. The rest are the
+        # gate-alpha placeholder prepare adds to every NVFP4 gated view.
+        activation = self.config.activation
+        read = (
+            ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+            if isinstance(activation, SiTU)
+            or (isinstance(activation, SwiGLU) and activation != SwiGLU())
+            else ("gemm1_clamp_limit",)
+            if isinstance(activation, SwiGLUStep)
+            else ()
+        )
         for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
-            kw.pop(name)
+            if name not in read:
+                kw[name] = None
         res = trtllm_fp4_sm90_moe(
             dict(
                 kw,
