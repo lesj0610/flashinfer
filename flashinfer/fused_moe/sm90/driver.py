@@ -572,8 +572,10 @@ def trtllm_fp4_sm90_moe(
         a[f"output{i}_scalar"] for i in ("1_scale", "1_scale_gate", "2_scale")
     )
     recipe = resolve_nvfp4_4over6(a["nvfp4_4over6"]) if pt is not None else None
-    # As SM100: SiTU's alpha, beta and limit, SwigluStep's limit, the biases (per tensor here)
+    # As SM100: Swiglu's and SiTU's alpha, beta and limit, SwigluStep's limit, the biases (per
+    # tensor here)
     params = {
+        ActivationType.Swiglu: ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
         ActivationType.Situ: ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
         ActivationType.SwigluStep: ("gemm1_clamp_limit",),
     }.get(act, ())
@@ -686,6 +688,7 @@ def trtllm_fp4_sm90_moe(
     alpha2 = _per_expert(s2, experts)
     limit = a.get("gemm1_clamp_limit") if params else None
     act_params = (None, None, None if limit is None else limit * alpha1)
+    act1 = act
     if act == ActivationType.Situ:  # TRT-LLM's defaults: alpha 1, beta 1
         one = torch.ones(experts, dtype=torch.float32, device=x.device)
         ab = (a.get("gemm1_alpha"), a.get("gemm1_beta"))
@@ -693,9 +696,19 @@ def trtllm_fp4_sm90_moe(
             *(one if t is None else t.contiguous() for t in ab),
             act_params[2],
         )
+    elif act == ActivationType.Swiglu and any(a.get(n) is not None for n in params):
+        # TRT-LLM's SwiGLU with parameters is SwigluBias (defaults alpha 1, beta 0, no limit):
+        # alpha on the dequantized gate, beta in accumulator units as the limit.
+        act1 = ActivationType.SwigluBias
+        alpha, beta = a.get("gemm1_alpha"), a.get("gemm1_beta")
+        act_params = (
+            None if alpha is None else alpha.contiguous(),
+            None if beta is None else beta * alpha1,
+            act_params[2],
+        )
     if pt is None:
         epi1 = Sm90EpilogueSpec(
-            int(act),
+            int(act1),
             fq=Fq.NVFP4,
             recipe=fp4_sm90_recipe_bits(None),
             alpha=alpha1,

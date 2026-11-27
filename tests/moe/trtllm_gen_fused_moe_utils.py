@@ -3912,7 +3912,7 @@ def run_moe_test(
         ),
         moe_gemm_backend=moe_gemm_backend,
         activation_params=activation_type
-        not in (ActivationType.Situ, ActivationType.SwigluStep)
+        not in (ActivationType.Swiglu, ActivationType.Situ, ActivationType.SwigluStep)
         and any(t is not None for t in (gemm1_alpha, gemm1_beta, gemm1_clamp_limit)),
     )
 
