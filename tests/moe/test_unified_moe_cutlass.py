@@ -1856,7 +1856,7 @@ def _is_cutlass_bf16_runtime_supported() -> bool:
         return is_sm120a_supported(device)
     if arch == 121:
         return is_sm121a_supported(device)
-    return arch == 89
+    return arch in (80, 86, 87, 89)
 
 
 cutlass_bf16_required = pytest.mark.skipif(
