@@ -153,6 +153,20 @@ inline void check_fp4_sm90_gemm_args(const GemmArgs& g) {
     TVM_FFI_CHECK(g.sched.expert_offset == nullptr, ValueError)
         << "SM90 FP4 GEMM: row-major activations take a single expert";
   }
+  if constexpr (Cfg::kCrossN) {
+    static_assert(!epi_gemm2(Cfg::kEpi) && epi_fq(Cfg::kEpi) == Fq::kNvfp4,
+                  "cross n is the NVFP4 GEMM1 epilogue");
+    TVM_FFI_CHECK(g.epi.out_tiled == 1 && g.sched.expert_offset != nullptr &&
+                      g.cross.expert_tile_base2 != nullptr,
+                  ValueError)
+        << "SM90 FP4 GEMM: cross n writes tiled output of an expert schedule and needs "
+           "expert_tile_base2";
+    TVM_FFI_CHECK(
+        g.cross.n2_shift >= 3 && g.cross.n2_shift <= 8 && (1 << g.cross.n2_shift) != Cfg::kN,
+        ValueError)
+        << "SM90 FP4 GEMM: cross n needs n2 = 1 << " << g.cross.n2_shift
+        << " in [8, 256] and != " << Cfg::kN;
+  }
   TVM_FFI_CHECK(g.sched.max_tiles >= 0, ValueError) << "SM90 FP4 GEMM: negative max_tiles";
   TVM_FFI_CHECK(g.sched.tile_expert == nullptr || g.sched.expert_offset != nullptr, ValueError)
       << "SM90 FP4 GEMM: an expert schedule needs expert_offset";

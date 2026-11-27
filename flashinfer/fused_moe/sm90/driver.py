@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import functools
 import math
+import operator
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -71,6 +72,10 @@ __all__ = [
     "sm90_fp4_moe_supports",
     "sm90_fp4_valid_tactics",
 ]
+
+#: One tactic per GEMM, ``((cta_m1, n1, stages1), (cta_m2, n2, stages2))``: the runner's input of
+#: ``profile_ids`` launches only; the autotuner and every ``SM90_TACTIC`` consumer see 3-tuples.
+Sm90GemmTactics = Tuple[SM90_TACTIC, SM90_TACTIC]
 
 #: D7 shapes (cta_m, n, stages); stages 0 = the most that fit shared memory, as built.
 #: ``Sm90Fp4MoeRunner.get_valid_tactics`` reports the built stage counts and drops shapes
@@ -195,11 +200,13 @@ def get_fp4_moe_sm90_module(recipe=None, exact=False, act=None, f16=False):
 
 @functools.cache
 def _module_tactics(
-    recipe, exact, act, f16, per_token, w1_fmt, w2_fmt, a_path
+    recipe, exact, act, f16, per_token, w1_fmt, w2_fmt, a_path, gemm=0
 ) -> Tuple[SM90_TACTIC, ...]:
+    """The module's tactics: ``gemm`` 0 the (cta_m, n, stages) of both GEMMs together (the
+    autotuner's candidates), 1 or 2 those of that GEMM alone (``profile_ids``' lists)."""
     flat = list(
         get_fp4_moe_sm90_module(recipe, exact, act, f16).fp4_moe_sm90_tactics(
-            per_token, int(w1_fmt), int(w2_fmt), a_path
+            per_token, int(w1_fmt), int(w2_fmt), a_path, gemm
         )
     )
     return tuple(
@@ -257,7 +264,9 @@ def sm90_fp4_valid_tactics(
     ``Sm90Fp4MoeRunner.get_valid_tactics`` reports them (builds the module)."""
     fmt = _ENTRY_AFMT[entry]
     return list(
-        _module_tactics(recipe, _exact(), int(act), False, per_token, fmt, fmt, a_path)
+        _module_tactics(
+            recipe, _exact(), int(act), False, per_token, fmt, fmt, a_path, 0
+        )
     )
 
 
@@ -370,7 +379,8 @@ def _tuning(
 
 class Sm90Fp4MoeRunner(TunableRunner):
     """``sm90_fp4_moe`` on fixed weights and epilogues; inputs [x, topk_ids, topk_weights,
-    x_sf, token_scale, out], tactic (cta_m, n, stages)."""
+    x_sf, token_scale, out], tactic (cta_m, n, stages) (GEMM1's; GEMM2 runs ``(cta_m, n, 0)``) or,
+    for ``profile_ids``, one such tuple per GEMM."""
 
     def __init__(
         self,
@@ -427,7 +437,26 @@ class Sm90Fp4MoeRunner(TunableRunner):
         return hash(self.key)
 
     def get_cache_key_extras(self, inputs) -> tuple:
-        return (inputs[0].dtype, self.x_global is not None)
+        # Persisted keys omit the runner hash: include what changes the tactics' meaning, the
+        # module and the launch (not the local expert offset: as SM100's ranks, it only shifts
+        # timings).
+        return (
+            inputs[0].dtype,
+            self.x_global is not None,
+            nvfp4_4over6_cache_key(self.recipe),
+            self.exact,
+            int(self.epi1.act),
+            self.per_token,
+            tuple(_geometry(self.w1)),
+            tuple(_geometry(self.w2)),
+            self.num_experts,
+            self.num_local_experts,
+            self.x_sf_swizzled,
+            self.do_finalize,
+            self.a_path,
+            self.epi2.out_dtype,
+            self.localized is not None,
+        )
 
     def get_valid_tactics(
         self, inputs, profile: OptimizationProfile
@@ -441,6 +470,49 @@ class Sm90Fp4MoeRunner(TunableRunner):
                 self.a_path,
             )
         )
+
+    def gemm_tactics(
+        self, profile_ids: Sequence[int], tokens: int, top_k: int
+    ) -> Sm90GemmTactics:
+        """The tactics of ``profile_ids`` ``[gemm1, gemm2]``, integer indices of SM100's combined
+        list: GEMM1's tactics, then GEMM2's. -1 takes that GEMM's untuned default from its own
+        list: the default (cta_m, n) with that GEMM's stages, else the nearest n (CTA_M 128
+        first, then list order)."""
+        lists = [
+            _module_tactics(
+                *self.module_key,
+                self.per_token,
+                self.w1.a_fmt,
+                self.w2.a_fmt,
+                self.a_path,
+                gemm,
+            )
+            for gemm in (1, 2)
+        ]
+        cta_m, n, _ = default_sm90_fp4_tactic(tokens, top_k, self.num_local_experts)
+
+        def default(gemm: int, tactics: Tuple[SM90_TACTIC, ...]) -> SM90_TACTIC:
+            if not tactics:
+                raise RuntimeError(
+                    f"SM90 FP4 MoE: this module has no gemm{gemm} tactic"
+                )
+            return min(
+                tactics,
+                key=lambda t: (abs(t[1].bit_length() - n.bit_length()), t[0] != cta_m),
+            )
+
+        first = 0
+        chosen = []
+        for gemm, (pid, tactics) in enumerate(zip(profile_ids, lists, strict=True), 1):
+            pid = operator.index(pid)  # SM100 takes int64 indices only
+            if pid == -1:
+                chosen.append(default(gemm, tactics))
+            elif first <= pid < first + len(tactics):
+                chosen.append(tactics[pid - first])
+            else:
+                raise RuntimeError(f"Invalid gemm{gemm} profile id: {pid}")
+            first += len(tactics)
+        return chosen[0], chosen[1]
 
     def _localized_args(self) -> tuple:
         """The module's localization arguments: per domain its shards' codes and scales (w1's,
@@ -460,7 +532,12 @@ class Sm90Fp4MoeRunner(TunableRunner):
         tokens, top_k = ids.shape
         if tactic is None or tactic == -1:
             tactic = default_sm90_fp4_tactic(tokens, top_k, self.num_local_experts)
-        cta_m, n, stages = tactic
+        # A 3-tuple (the autotuner's) runs GEMM2 with the shape of GEMM1 and its table's stages.
+        if len(tactic) == 2:
+            (cta_m1, n1, stages1), (cta_m2, n2, stages2) = tactic
+        else:
+            cta_m1, n1, stages1 = tactic
+            cta_m2, n2, stages2 = cta_m1, n1, 0
         if x.dtype == torch.uint8:
             x_fmt = XFmt.NVFP4_SWZ128X4 if self.x_sf_swizzled else XFmt.NVFP4_LINEAR
             quantize = 0
@@ -480,7 +557,8 @@ class Sm90Fp4MoeRunner(TunableRunner):
             int(x_fmt),
             quantize,
             self.per_token,
-            n,
+            n1,
+            n2,
         )
         out_dtype = self.epi2.out_dtype
         lora, act_out = kwargs.get("gemm1_lora_delta"), None
@@ -502,7 +580,8 @@ class Sm90Fp4MoeRunner(TunableRunner):
                 hidden,
                 inter,
                 self.per_token,
-                n,
+                n1,
+                n2,
                 out_dtype.itemsize,
                 carve_src,
                 carve_y,
@@ -571,9 +650,12 @@ class Sm90Fp4MoeRunner(TunableRunner):
             *fc2,
             lora,
             act_out,
-            cta_m,
-            n,
-            stages,
+            cta_m1,
+            n1,
+            stages1,
+            cta_m2,
+            n2,
+            stages2,
             self.a_path,
             *self._localized_args(),
             self.keep_unrouted,
@@ -595,6 +677,7 @@ def sm90_fp4_moe(
     *,
     out: Optional[torch.Tensor] = None,
     tactic: Any = -1,
+    profile_ids: Optional[Sequence[int]] = None,
     recipe=None,
     exact: bool = False,
     x_global: Optional[torch.Tensor] = None,
@@ -636,7 +719,12 @@ def sm90_fp4_moe(
         Finalized output ``[num_tokens, <= hidden]``, the leading columns of GEMM2's rows
         (allocated ``hidden`` wide if None).
     tactic : tuple or int
-        ``(cta_m, n, stages)``; -1 autotunes (or the untuned default outside tuning).
+        ``(cta_m, n, stages)`` (GEMM2 runs ``(cta_m, n, 0)``); -1 autotunes (or the untuned
+        default outside tuning).
+    profile_ids : Optional[Sequence[int]]
+        SM100's ``[gemm1_profile, gemm2_profile]``, absolute indices of the combined list of
+        GEMM1's tactics then GEMM2's (``fp4_moe_sm90_tactics`` with ``gemm`` 1 and 2); -1 keeps
+        that GEMM's untuned default. Replaces ``tactic`` and skips autotuning, whatever the ids.
     recipe : Optional[NVFP44Over6Config]
         Resolved NVFP4 recipe of every quantization in the call (the module's).
     exact : bool
@@ -762,7 +850,9 @@ def sm90_fp4_moe(
         keep_unrouted=keep_unrouted,
     )
     inputs = [x, ids, weights, x_sf, token_scale, out if do_finalize else None]
-    if isinstance(tactic, int) and tactic == -1:
+    if profile_ids is not None:
+        tactic = runner.gemm_tactics(profile_ids, *ids.shape)
+    elif isinstance(tactic, int) and tactic == -1:
         tuning = _tuning(
             routing.num_experts, x.shape[0], tune_max_num_tokens, inputs, x_sf_swizzled
         )
@@ -1240,8 +1330,8 @@ def trtllm_fp4_sm90_moe(
 
 def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
     """``cutlass_fused_moe`` (its arguments ``a``, ``output`` allocated; unset optional ones at
-    their defaults, ``tactic`` an SM90 tactic or -1) on SM90 with the resolved ``recipe``:
-    NVFP4 x NVFP4 per tensor, BF16/FP16 or NVFP4 input."""
+    their defaults, ``tactic`` an SM90 tactic or -1, ``profile_ids`` SM100's two ids) on SM90
+    with the resolved ``recipe``: NVFP4 x NVFP4 per tensor, BF16/FP16 or NVFP4 input."""
     qs, act = a["quant_scales"], ActivationType(a["activation_type"])
     # As SM100's argument conversion (quant_scales is an optional list of tensors), then its
     # runMoe: the cluster first, the quant scales' count, the activation global scales.
@@ -1262,11 +1352,6 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
     profile_ids = a.get("profile_ids")
     if profile_ids is not None and len(profile_ids) != 2:
         raise ValueError("profile_ids must contain [gemm1_profile, gemm2_profile]")
-    unsupported = []
-    # As SM100: -1 keeps a GEMM's default tactic without the tuner; SM100 tactic ids mean
-    # nothing here.
-    if profile_ids is not None and list(profile_ids) != [-1, -1]:
-        unsupported.append("profile_ids")
     biases = (a.get("fc1_expert_biases"), a.get("fc2_expert_biases"))
     swiglu = tuple(a.get(n) for n in ("swiglu_alpha", "swiglu_beta", "swiglu_limit"))
     # As cutlass_fused_moe: Swiglu with SwiGLU parameters runs SwigluBias; SiTU reads situ_beta
@@ -1282,16 +1367,13 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
     ep_size, ep_rank = a.get("ep_size", 1), a.get("ep_rank", 0)
     if (
         act not in SM90_FP4_ACTIVATIONS
-        or unsupported
         or a["output_dtype"] not in (torch.bfloat16, torch.float16)
         or codes != (x_sf is not None)
         or (not codes and x.dtype not in (torch.bfloat16, torch.float16))
         or qs[2].numel() != fc1.shape[0]
         or qs[5].numel() != fc1.shape[0]
     ):
-        raise _not_on_sm90(
-            f"CUTLASS FP4 MoE outside NVFP4 x NVFP4 per tensor (set: {unsupported})"
-        )
+        raise _not_on_sm90("CUTLASS FP4 MoE outside NVFP4 x NVFP4 per tensor")
     if (biases[0] is None) != (biases[1] is None):
         raise ValueError("fc1_expert_biases and fc2_expert_biases go together")
     if (
@@ -1376,7 +1458,10 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
             bias=biases[1],
         ),
         out=out,
-        tactic=None if profile_ids is not None else a.get("tactic", -1),
+        tactic=a.get("tactic", -1),
+        # As SM100's runMoe, after the input checks: ids of GEMM1's then GEMM2's tactics, -1 a
+        # GEMM's default, no tuner.
+        profile_ids=profile_ids,
         recipe=recipe,
         exact=_exact(),
         x_global=None if codes else _device_fp32(qs[0], "the input global scale"),

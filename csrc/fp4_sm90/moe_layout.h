@@ -50,18 +50,26 @@ inline size_t prep_workspace_bytes(int tokens, int top_k, int num_local_experts)
   return size_t(chunks * num_local_experts) * sizeof(int32_t);
 }
 
+// The tile list of GEMM1 and of GEMM1's B tiles (n = n1) is the first set of arrays; the second set
+// (expert_tile_base2 .. num_tiles2) is GEMM2's own list when n2 != n1 and takes no bytes otherwise.
 struct Layout {
   size_t expert_offset, expert_tile_base, permuted_src, tile_expert, tile_n0, num_tiles;
-  size_t tok1, tok2, x_tiles, act, x2_tiles, prep, total;
+  size_t tok1, tok2, x_tiles, act, x2_tiles, prep;
+  size_t expert_tile_base2, tile_expert2, tile_n02, num_tiles2, total;
 };
 
+// n1 / n2: the n of GEMM1 / GEMM2. x_tiles are n1 tiles, act and x2_tiles (GEMM2's B tiles) n2
+// tiles.
 inline Layout make_layout(int64_t tokens_, int64_t top_k_, int64_t num_local_experts_,
-                          int64_t hidden_, int64_t inter_, int64_t n_, bool per_token) {
+                          int64_t hidden_, int64_t inter_, int64_t n1_, int64_t n2_,
+                          bool per_token) {
   const int tokens = static_cast<int>(tokens_), top_k = static_cast<int>(top_k_);
   const int num_local_experts = static_cast<int>(num_local_experts_);
   const int k = static_cast<int>(hidden_), inter = static_cast<int>(inter_);
-  const int n = static_cast<int>(n_);
+  const int n = static_cast<int>(n1_), n2 = static_cast<int>(n2_);
+  const bool cross = n != n2;
   const int max_tiles = max_tiles_of(tokens * top_k, n, num_local_experts);
+  const int max_tiles2 = max_tiles_of(tokens * top_k, n2, num_local_experts);
   const size_t rows = size_t(tokens) * top_k;
   const size_t experts = size_t(num_local_experts) + 1;
   Layout l{};
@@ -81,9 +89,13 @@ inline Layout make_layout(int64_t tokens_, int64_t top_k_, int64_t num_local_exp
   l.tok2 = take(per_token ? rows * 4 : 0);
   l.x_tiles = take(b_tiles_bytes(max_tiles, k, n));
   // per token: BF16 GEMM1 rows for row_quant; per tensor: GEMM2 B tiles written by GEMM1
-  l.act = take(per_token ? rows * size_t(inter) * 2 : b_tiles_bytes(max_tiles, inter, n));
-  l.x2_tiles = take(per_token ? b_tiles_bytes(max_tiles, inter, n) : 0);
+  l.act = take(per_token ? rows * size_t(inter) * 2 : b_tiles_bytes(max_tiles2, inter, n2));
+  l.x2_tiles = take(per_token ? b_tiles_bytes(max_tiles2, inter, n2) : 0);
   l.prep = take(prep_workspace_bytes(tokens, top_k, num_local_experts));
+  l.expert_tile_base2 = take(cross ? experts * 4 : 0);
+  l.tile_expert2 = take(cross ? size_t(max_tiles2) * 4 : 0);
+  l.tile_n02 = take(cross ? size_t(max_tiles2) * 4 : 0);
+  l.num_tiles2 = take(cross ? 4 : 0);
   l.total = at;
   return l;
 }
@@ -106,18 +118,20 @@ inline Scratch scratch_layout(size_t layout_bytes, size_t rows, size_t hidden, s
   return s;
 }
 
-// The bytes that hold every execution variant a query's inputs do not tell apart: each n,
-// per-token or per-tensor, src_permuted and y both carved, plus kQueryLead.
+// The bytes that hold every execution variant a query's inputs do not tell apart: each pair
+// (n1, n2), per-token or per-tensor, src_permuted and y both carved, plus kQueryLead.
 inline size_t query_bytes(int64_t max_tokens, int64_t top_k, int64_t num_local_experts,
                           int64_t hidden, int64_t inter, int64_t out_bytes) {
   size_t most = 0;
-  for (int n = kMinN; n <= kMaxN; n *= 2) {
-    for (int per_token = 0; per_token < 2; ++per_token) {
-      const Layout l =
-          make_layout(max_tokens, top_k, num_local_experts, hidden, inter, n, per_token != 0);
-      const Scratch s = scratch_layout(l.total, size_t(max_tokens) * size_t(top_k), size_t(hidden),
-                                       size_t(out_bytes), true, true);
-      if (s.end > most) most = s.end;
+  for (int n1 = kMinN; n1 <= kMaxN; n1 *= 2) {
+    for (int n2 = kMinN; n2 <= kMaxN; n2 *= 2) {
+      for (int per_token = 0; per_token < 2; ++per_token) {
+        const Layout l = make_layout(max_tokens, top_k, num_local_experts, hidden, inter, n1, n2,
+                                     per_token != 0);
+        const Scratch s = scratch_layout(l.total, size_t(max_tokens) * size_t(top_k),
+                                         size_t(hidden), size_t(out_bytes), true, true);
+        if (s.end > most) most = s.end;
+      }
     }
   }
   return kQueryLead + most;

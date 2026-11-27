@@ -349,6 +349,9 @@ struct StagingN<C, std::void_t<decltype(C::kStagingN)>> {
 // GEMM1's full K with out at its first K tile), padding written as 0; the last m-tile also zeroes
 // the K range past its columns. Otherwise row-major [p, column] (out_ld).
 // Synchronization: named barrier 1 + wg (128 threads) only, for the NVFP4 staging.
+// Cfg::kCrossN (NVFP4 per-tensor GEMM1 whose output tiles are n2 rows, n2 != kN): out_tiled tiles
+// are written per row at their n2 place (params.cuh CrossN) and only for the rows of the tile;
+// the padding rows of the n2-tiles are prep's (prep_pad), everything else is as above.
 template <class Cfg>
 struct Epilogue {
   static constexpr Fq kFq = epi_fq(Cfg::kEpi);
@@ -360,6 +363,7 @@ struct Epilogue {
   static_assert(!kGemm2 || (!kGated && kFq == Fq::kNone), "GEMM2 writes plain rows");
   static_assert(!kFqNvfp4 || epi::kExactFixed,
                 "the NVFP4 epilogue needs FLASHINFER_FP4_SM90_EXACT=0/1 (module builder)");
+  static_assert(!Cfg::kCrossN || (kFqNvfp4 && !kGemm2), "cross n is the NVFP4 GEMM1 epilogue");
 
   static constexpr int kCtaM = Cfg::kCtaM;
   static constexpr int kN = Cfg::kN;
@@ -415,6 +419,14 @@ struct Epilogue {
     const int col0 = kGated ? (m0 >> 1) + wg * (kCtaM / 4) + 8 * warp + lr
                             : m0 + wg * (kCtaM / 2) + 16 * warp + lr;
     char* const outb = static_cast<char*>(ep.out);
+    // Cross n: n2-tile 0 of the expert's list, the n2 shift, and the expert row of this n-tile's
+    // first row; output row p = n0 + r is row off of the expert.
+    [[maybe_unused]] int cx_base = 0, cx_shift = 0, cx_off0 = 0;
+    if constexpr (Cfg::kCrossN) {
+      cx_base = __ldg(args.cross.expert_tile_base2 + expert);
+      cx_shift = args.cross.n2_shift;
+      cx_off0 = n0 - __ldg(args.sched.expert_offset + expert);
+    }
 
     // Bias of [mi][0] gate, [mi][1] up (gated) or [mi][half] for columns + 8 half (plain). BF16
     // or FP16 (ep.bias_f16): the logical rows, gated [up; gate] halves. TRT-LLM's
@@ -530,7 +542,20 @@ struct Epilogue {
         }
       };
       auto put16 = [&](int c0, int r, bool ok, const uint4(&o)[2]) {
-        if (ep.out_tiled) {
+        if constexpr (Cfg::kCrossN) {
+          // Rows of this n-tile only (o is 0 past the columns: their K padding); the rest of a
+          // destination tile is not ours.
+          if (n0 + r < p_end && c0 < kp) {
+            const int off = cx_off0 + r;
+#pragma unroll
+            for (int u = 0; u < 2; ++u) {
+              const int c = c0 + 8 * u;
+              *reinterpret_cast<uint4*>(
+                  outb + b_tile_byte(cx_base + (off >> cx_shift), k_tiles, c >> 7, (c >> 6) & 1,
+                                     1 << cx_shift, off & ((1 << cx_shift) - 1), c & 63)) = o[u];
+            }
+          }
+        } else if (ep.out_tiled) {
           if (c0 < kp) {
 #pragma unroll
             for (int u = 0; u < 2; ++u) {
@@ -618,8 +643,24 @@ struct Epilogue {
     }
 
     // The last m-tile zeroes GEMM2's K padding past the columns any m-tile covers (whole 64-value
-    // halves: kN x 128 contiguous bytes each). Both warp groups share it.
-    if (ep.out_tiled) {
+    // halves: kN x 128 contiguous bytes each). Both warp groups share it. Cross n: the same
+    // halves of the n_valid rows of this n-tile, each at its n2 place (128 contiguous bytes).
+    if constexpr (Cfg::kCrossN) {
+      const int cover_end = kGated ? (m0 + kCtaM) >> 1 : m0 + kCtaM;
+      if (m0 + kCtaM >= rows && cover_end < kp) {
+        const int t256 = wg * 128 + warp * 32 + lane;
+        const int h0 = cover_end >> 6, nh = (kp >> 6) - h0;
+        for (int i = t256; i < n_valid * nh * 8; i += 256) {
+          const int r = i / (nh * 8), hf = h0 + (i / 8) % nh;
+          const int off = cx_off0 + r;
+          *reinterpret_cast<uint4*>(outb +
+                                    b_tile_byte(cx_base + (off >> cx_shift), k_tiles, hf >> 1,
+                                                hf & 1, 1 << cx_shift, 0, 0) +
+                                    int64_t(off & ((1 << cx_shift) - 1)) * 128 + (i % 8) * 16) =
+              make_uint4(0, 0, 0, 0);
+        }
+      }
+    } else if (ep.out_tiled) {
       const int cover_end = kGated ? (m0 + kCtaM) >> 1 : m0 + kCtaM;
       if (m0 + kCtaM >= rows && cover_end < kp) {
         const int t256 = wg * 128 + warp * 32 + lane;

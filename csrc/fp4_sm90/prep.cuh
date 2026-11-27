@@ -189,6 +189,69 @@ __global__ void __launch_bounds__(kScanThreads) prep_scan(PrepArgs a, int total,
   }
 }
 
+// GEMM2's n-tile list when its n (a.n2) differs from n: the same experts and rows (expert_offset
+// from prep_scan), tiles of n2 rows. One CTA, as prep_scan.
+__global__ void __launch_bounds__(kScanThreads) prep_scan2(PrepArgs a) {
+  using Scan = cub::BlockScan<int, kScanThreads>;
+  __shared__ typename Scan::TempStorage scan_tmp;
+  __shared__ int carry;
+  int const E = a.num_local_experts, n2 = a.n2;
+  if (threadIdx.x == 0) carry = 0;
+  __syncthreads();
+  for (int e0 = 0; e0 < E; e0 += kScanThreads) {
+    int const e = e0 + threadIdx.x;
+    int const cnt = e < E ? a.expert_offset[e + 1] - a.expert_offset[e] : 0;
+    int tile0, tiles;
+    Scan(scan_tmp).ExclusiveSum((cnt + n2 - 1) / n2, tile0, tiles);
+    if (e < E) a.expert_tile_base2[e] = tile0 + carry;
+    __syncthreads();
+    if (threadIdx.x == 0) carry += tiles;
+    __syncthreads();
+  }
+  int const num_tiles = carry;
+  if (threadIdx.x == 0) {
+    a.expert_tile_base2[E] = num_tiles;
+    *a.num_tiles2 = num_tiles;
+  }
+  __syncthreads();  // expert_tile_base2 is read back below
+  for (int t = threadIdx.x; t < num_tiles && t < a.max_tiles2; t += kScanThreads) {
+    int e = 0;
+    int hi = E - 1;
+    while (e < hi) {  // last expert with expert_tile_base2[e] <= t
+      int const mid = (e + hi + 1) / 2;
+      if (a.expert_tile_base2[mid] <= t) {
+        e = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    a.tile_expert2[t] = e;
+    a.tile_n02[t] = a.expert_offset[e] + (t - a.expert_tile_base2[e]) * n2;
+  }
+}
+
+// Per tensor, n2 != n: GEMM1 writes GEMM2's B tiles (act_tiles) row by row and only for the rows
+// it has. This kernel is the only writer of the others: the rows past an expert's count in its
+// last n2-tile, over every K tile and half. (GEMM1 zeroes the K padding of the rows it writes.)
+__global__ void __launch_bounds__(kSortThreads) prep_pad(PrepArgs a) {
+  int const n2 = a.n2;
+  int const per_row = ((a.act_k + 127) / 128) * 2 * 8;  // 16-byte chunks of a padded row
+  char* const tiles = static_cast<char*>(a.act_tiles);
+  for (int e = blockIdx.x; e < a.num_local_experts; e += gridDim.x) {
+    int const cnt = a.expert_offset[e + 1] - a.expert_offset[e];
+    int const rem = cnt % n2;
+    if (rem == 0) continue;
+    int const t = a.expert_tile_base2[e] + cnt / n2;  // the partly filled tile
+    int const k_tiles = per_row / 16;
+    for (int i = threadIdx.x; i < (n2 - rem) * per_row; i += kSortThreads) {
+      int const r = rem + i / per_row, j = i % per_row;
+      int const kt = j >> 4, kh = (j >> 3) & 1, c = (j & 7) * 8;
+      *reinterpret_cast<uint4*>(tiles + b_tile_byte(t, k_tiles, kt, kh, n2, r, c)) =
+          make_uint4(0, 0, 0, 0);
+    }
+  }
+}
+
 // Stable scatter: entries of a chunk in flat order, a round of kSortThreads at a time; the rank
 // inside a round comes from the warp match and the counts of the warps before.
 __global__ void __launch_bounds__(kSortThreads) prep_scatter(PrepArgs a, int total) {
@@ -530,6 +593,16 @@ inline void launch_fp4_sm90_prep(const PrepArgs& a, cudaStream_t stream) {
                          a.tile_expert && a.tile_n0 && a.num_tiles,
                      "fp4_sm90 prep: MoE needs every schedule output");
   }
+  // n2 != 0: GEMM2 has its own n-tile list (MoE, n2 != n).
+  bool const cross = a.n2 != 0;
+  if (cross) {
+    FLASHINFER_CHECK(!dense && a.n2 != n && a.n2 >= 8 && a.n2 <= 256 && (a.n2 & (a.n2 - 1)) == 0,
+                     "fp4_sm90 prep: n2 must be another power of two in [8, 256], got ", a.n2);
+    FLASHINFER_CHECK(a.expert_tile_base2 && a.tile_expert2 && a.tile_n02 && a.num_tiles2,
+                     "fp4_sm90 prep: n2 needs its schedule outputs");
+    FLASHINFER_CHECK(a.act_tiles == nullptr || (aligned(a.act_tiles, 16) && a.act_k > 0),
+                     "fp4_sm90 prep: act_tiles / act_k");
+  }
   int64_t const total64 = int64_t(a.tokens) * a.top_k;
   FLASHINFER_CHECK(total64 <= INT_MAX / 2, "fp4_sm90 prep: ", total64, " expanded rows");
   int const total = int(total64);
@@ -537,6 +610,11 @@ inline void launch_fp4_sm90_prep(const PrepArgs& a, cudaStream_t stream) {
   int64_t const need_tiles = (total64 + busy * (n - 1)) / n;
   FLASHINFER_CHECK(a.max_tiles >= need_tiles, "fp4_sm90 prep: max_tiles ", a.max_tiles,
                    " is below the routing bound ", need_tiles);
+  if (cross) {
+    int64_t const need_tiles2 = (total64 + busy * (a.n2 - 1)) / a.n2;
+    FLASHINFER_CHECK(a.max_tiles2 >= need_tiles2, "fp4_sm90 prep: max_tiles2 ", a.max_tiles2,
+                     " is below the routing bound ", need_tiles2);
+  }
 
   // B tile source checks (before any launch: an error leaves no partial output).
   bool const mx_in = a.x_fmt == XFmt::kMxfp4Swz128x4;
@@ -598,6 +676,14 @@ inline void launch_fp4_sm90_prep(const PrepArgs& a, cudaStream_t stream) {
       set_smem(prep_scatter, scatter_smem);
       prep_scatter<<<chunks, kSortThreads, scatter_smem, stream>>>(a, total);
       check_launch("scatter");
+    }
+    if (cross) {
+      prep_scan2<<<1, kScanThreads, 0, stream>>>(a);
+      check_launch("scan2");
+      if (a.act_tiles != nullptr) {
+        prep_pad<<<std::min(E, kMaxTileCtas), kSortThreads, 0, stream>>>(a);
+        check_launch("pad");
+      }
     }
   } else if (a.expert_offset || a.expert_tile_base || a.permuted_src || a.src_permuted ||
              a.tile_expert || a.tile_n0 || a.num_tiles) {

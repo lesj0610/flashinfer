@@ -125,6 +125,41 @@ int run_gemm(const GemmArgs& args, int cta_m, int n, int num_sms, cudaStream_t s
   return run_gemm_shape<V, AP>(args, cta_m, n, num_sms, stream);
 }
 
+// The same shapes with Cfg::kCrossN, for the per-tensor GEMM1 of a call whose GEMM2 has another n
+// (GemmArgs::cross): their own instances, so that no other kernel carries cross-n code. Same
+// shared memory, so the same stage counts.
+template <int V, APath AP, int I = 0>
+int run_gemm_cross_shape(const GemmArgs& args, int cta_m, int n, int num_sms, cudaStream_t stream) {
+  if constexpr (I == kNumShapes) {
+    return 0;
+  } else {
+    constexpr int CM = kShapes[I].cta_m, N = kShapes[I].n;
+    constexpr int S = max_stages<CM, N, V, AP>();
+    if (cta_m == CM && n == N) {
+      if constexpr (S >= 2) {
+        launch_fp4_sm90_gemm<
+            Cfg<CM, N, S, VariantOf<V>::kA, kModuleF16, VariantOf<V>::kEpi, AP, true>>(
+            args, num_sms, stream);
+      }
+      return S;
+    }
+    return run_gemm_cross_shape<V, AP, I + 1>(args, cta_m, n, num_sms, stream);
+  }
+}
+
+// Returns the stage count of the (cta_m, n) kernel (0: not instantiated; GEMM1 NVFP4 epilogue
+// only).
+template <int V, APath AP>
+int run_gemm_cross([[maybe_unused]] const GemmArgs& args, [[maybe_unused]] int cta_m,
+                   [[maybe_unused]] int n, [[maybe_unused]] int num_sms,
+                   [[maybe_unused]] cudaStream_t stream) {
+  if constexpr (VariantOf<V>::kFq == Fq::kNvfp4) {
+    return run_gemm_cross_shape<V, AP>(args, cta_m, n, num_sms, stream);
+  } else {
+    return 0;
+  }
+}
+
 }  // namespace moe
 }  // namespace fp4_sm90
 }  // namespace flashinfer
@@ -134,6 +169,9 @@ int run_gemm(const GemmArgs& args, int cta_m, int n, int num_sms, cudaStream_t s
 static_assert(FP4_MOE_SM90_PART >= 0 && FP4_MOE_SM90_PART < flashinfer::fp4_sm90::moe::kNumParts,
               "FP4_MOE_SM90_PART out of range");
 template int flashinfer::fp4_sm90::moe::run_gemm<
+    (FP4_MOE_SM90_PART) / 2, static_cast<flashinfer::fp4_sm90::APath>((FP4_MOE_SM90_PART) % 2)>(
+    const flashinfer::fp4_sm90::GemmArgs&, int, int, int, cudaStream_t);
+template int flashinfer::fp4_sm90::moe::run_gemm_cross<
     (FP4_MOE_SM90_PART) / 2, static_cast<flashinfer::fp4_sm90::APath>((FP4_MOE_SM90_PART) % 2)>(
     const flashinfer::fp4_sm90::GemmArgs&, int, int, int, cudaStream_t);
 
@@ -152,8 +190,9 @@ namespace fp4_sm90 {
 namespace moe {
 
 #if defined(FP4_MOE_SM90_SPLIT) && FP4_MOE_SM90_SPLIT
-#define FP4_MOE_SM90_EXTERN(V, AP) \
-  extern template int run_gemm<V, AP>(const GemmArgs&, int, int, int, cudaStream_t);
+#define FP4_MOE_SM90_EXTERN(V, AP)                                                   \
+  extern template int run_gemm<V, AP>(const GemmArgs&, int, int, int, cudaStream_t); \
+  extern template int run_gemm_cross<V, AP>(const GemmArgs&, int, int, int, cudaStream_t);
 #define FP4_MOE_SM90_EXTERN_V(V)     \
   FP4_MOE_SM90_EXTERN(V, APath::kN1) \
   FP4_MOE_SM90_EXTERN(V, APath::kN2)
@@ -167,11 +206,16 @@ FP4_MOE_SM90_EXTERN_V(5)
 #undef FP4_MOE_SM90_EXTERN
 #endif
 
-int dispatch_gemm(int variant, APath ap, const GemmArgs& args, int cta_m, int n, int num_sms,
-                  cudaStream_t stream) {
-#define FP4_MOE_SM90_CASE(V)                                                           \
-  case V:                                                                              \
-    return ap == APath::kN1 ? run_gemm<V, APath::kN1>(args, cta_m, n, num_sms, stream) \
+// cross: the kCrossN kernel of the variant (GEMM1, GEMM2 with another n).
+int dispatch_gemm(int variant, APath ap, bool cross, const GemmArgs& args, int cta_m, int n,
+                  int num_sms, cudaStream_t stream) {
+#define FP4_MOE_SM90_CASE(V)                                                                    \
+  case V:                                                                                       \
+    if (cross) {                                                                                \
+      return ap == APath::kN1 ? run_gemm_cross<V, APath::kN1>(args, cta_m, n, num_sms, stream)  \
+                              : run_gemm_cross<V, APath::kN2>(args, cta_m, n, num_sms, stream); \
+    }                                                                                           \
+    return ap == APath::kN1 ? run_gemm<V, APath::kN1>(args, cta_m, n, num_sms, stream)          \
                             : run_gemm<V, APath::kN2>(args, cta_m, n, num_sms, stream);
   switch (variant) {
     FP4_MOE_SM90_CASE(0)
@@ -225,7 +269,7 @@ using moe_layout::max_tiles_of;
 
 PrepArgs prep_shape(int64_t tokens, int64_t top_k, int64_t num_experts, int64_t local_expert_offset,
                     int64_t num_local_experts, int64_t hidden, int64_t x_fmt, int64_t quantize,
-                    int64_t n) {
+                    int64_t n, int64_t n2) {
   PrepArgs p{};
   p.tokens = static_cast<int>(tokens);
   p.top_k = static_cast<int>(top_k);
@@ -240,6 +284,10 @@ PrepArgs prep_shape(int64_t tokens, int64_t top_k, int64_t num_experts, int64_t 
   p.f16 = kModuleF16;
   p.n = static_cast<int>(n);
   p.max_tiles = max_tiles_of(p.tokens * p.top_k, p.n, p.num_local_experts);
+  if (n2 != n) {  // GEMM2's own n-tile list; the caller binds its outputs
+    p.n2 = static_cast<int>(n2);
+    p.max_tiles2 = max_tiles_of(p.tokens * p.top_k, p.n2, p.num_local_experts);
+  }
   return p;
 }
 
@@ -340,20 +388,22 @@ using namespace flashinfer::fp4_sm90::moe;
 int64_t fp4_moe_sm90_workspace_bytes(int64_t tokens, int64_t top_k, int64_t num_experts,
                                      int64_t local_expert_offset, int64_t num_local_experts,
                                      int64_t hidden, int64_t inter, int64_t x_fmt, int64_t quantize,
-                                     bool per_token, int64_t n) {
-  TVM_FFI_ICHECK(valid_n(n)) << "n must be a power of two in [8, 256]";
+                                     bool per_token, int64_t n1, int64_t n2) {
+  TVM_FFI_ICHECK(valid_n(n1) && valid_n(n2)) << "n1 and n2 must be powers of two in [8, 256]";
   return static_cast<int64_t>(
-      moe_layout::make_layout(tokens, top_k, num_local_experts, hidden, inter, n, per_token).total);
+      moe_layout::make_layout(tokens, top_k, num_local_experts, hidden, inter, n1, n2, per_token)
+          .total);
 }
 
 // Offsets {src_permuted, y, end} in a caller's buffer from its 256 B aligned start: the layout of
 // workspace_bytes, then src_permuted and y of the calls that do not return them.
 Array<int64_t> fp4_moe_sm90_scratch(int64_t tokens, int64_t top_k, int64_t num_local_experts,
-                                    int64_t hidden, int64_t inter, bool per_token, int64_t n,
-                                    int64_t out_bytes, bool carve_src, bool carve_y) {
-  TVM_FFI_ICHECK(valid_n(n)) << "n must be a power of two in [8, 256]";
+                                    int64_t hidden, int64_t inter, bool per_token, int64_t n1,
+                                    int64_t n2, int64_t out_bytes, bool carve_src, bool carve_y) {
+  TVM_FFI_ICHECK(valid_n(n1) && valid_n(n2)) << "n1 and n2 must be powers of two in [8, 256]";
   const size_t layout =
-      moe_layout::make_layout(tokens, top_k, num_local_experts, hidden, inter, n, per_token).total;
+      moe_layout::make_layout(tokens, top_k, num_local_experts, hidden, inter, n1, n2, per_token)
+          .total;
   const moe_layout::Scratch s =
       moe_layout::scratch_layout(layout, size_t(tokens) * size_t(top_k), size_t(hidden),
                                  size_t(out_bytes), carve_src, carve_y);
@@ -361,19 +411,23 @@ Array<int64_t> fp4_moe_sm90_scratch(int64_t tokens, int64_t top_k, int64_t num_l
       static_cast<int64_t>(s.src_off), static_cast<int64_t>(s.y_off), static_cast<int64_t>(s.end)});
 }
 
-// Tactics (cta_m, n, stages of GEMM1) whose GEMM1 and GEMM2 kernels both hold 2 or more stages.
-Array<int64_t> fp4_moe_sm90_tactics(bool per_token, int64_t w1_fmt, int64_t w2_fmt,
-                                    int64_t a_path) {
+// Tactics (cta_m, n, stages), flat. gemm 0: the shapes whose GEMM1 and GEMM2 kernels both hold 2
+// or more stages (stages of GEMM1); 1: the shapes GEMM1 holds 2 or more stages of (its stages);
+// 2: the same for GEMM2.
+Array<int64_t> fp4_moe_sm90_tactics(bool per_token, int64_t w1_fmt, int64_t w2_fmt, int64_t a_path,
+                                    int64_t gemm) {
+  TVM_FFI_ICHECK(gemm >= 0 && gemm <= 2) << "gemm must be 0 (both), 1 or 2";
   const APath ap = a_path ? APath::kN2 : APath::kN1;
   int s1[kNumShapes], s2[kNumShapes];
   stages_of(gemm1_variant(per_token, static_cast<AFmt>(w1_fmt)), ap, s1);
   stages_of(gemm2_variant(static_cast<AFmt>(w2_fmt)), ap, s2);
   std::vector<int64_t> out;
   for (int i = 0; i < kNumShapes; ++i) {
-    if (s1[i] >= 2 && s2[i] >= 2) {
+    const bool ok = gemm == 0 ? s1[i] >= 2 && s2[i] >= 2 : (gemm == 1 ? s1[i] : s2[i]) >= 2;
+    if (ok) {
       out.push_back(kShapes[i].cta_m);
       out.push_back(kShapes[i].n);
-      out.push_back(s1[i]);
+      out.push_back(gemm == 2 ? s2[i] : s1[i]);
     }
   }
   return Array<int64_t>(out);
@@ -406,8 +460,9 @@ void fp4_moe_sm90_run(
     // the activation by
     // expanded row, GEMM1's output dtype [>= T * top_k, >= the GEMM2 K]
     Optional<TensorView> lora, Optional<TensorView> act_out,
-    // tactic
-    int64_t cta_m, int64_t n, int64_t stages, int64_t a_path,
+    // tactic: per GEMM (cta_m, n, stages), n1 != n2 allowed
+    int64_t cta_m1, int64_t n1, int64_t stages1, int64_t cta_m2, int64_t n2, int64_t stages2,
+    int64_t a_path,
     // localization (SM100's localized_*): per domain its shards' w1 codes, w1 scales, w2 codes and
     // w2 scales (uint8 views) and their geometries (w1's, then w2's), the domain streams and the
     // SM count of each (0: off)
@@ -435,8 +490,9 @@ void fp4_moe_sm90_run(
   }
   TVM_FFI_ICHECK(y.dtype() == dl_bfloat16 || y.dtype() == dl_float16) << "y must be BF16 or FP16";
   TVM_FFI_ICHECK_EQ(act, kModuleAct) << "activation " << act << " is not this module's";
-  TVM_FFI_ICHECK(valid_n(n)) << "n must be a power of two in [8, 256]";
-  TVM_FFI_ICHECK(cta_m == 128 || cta_m == 256) << "cta_m must be 128 or 256";
+  TVM_FFI_ICHECK(valid_n(n1) && valid_n(n2)) << "n1 and n2 must be powers of two in [8, 256]";
+  TVM_FFI_ICHECK((cta_m1 == 128 || cta_m1 == 256) && (cta_m2 == 128 || cta_m2 == 256))
+      << "cta_m1 and cta_m2 must be 128 or 256";
   TVM_FFI_ICHECK(a_path == 0 || a_path == 1) << "a_path must be 0 (n1) or 1 (n2)";
 
   const int tokens = static_cast<int>(topk_ids.size(0));
@@ -607,9 +663,9 @@ void fp4_moe_sm90_run(
   }
 
   const PrepArgs shape = prep_shape(tokens, top_k, num_experts, local_expert_offset,
-                                    num_local_experts, hidden, x_fmt, quantize, n);
+                                    num_local_experts, hidden, x_fmt, quantize, n1, n2);
   const Layout l =
-      moe_layout::make_layout(tokens, top_k, num_local_experts, hidden, inter, n, per_token);
+      moe_layout::make_layout(tokens, top_k, num_local_experts, hidden, inter, n1, n2, per_token);
   TVM_FFI_ICHECK_GE(static_cast<size_t>(workspace.numel()), l.total)
       << "workspace must hold " << l.total << " bytes";
   uint8_t* ws = static_cast<uint8_t*>(workspace.data_ptr());
@@ -619,15 +675,24 @@ void fp4_moe_sm90_run(
 
   const APath ap = a_path ? APath::kN2 : APath::kN1;
   const int v1 = gemm1_variant(per_token, a1.fmt), v2 = gemm2_variant(a2.fmt);
-  int s1[kNumShapes];
-  stages_of(v1, ap, s1);
-  int shape_index = -1;
-  for (int i = 0; i < kNumShapes; ++i) {
-    if (kShapes[i].cta_m == cta_m && kShapes[i].n == n) shape_index = i;
-  }
-  TVM_FFI_ICHECK(shape_index >= 0) << "tactic (" << cta_m << ", " << n << ") is not a D7 shape";
-  TVM_FFI_ICHECK(stages == 0 || stages == s1[shape_index])
-      << "tactic stages " << stages << " differ from the module's " << s1[shape_index];
+  // Per GEMM: the (cta_m, n) must be a D7 shape and stages 0 or the module's stage count of it.
+  auto check_tactic = [&](int variant, int64_t cta_m, int64_t n, int64_t stages, const char* name) {
+    int st[kNumShapes];
+    stages_of(variant, ap, st);
+    int index = -1;
+    for (int i = 0; i < kNumShapes; ++i) {
+      if (kShapes[i].cta_m == cta_m && kShapes[i].n == n) index = i;
+    }
+    TVM_FFI_ICHECK(index >= 0) << name << " tactic (" << cta_m << ", " << n
+                               << ") is not a D7 shape";
+    TVM_FFI_ICHECK(stages == 0 || stages == st[index])
+        << name << " tactic stages " << stages << " differ from the module's " << st[index];
+  };
+  check_tactic(v1, cta_m1, n1, stages1, "GEMM1");
+  check_tactic(v2, cta_m2, n2, stages2, "GEMM2");
+  // GEMM1 of a per-tensor call writes GEMM2's B tiles: of n2 rows, by its cross-n kernel if n1 !=
+  // n2 (per token, row_quant writes them and GEMM1's rows do not depend on n).
+  const bool cross = n1 != n2 && !per_token;
 
   ffi::CUDADeviceGuard guard(x.device().device_id);
   const cudaStream_t stream = get_stream(x.device());
@@ -640,10 +705,12 @@ void fp4_moe_sm90_run(
                                 loc_stream[1] != stream))
       << "localized streams must be distinct and differ from the current stream";
   // One GEMM: plain, or localized with part(d, args) narrowing it to domain d.
-  auto gemm = [&](int variant, const GemmArgs& g, const char* name, auto part) {
+  auto gemm = [&](int variant, bool cross_n, int64_t cta_m, int64_t n, const GemmArgs& g,
+                  const char* name, auto part) {
     auto launch = [&](const GemmArgs& args, int sms, cudaStream_t s) {
-      TVM_FFI_ICHECK_GE(
-          dispatch_gemm(variant, ap, args, static_cast<int>(cta_m), static_cast<int>(n), sms, s), 2)
+      TVM_FFI_ICHECK_GE(dispatch_gemm(variant, ap, cross_n, args, static_cast<int>(cta_m),
+                                      static_cast<int>(n), sms, s),
+                        2)
           << name << " tactic (" << cta_m << ", " << n << ") has no kernel (fewer than 2 stages)";
     };
     if (!localized) return launch(g, num_sms, stream);
@@ -687,6 +754,15 @@ void fp4_moe_sm90_run(
   prep.x_tiles = at(l.x_tiles);
   prep.tok_scale = nullptr;
   prep.workspace = at(l.prep);
+  if (n1 != n2) {
+    prep.expert_tile_base2 = reinterpret_cast<int32_t*>(at(l.expert_tile_base2));
+    prep.tile_expert2 = reinterpret_cast<int32_t*>(at(l.tile_expert2));
+    prep.tile_n02 = reinterpret_cast<int32_t*>(at(l.tile_n02));
+    prep.num_tiles2 = reinterpret_cast<int32_t*>(at(l.num_tiles2));
+    // per tensor, GEMM1 writes the n2-tiles row by row: prep zeroes their padding rows
+    prep.act_tiles = per_token ? nullptr : at(l.act);
+    prep.act_k = inter;
+  }
   launch_fp4_sm90_prep(prep, stream);
 
   float* tok1 = per_token ? reinterpret_cast<float*>(at(l.tok1)) : nullptr;
@@ -706,6 +782,15 @@ void fp4_moe_sm90_run(
   sched.expert_offset = prep.expert_offset;
   sched.expert_tile_base = prep.expert_tile_base;
   sched.max_tiles = prep.max_tiles;
+  // GEMM2 and row_quant: the list of n2 (the same one when n1 == n2)
+  Sched sched2 = sched;
+  if (n1 != n2) {
+    sched2.tile_expert = prep.tile_expert2;
+    sched2.tile_n0 = prep.tile_n02;
+    sched2.num_tiles = prep.num_tiles2;
+    sched2.expert_tile_base = prep.expert_tile_base2;
+    sched2.max_tiles = prep.max_tiles2;
+  }
 
   // GEMM1: BF16 rows (token-wise; with gemm1_lora_delta straight into act_out, which row_quant
   // then reads) or NVFP4-quantized GEMM2 B tiles (per tensor)
@@ -751,10 +836,14 @@ void fp4_moe_sm90_run(
   g1.epi.out_f16 = per_token ? 0 : kModuleF16;
   g1.epi.out_tiled = per_token ? 0 : 1;
   g1.sched = sched;
-  gemm(v1, g1, "GEMM1", [&](int d, GemmArgs& g) {
+  if (cross) {
+    g1.cross.expert_tile_base2 = prep.expert_tile_base2;
+    g1.cross.n2_shift = __builtin_ctz(static_cast<unsigned>(n2));
+  }
+  gemm(v1, cross, cta_m1, n1, g1, "GEMM1", [&](int d, GemmArgs& g) {
     g.a = loc1[d];
-    // GEMM2's B tiles from K tile d I / 256 (out_ld keeps their K)
-    g.epi.out = at(l.act) + int64_t(d) * (inter / 256) * 2 * n * 128;
+    // GEMM2's B tiles (n2 rows each) from K tile d I / 256 (out_ld keeps their K)
+    g.epi.out = at(l.act) + int64_t(d) * (inter / 256) * 2 * n2 * 128;
   });
 
   // token-wise recipes: quantize GEMM1's rows into GEMM2 B tiles with per-row scales
@@ -767,11 +856,11 @@ void fp4_moe_sm90_run(
     rq.in_f16 = 0;
     rq.recipe = kModuleRecipe;
     rq.out_f16 = kModuleF16;
-    rq.n = static_cast<int>(n);
+    rq.n = static_cast<int>(n2);
     rq.gsi = fq_g;
     rq.expert_offset = prep.expert_offset;
-    rq.expert_tile_base = prep.expert_tile_base;
-    rq.num_tiles = prep.num_tiles;
+    rq.expert_tile_base = sched2.expert_tile_base;
+    rq.num_tiles = sched2.num_tiles;
     rq.out_tiles = at(l.x2_tiles);
     rq.tok_scale = tok2;
     rq.fq_codes = static_cast<uint8_t*>(ptr(fc2_codes));
@@ -804,8 +893,8 @@ void fp4_moe_sm90_run(
   g2.epi.recipe = 0;
   g2.epi.out_f16 = y.dtype() == dl_float16;
   g2.epi.out_tiled = 0;
-  g2.sched = sched;
-  gemm(v2, g2, "GEMM2", [&](int d, GemmArgs& g) {
+  g2.sched = sched2;
+  gemm(v2, false, cta_m2, n2, g2, "GEMM2", [&](int d, GemmArgs& g) {
     g.a = loc2[d];
     g.epi.out = static_cast<char*>(y.data_ptr()) + int64_t(d) * (hidden / 2) * 2;  // 16-bit y
   });

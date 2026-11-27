@@ -197,8 +197,9 @@ struct EpiArgs {
 // Persistent schedule written by prep. Expanded rows p are sorted by local expert; expert e owns
 // p in [expert_offset[e], expert_offset[e + 1]). Its rows are cut into n-tiles of Cfg::kN rows;
 // n-tile t = expert_tile_base[e] + (p - expert_offset[e]) / kN, listed in (tile_expert, tile_n0).
-// The GEMM walks t * m_tiles + m_tile with m_tiles = ceil(ASrc::rows / kCtaM); both GEMMs of one
-// MoE call share kN and this list.
+// The GEMM walks t * m_tiles + m_tile with m_tiles = ceil(ASrc::rows / kCtaM). Both GEMMs of one
+// MoE call share kN and this list, unless their n differ: then each GEMM gets the list of its own
+// n (PrepArgs::n2 for GEMM2) over the same expert_offset.
 struct Sched {
   const int32_t* tile_expert;       // [max_tiles] local expert of n-tile t; null: dense (expert 0)
   const int32_t* tile_n0;           // [max_tiles] first expanded row of n-tile t; null: t * kN
@@ -220,12 +221,23 @@ __host__ __device__ constexpr int64_t b_tile_byte(int t, int k_tiles, int kt, in
          (c % 8) * 2;
 }
 
+// GEMM1 of a MoE call whose GEMMs differ in n (Cfg::kCrossN): the epilogue writes GEMM2's B tiles,
+// n2 = 1 << n2_shift rows each, directly. Output row p of expert e is row off = p -
+// expert_offset[e] of the expert: row off % n2 of n2-tile expert_tile_base2[e] + off / n2.
+struct CrossN {
+  const int32_t* expert_tile_base2;  // [E_local + 1] first n2-tile of each expert
+  int n2_shift;                      // log2(n2)
+};
+
 struct GemmArgs {
   ASrc a;
   BSrc b;
   EpiArgs epi;
   Sched sched;
+  // Last, so that no other member and no later kernel parameter (the tensor maps) moves.
+  CrossN cross;
 };
+static_assert(sizeof(GemmArgs) <= 320, "GemmArgs must keep the offset of the kernels' tensor maps");
 
 // Routing sort, tile list, activation quantization / dequantization (K1 prep.cuh).
 // Dense: topk_ids == null, top_k == 1, one expert.
@@ -262,6 +274,19 @@ struct PrepArgs {
   void* x_tiles;          // B tiles of GEMM1 (layout above); null when GEMM1 gathers x directly
   float* tok_scale;       // [tokens * top_k] by expanded row (per_token); null = none
   void* workspace;        // scratch owned by prep
+  // GEMM2's own n-tile list when its n (n2) differs from n (MoE only); n2 = 0: GEMM2 shares n and
+  // the list above, and prep does no more.
+  int n2;
+  int max_tiles2;
+  int32_t* expert_tile_base2;  // [num_local_experts + 1]
+  int32_t* tile_expert2;       // [max_tiles2]
+  int32_t* tile_n02;           // [max_tiles2]
+  int32_t* num_tiles2;         // device scalar
+  // Per tensor: GEMM2's B tiles (n2 rows each, act_k values per row), which GEMM1 writes row by
+  // row; prep zeroes their padding rows, the rows past an expert's count in its last n2-tile.
+  // Null: none (per token, row_quant writes those tiles whole).
+  void* act_tiles;
+  int act_k;
 };
 
 // Token-wise quantization of the GEMM2 input after the GEMM1 epilogue (K3 row_quant.cuh).
@@ -320,7 +345,10 @@ struct FinalizeArgs {
 // ---------------------------------------------------------------------------------------------
 enum class APath : uint8_t { kN1 = 0, kN2 = 1 };
 
-template <int CTA_M_, int N_, int STAGES_, AFmt AF_, bool F16_, int EPI_, APath AP_ = APath::kN1>
+// CROSS_N_: GEMM1 writes GEMM2's B tiles of another n (CrossN); a separate instance, so that a
+// call whose GEMMs share n runs the kernels without it.
+template <int CTA_M_, int N_, int STAGES_, AFmt AF_, bool F16_, int EPI_, APath AP_ = APath::kN1,
+          bool CROSS_N_ = false>
 struct Cfg {
   static constexpr int kCtaM = CTA_M_;
   static constexpr int kN = N_;
@@ -329,6 +357,7 @@ struct Cfg {
   static constexpr bool kF16 = F16_;
   static constexpr int kEpi = EPI_;
   static constexpr APath kAPath = AP_;
+  static constexpr bool kCrossN = CROSS_N_;
 
   static constexpr int kTileK = 128;  // 8 x k16 per stage
   static constexpr int kConsumerWarpGroups = 2;
