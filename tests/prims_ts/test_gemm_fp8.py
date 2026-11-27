@@ -13,8 +13,9 @@ from flashinfer.utils import get_compute_capability
 def _require_gemm_gpu():
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("requires SM100, SM103, or SM107")
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc[0] != 8 and cc not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("requires SM8x, SM100, SM103, or SM107")
 
 
 def _fp8_problem(m=128, n=512, k=128):

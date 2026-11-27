@@ -13,6 +13,7 @@ same config.  That is what makes concurrent fused epilogues safe.
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import sys
 import threading
@@ -46,10 +47,10 @@ _MAX_ACTIVE_CLUSTERS: dict[tuple[str, int | None, int], int] = {}
 _CAPTURE_UNIT_SCALE: dict[tuple[str, int | None], torch.Tensor] = {}
 
 _FP8 = torch.float8_e4m3fn
-_SUPPORTED_ARCHES = {100, 103, 107}
+_SUPPORTED_ARCHES = {80, 86, 87, 89, 100, 103, 107}
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _check_gemm(
     a: Optional[torch.Tensor] = None,
     a_packed: Optional[torch.Tensor] = None,
@@ -339,6 +340,10 @@ def _compile(
     module: ModuleType,
     args: tuple[object, ...],
 ) -> object:
+    if config.arch < 90:
+        from .sm8x import run
+
+        return functools.partial(run, config)
     activation = args[0]
     if not isinstance(activation, torch.Tensor):
         raise TypeError("the PrimsTS compile activation must be a Torch tensor")
@@ -465,6 +470,8 @@ def _max_active_clusters(
     device: torch.device,
 ) -> int:
     """Return the cached device limit for one cluster specialization."""
+    if config.arch < 90:
+        return 1
     import cutlass.utils as cutlass_utils
 
     cluster_size = (

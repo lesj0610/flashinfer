@@ -12,7 +12,7 @@ from typing import Optional
 import torch
 
 _FP8 = torch.float8_e4m3fn
-_SUPPORTED_ARCHES = (100, 103, 107)
+_SUPPORTED_ARCHES = (80, 86, 87, 89, 100, 103, 107)
 
 
 def nvfp4_128x4_numel(rows: int, k: int) -> int:
