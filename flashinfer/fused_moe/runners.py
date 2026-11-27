@@ -7278,6 +7278,12 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
         # hybrid and raises), the reserved overlap SMs of the cooperative router
         # and the NVFP4 4over6 recipe, resolved once per runner.
         self._cake_knobs = _resolve_cake_stepfun_knobs(self.config)
+        _TrtllmRunnerBase._attach_sm8x(self, major * 10 + minor)
+
+    def _attach_sm8x(self, arch: int) -> None:
+        # The family runner's check calls this before the Cake checks above;
+        # ``_check_support`` attaches once those have passed.
+        pass
 
     def _build(self) -> None:
         from ..api_logging import warn_experimental_backend_once
