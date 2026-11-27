@@ -229,7 +229,11 @@ _ENTRY_ACTIVATIONS = {
     "cutlass": SM90_FP4_ACTIVATIONS,
     "cute_dsl": (ActivationType.Swiglu, ActivationType.Relu2),
 }
-_TRTLLM_PER_TOKEN_ACTIVATIONS = (ActivationType.Swiglu, ActivationType.Relu2)
+_TRTLLM_PER_TOKEN_ACTIVATIONS = (
+    ActivationType.Swiglu,
+    ActivationType.Relu2,
+    ActivationType.SwigluStep,
+)
 
 
 def sm90_fp4_moe_supports(entry: str, *, per_token: bool, activation_type: int) -> bool:
@@ -610,9 +614,9 @@ def sm90_fp4_moe(
         FP32 token scales ``[>= num_tokens, top_k]``; other ranks' slots and the columns past
         ``inter`` are zero. Not passed to autotuning.
     gemm1_lora_delta : Optional[torch.Tensor]
-        Gated per tensor only: BF16 ``[num_tokens, top_k, 2 * I]`` (``I >= inter``) added to
-        GEMM1's rows before the activation in output units (after ``alpha``), ``[up; gate]``
-        halves by (token, slot).
+        Gated only: BF16 ``[num_tokens, top_k, 2 * I]`` (``I >= inter``) added to
+        GEMM1's rows before the activation in output units (after GEMM1's scales),
+        ``[up; gate]`` halves by (token, slot).
         The calls also return the activation (before GEMM2's input quantization), BF16
         ``[num_tokens * top_k, I]`` by row of ``y``, as TRT-LLM's ``gemm1_output``. Not passed
         to autotuning.
@@ -647,8 +651,8 @@ def sm90_fp4_moe(
         raise _not_on_sm90("the token-wise recipe without NVFP4 per-token activations")
     if fc2_input_out is not None and not per_token:
         raise _not_on_sm90("fc2_input_out without the token-wise recipe")
-    if gemm1_lora_delta is not None and (per_token or not w1.gated):
-        raise _not_on_sm90("gemm1_lora_delta other than gated per tensor")
+    if gemm1_lora_delta is not None and not w1.gated:
+        raise _not_on_sm90("gemm1_lora_delta without a gated activation")
     if x.dtype != torch.uint8 and not _scalar(x_global):
         raise _not_on_sm90("16-bit input quantization without one global scale")
     if min(w1.num_experts, w2.num_experts) < num_local or epi1.alpha is None:
@@ -730,8 +734,7 @@ def trtllm_fp4_sm90_moe(
         a[f"output{i}_scalar"] for i in ("1_scale", "1_scale_gate", "2_scale")
     )
     recipe = resolve_nvfp4_4over6(a["nvfp4_4over6"]) if pt is not None else None
-    # As SM100: Swiglu's and SiTU's alpha, beta and limit, SwigluStep's limit, the biases (per
-    # tensor here)
+    # As SM100: Swiglu's and SiTU's alpha, beta and limit, SwigluStep's limit, the biases
     params = {
         ActivationType.Swiglu: ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
         ActivationType.Situ: ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
@@ -773,8 +776,7 @@ def trtllm_fp4_sm90_moe(
             "workspace_buffer",
             "routing_metadata",
         )
-        if a.get(n) is not None
-        and (pt is not None or n not in params + biases + lora_ok)
+        if a.get(n) is not None and n not in params + biases + lora_ok
     ]
     if (
         x.dtype != torch.uint8
@@ -959,7 +961,9 @@ def trtllm_fp4_sm90_moe(
             fq_global=fc2.contiguous(),
         )
     else:
-        epi1 = Sm90EpilogueSpec(int(act), alpha=alpha1, out_scale=fc2)
+        epi1 = Sm90EpilogueSpec(
+            int(act1), alpha=alpha1, act_params=act_params, bias=bias[0], out_scale=fc2
+        )
     return sm90_fp4_moe(
         x.view(torch.uint8),
         x_scale.view(torch.uint8).reshape(tokens, hidden // 16),

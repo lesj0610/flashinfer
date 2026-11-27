@@ -427,7 +427,7 @@ void fp4_moe_sm90_run(
     // [>= T, top_k, I / 2], linear E4M3 scales [>= T, top_k, I / 16] and token scales
     // [>= T, top_k]
     Optional<TensorView> fc2_codes, Optional<TensorView> fc2_sf, Optional<TensorView> fc2_tok,
-    // gemm1_lora_delta (gated, per tensor): BF16 [T, top_k, 2 * I] by (token, slot), [up; gate]
+    // gemm1_lora_delta (gated): BF16 [T, top_k, 2 * I] by (token, slot), [up; gate]
     // with I >= the GEMM2 K, added before the activation in output units; act_out receives
     // the activation by
     // expanded row, GEMM1's output dtype [>= T * top_k, >= the GEMM2 K]
@@ -536,11 +536,10 @@ void fp4_moe_sm90_run(
   TVM_FFI_ICHECK_EQ(lora.has_value(), act_out.has_value())
       << "gemm1_lora_delta and its activation output go together";
   if (lora.has_value()) {
-    TVM_FFI_ICHECK(kModuleGated && !per_token) << "gemm1_lora_delta needs a gated activation "
-                                                  "per tensor";
+    TVM_FFI_ICHECK(kModuleGated) << "gemm1_lora_delta needs a gated activation";
     const TensorView d = lora.value(), o = act_out.value();
     CHECK_INPUT_AND_TYPE(d, dl_bfloat16);
-    CHECK_INPUT_AND_TYPE(o, kModuleF16 ? dl_float16 : dl_bfloat16);
+    CHECK_INPUT_AND_TYPE(o, kModuleF16 && !per_token ? dl_float16 : dl_bfloat16);
     for (const TensorView& t : {d, o}) {
       CHECK_DEVICE(t, x);
     }
@@ -562,7 +561,7 @@ void fp4_moe_sm90_run(
         << "activation parameters must be [num_local_experts]";
   }
   // Per-expert biases of the GEMM rows: the output dtype on the logical rows, or TRT-LLM's FP32
-  // on the rows of TRT-LLM shuffled weights (accumulator units, per tensor)
+  // on the rows of TRT-LLM shuffled weights (accumulator units)
   for (const auto& [b, a] : {std::pair{&bias1, &a1}, std::pair{&bias2, &a2}}) {
     if (!b->has_value()) continue;
     CHECK_INPUT(b->value());
@@ -570,8 +569,8 @@ void fp4_moe_sm90_run(
     const bool trtllm_rows =
         afmt_trtllm(a->fmt) && (a->pair == Pair::kNone || a->pair == Pair::kTrtllmW31);
     TVM_FFI_ICHECK(b->value().dtype() == y.dtype() ||
-                   (b->value().dtype() == dl_float32 && trtllm_rows && !per_token))
-        << "biases must have the output dtype, or be FP32 per tensor on TRT-LLM shuffled weights";
+                   (b->value().dtype() == dl_float32 && trtllm_rows))
+        << "biases must have the output dtype, or be FP32 on TRT-LLM shuffled weights";
     CHECK_DIM(2, b->value());
     TVM_FFI_ICHECK(b->value().size(0) == num_local_experts && b->value().size(1) == a->rows)
         << "biases must be [num_local_experts, GEMM rows]";
@@ -728,7 +727,11 @@ void fp4_moe_sm90_run(
   sched.expert_tile_base = prep.expert_tile_base;
   sched.max_tiles = prep.max_tiles;
 
-  // GEMM1: BF16 rows (token-wise) or NVFP4-quantized GEMM2 B tiles (per tensor)
+  // GEMM1: BF16 rows (token-wise; with gemm1_lora_delta straight into act_out, which row_quant
+  // then reads) or NVFP4-quantized GEMM2 B tiles (per tensor)
+  const bool rows_to_act_out = per_token && act_out.has_value();
+  void* const rows1 = rows_to_act_out ? act_out.value().data_ptr() : at(l.act);
+  const int64_t rows1_ld = rows_to_act_out ? act_out.value().size(1) : inter;
   GemmArgs g1{};
   g1.a = a1;
   g1.b.x = prep.x_tiles;
@@ -747,8 +750,8 @@ void fp4_moe_sm90_run(
   g1.epi.bias = ptr(bias1);
   g1.epi.bias_f16 = y.dtype() == dl_float16;
   g1.epi.bias_trtllm = bias1.has_value() && bias1.value().dtype() == dl_float32;
-  g1.epi.out = at(l.act);
-  g1.epi.out_ld = inter;
+  g1.epi.out = rows1;
+  g1.epi.out_ld = rows1_ld;
   g1.epi.out_scale = static_cast<const float*>(ptr(out_scale1));
   g1.epi.lora = ptr(lora);
   g1.epi.lora_row = lora.has_value() ? prep.permuted_src : nullptr;
@@ -777,8 +780,8 @@ void fp4_moe_sm90_run(
   // token-wise recipes: quantize GEMM1's rows into GEMM2 B tiles with per-row scales
   if (per_token) {
     RowQuantArgs rq{};
-    rq.in = at(l.act);
-    rq.in_ld = inter;
+    rq.in = rows1;
+    rq.in_ld = rows1_ld;
     rq.rows = rows;
     rq.cols = inter;
     rq.in_f16 = 0;

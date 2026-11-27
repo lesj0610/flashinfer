@@ -405,8 +405,8 @@ struct Epilogue {
     const epi::ActQ q = kGemm2 ? epi::ActQ{1.f, 0.f, 0.f}
                                : epi::act_params(act, ep.act_x, ep.act_y, ep.act_z, expert);
     const void* const bias = ep.bias;
-    // gemm1_lora_delta: compiled into the gated GEMM1 with the NVFP4 quantization only
-    constexpr bool kLora = kGated && kFqNvfp4;
+    // gemm1_lora_delta: compiled into the gated GEMM1, per tensor or per token
+    constexpr bool kLora = kGated;
     const __nv_bfloat16* const lora = kLora ? static_cast<const __nv_bfloat16*>(ep.lora) : nullptr;
     const int64_t bias0 = static_cast<int64_t>(expert) * rows;
     const int lr = lane >> 2, lc = (lane & 3) * 2;
