@@ -850,9 +850,11 @@ class CakeStepFunConfig:
     activation ``clamp(up, -L, L) * min(silu(gate), L)`` and a per-expert limit
     ``L``, the NVFP4 per-token requantization, FC2 and finalize -- is an exported
     Cake kernel. It accepts four weight families, each with :class:`SwiGLUStep`
-    on exact SM100 and SM103 only: NVFP4×NVFP4 (E2m1 output, or bf16 output with
-    ``per_token_scale``), BF16×BF16, per-tensor FP8×FP8 and MXFP8×MXFP8. It is
-    never part of the default backend list; users opt in with
+    on exact SM100 and SM103: NVFP4×NVFP4 (E2m1 output, or bf16 output with
+    ``per_token_scale``), BF16×BF16, per-tensor FP8×FP8 and MXFP8×MXFP8. On
+    SM80/86/87/89 the per-tensor FP8 and MXFP8 families run the same forward on
+    the SM8x pipeline of their trtllm-gen runner. It is never part of the
+    default backend list; users opt in with
     ``CakeStepFunConfig(backend="cake_stepfun")``.
 
     The physical weight and activation layouts are exactly those produced by
@@ -896,7 +898,7 @@ class CakeStepFunConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (100, 103)
+        return arch in (80, 86, 87, 89, 100, 103)
 
     @staticmethod
     def prepare_weights(

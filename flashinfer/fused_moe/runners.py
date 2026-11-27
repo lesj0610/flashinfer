@@ -5546,9 +5546,10 @@ class _TrtllmRunnerBase(MoERunner):
 
     def check_support(self) -> None:
         # Attach the SM8x pipeline only after every runner-level check, the
-        # subclasses' configuration and arch checks included, has passed.
+        # subclasses' configuration and arch checks included, has passed. A repeated
+        # check keeps the attached (and possibly built) pipeline.
         self._support_checked = False
-        self._sm8x = None
+        attached, self._sm8x = getattr(self, "_sm8x", None), None
         self._check_support()
         body = self._sm8x_body_class()
         if body is not None:
@@ -5556,7 +5557,9 @@ class _TrtllmRunnerBase(MoERunner):
 
             major, minor = get_compute_capability(self.device)
             if major * 10 + minor in body._supported_archs:
-                self._sm8x = body(self.config, self.device)
+                if type(attached) is not body:
+                    attached = body(self.config, self.device)
+                self._sm8x = attached
                 self._sm8x.check_support()
         self._support_checked = True
 
@@ -5591,9 +5594,8 @@ class _TrtllmRunnerBase(MoERunner):
                 "TRTLLM forward requires the launch state returned by pack_inputs."
             )
         if self._sm8x is not None:
-            # One pipeline, no tactics or preparation launch.
-            if do_preparation:
-                return inputs[0]
+            # One pipeline and no tactics; a preparation call runs the forward too,
+            # as the trtllm-gen runner's does.
             return self._sm8x.run(inputs, launch_state.static_kwargs)
         result = self._inner.forward(
             inputs,
@@ -7253,10 +7255,16 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
         from .api import _resolve_cake_stepfun_knobs
 
         compute_capability = get_compute_capability(self.device)
-        if compute_capability not in ((10, 0), (10, 3)):
+        major, minor = compute_capability
+        # Where the family's trtllm-gen runner runs on its SM8x pipeline
+        # (``_sm8x_body_class``), the Cake family runs on that pipeline too.
+        body = self._sm8x_body_class()
+        if compute_capability not in ((10, 0), (10, 3)) and (
+            body is None or major * 10 + minor not in body._supported_archs
+        ):
             raise NotImplementedError(
-                f"{type(self).__name__} supports exact SM100 and SM103 only, "
-                f"got SM{compute_capability[0]}{compute_capability[1]}."
+                f"{type(self).__name__} supports exact SM100 and SM103, and the fp8 "
+                f"and mxfp8 families on SM80/86/87/89, got SM{major}{minor}."
             )
         # The Cake routing stage serves Renormalize (top-k then softmax) with
         # routed experts only; nothing falls back to the native router.
@@ -7276,8 +7284,13 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
         from ..experimental.cake_stepfun_moe import cake_backend
         from .backends.trtllm.sm100_runner import MoERunner as _TuningRunner
 
+        # The registry queries (routing inventory, plans) are arch independent; the
+        # SM8x pipeline replaces the exported programs.
         self._cake = cake_backend
-        self._cake_arch = cake_backend.arch_for(self.device)
+        if self._sm8x is None:
+            self._cake_arch = cake_backend.arch_for(self.device)
+        else:
+            self._sm8x.build()
         self._module = _CakeStepFunTuningModule(_TuningRunner)
         warn_experimental_backend_once("fused_moe", "cake_stepfun")
 
@@ -7438,6 +7451,28 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
                 f"{type(self).__name__} does not support routing_input_mode={mode!r}."
             )
         do_finalize = bool(static["do_finalize"])
+        if self._sm8x is not None:
+            num_tokens, hidden_size = self._problem_size(inputs)
+            self._cake._resolve_plan(
+                self.family(),
+                self._resolve_tactic(inputs, tactic),
+                num_tokens,
+                hidden_size,
+                self._intermediate_size,
+            )
+            # The Cake router reads no routing scale, group or normalization
+            # argument (Renormalize) and records no replay.
+            return self._sm8x.run(
+                inputs,
+                {
+                    **static,
+                    "n_group": None,
+                    "topk_group": None,
+                    "routed_scaling_factor": None,
+                    "norm_topk_prob": True,
+                    "routing_replay_out": None,
+                },
+            )
 
         def scalar(name: str, fp8_name: str) -> torch.Tensor | None:
             # The per-tensor FP8 view spells the activation scalars ``output*_scales_*``.

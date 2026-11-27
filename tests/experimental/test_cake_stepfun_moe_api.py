@@ -19,7 +19,8 @@ runs routing, FC1 with the StepFun epilogue, the NVFP4 per-token
 requantization, FC2 and finalize on the exported Cake kernels of
 ``flashinfer.experimental.cake_stepfun_moe`` for NVFP4 (E2m1 output and the
 per-token bf16-output variant), BF16, per-tensor FP8 and MXFP8, on exact SM100
-/ SM103.
+/ SM103; on SM80 / 86 / 87 / 89 the per-tensor FP8 and MXFP8 families run the
+public-route tests on the SM8x pipeline of their trtllm-gen runner.
 
 The suite compares that route with the trtllm-gen fused-MoE test references
 and with the native trtllm-gen pipeline on the StepFun serving geometry
@@ -39,7 +40,8 @@ into ``CAKE_STEPFUN_ERROR_TABLE_DIR``.
 
 The numerical contract of the backend package alone (stage by stage against
 the torch-only fp32 reference) lives in ``test_cake_stepfun_moe.py``; this
-module needs an SM100 / SM103 device and skips as a whole elsewhere.
+module needs an SM100 / SM103 (or, for FP8 / MXFP8, SM80 / 86 / 87 / 89) device
+and skips as a whole elsewhere.
 """
 
 from __future__ import annotations
@@ -189,22 +191,69 @@ def _arch_or_none():
     return cb.SUPPORTED_COMPUTE_CAPABILITIES.get(get_compute_capability(_device()))
 
 
+def _sm8x() -> bool:
+    """SM80 / 86 / 87 / 89, where the per-tensor FP8 and MXFP8 Cake families run on the SM8x
+    pipeline of their trtllm-gen runner."""
+    return torch.cuda.is_available() and get_compute_capability(_device()) in (
+        (8, 0),
+        (8, 6),
+        (8, 7),
+        (8, 9),
+    )
+
+
 def _supported() -> bool:
-    return _arch_or_none() is not None and bool(loader.PROGRAMS)
+    return (_arch_or_none() is not None or _sm8x()) and bool(loader.PROGRAMS)
 
 
 pytestmark = [
     pytest.mark.long_running,
     pytest.mark.skipif(
         not _supported(),
-        reason="cake_stepfun_moe needs an SM100 / SM103 device and a filled registry",
+        reason="cake_stepfun_moe needs an SM100 / SM103 device (FP8 / MXFP8 also "
+        "SM80 / 86 / 87 / 89) and a filled registry",
     ),
 ]
+
+# Tests that launch the exported Cake kernels or the SM100 trtllm-gen routing stages directly.
+CAKE_KERNEL_TESTS = frozenset(
+    {
+        "test_full_path_routing_tables_match_native",
+        "test_full_path_fc2_permuted_output_matches_native",
+        "test_full_path_precomputed_ids_matches_native_pipeline",
+        "test_full_path_finalize_matches_native_kernel",
+        "test_full_path_requant_matches_native_kernel",
+        "test_full_path_launches_only_cake_kernels_from_topk_ids",
+        "test_facade_forward_equals_backend_forward",
+    }
+)
+# Device tests of one precision; the CPU-device tests run every precision on every arch.
+DEVICE_PRECISION_TESTS = frozenset(
+    {
+        "test_prepare_weights_adds_step_limits_and_matches_the_native_route",
+        "test_reference_layouts_match_prepare_weights",
+        "test_matches_trtllm_reference_for_every_plan",
+        "test_full_path_matches_native_pipeline",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def sm8x_scope(request):
+    if _sm8x():
+        name = request.node.originalname
+        callspec = getattr(request.node, "callspec", None)
+        precision = callspec.params.get("precision") if callspec else None
+        if name in CAKE_KERNEL_TESTS:
+            pytest.skip("launches the SM100 / SM103 Cake kernels directly")
+        if name in DEVICE_PRECISION_TESTS and precision not in ("fp8", "mxfp8"):
+            pytest.skip(f"no SM8x pipeline for the {precision} family")
+    yield
 
 
 @pytest.fixture(autouse=not has_flashinfer_jit_cache(), scope="module")
 def warmup_jit():
-    if _supported():
+    if _arch_or_none() is not None and bool(loader.PROGRAMS):
         flashinfer.jit.build_jit_specs(
             loader.specs_for_arch(_arch_or_none()), verbose=False
         )
