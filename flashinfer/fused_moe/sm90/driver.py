@@ -734,6 +734,27 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
             "fc1_expert_weights must be [num_experts, (2 *) intermediate_size, ...] as "
             "fc2_expert_weights."
         )
+    # As cutlass_fused_moe's checkedActivationParams: every supplied per-expert activation
+    # parameter is checked, whichever ones the activation reads.
+    for n in (
+        "swiglu_alpha",
+        "swiglu_beta",
+        "swiglu_limit",
+        "situ_beta",
+        "situ_linear_beta",
+    ):
+        t = a.get(n)
+        if t is None:
+            continue
+        for bad, msg in (  # SM100's checks, in its order
+            (not t.is_cuda, f"{n} must be a CUDA tensor"),
+            (not t.is_contiguous(), f"{n} must be contiguous"),
+            (t.dtype != torch.float32, f"Inconsistency of Tensor type: {n}"),
+            (t.dim() != 1, f"{n} must be a 1D tensor"),
+            (t.numel() != experts, f"{n} must have {experts} element(s)."),
+        ):
+            if bad:
+                raise RuntimeError(msg)
     w1 = sm90_weight_view(
         "cutlass",
         fc1.view(torch.uint8),
