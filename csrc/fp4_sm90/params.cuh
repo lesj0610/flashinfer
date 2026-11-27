@@ -159,20 +159,24 @@ struct BSrc {
 };
 
 struct EpiArgs {
-  const float* alpha;       // per expert (MoE) or scalar (dense) fp32: weight global x input global
-  const float* tok_scale;   // per expanded row fp32 (token-wise recipes); null = none
-  const float* act_params;  // [E_local][3] activation parameters (SwiGLU alpha/beta/limit);
-                            // null or NaN entry = the activation's default
-  const void* bias;         // per expert [rows] in the output dtype; null = none
-  void* out;                // output
-  int64_t out_ld;           // elements between output rows
-  const float* fq_global;   // device fp32 scalar: global scale of the epilogue quantization (Fq !=
-                            // kNone); null = 1
-  uint8_t act;              // flashinfer.tllm_enums.ActivationType value
-  uint8_t fq;               // Fq (same as epi_fq(Cfg::kEpi); kept for runtime checks)
-  uint8_t recipe;           // kRecipe* bits (same as epi_recipe(Cfg::kEpi))
-  uint8_t out_f16;          // 1: FP16 output, 0: BF16 output
-  uint8_t out_tiled;        // 1: write GEMM2 input tiles (expert order, SW128); 0: row-major
+  const float* alpha;      // per expert (MoE) or scalar (dense) fp32: weight global x input global
+  const float* tok_scale;  // per expanded row fp32 (token-wise recipes); null = none
+  // Activation parameters, FP32 [E_local] each (cutlass_fused_moe's SwiGLU alpha / beta /
+  // limit, SiTU beta / linear beta); null = the activation's default
+  const float* act_x;
+  const float* act_y;
+  const float* act_z;
+  const void* bias;        // per expert [rows], BF16 or FP16 (bias_f16); null = none
+  void* out;               // output
+  int64_t out_ld;          // elements between output rows
+  const float* fq_global;  // device fp32 scalar: global scale of the epilogue quantization (Fq !=
+                           // kNone); null = 1
+  uint8_t act;             // flashinfer.tllm_enums.ActivationType value
+  uint8_t fq;              // Fq (same as epi_fq(Cfg::kEpi); kept for runtime checks)
+  uint8_t recipe;          // kRecipe* bits (same as epi_recipe(Cfg::kEpi))
+  uint8_t out_f16;         // 1: FP16 output, 0: BF16 output
+  uint8_t out_tiled;       // 1: write GEMM2 input tiles (expert order, SW128); 0: row-major
+  uint8_t bias_f16;        // 1: FP16 bias, 0: BF16 bias
 };
 
 // Persistent schedule written by prep. Expanded rows p are sorted by local expert; expert e owns

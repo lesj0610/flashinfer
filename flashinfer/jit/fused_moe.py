@@ -367,8 +367,9 @@ def gen_fp4_moe_sm90_module(
 
 def gen_fp4_moe_sm90_aot_modules() -> List[JitSpec]:
     """The SM90 FP4 MoE modules built ahead of time: standard NVFP4 and the two E4M3 bounds of
-    the default 4over6 recipe, every activation the entry points accept, BF16 and FP16
-    outputs. Other recipes and FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH compile on first use."""
+    the default 4over6 recipe, with SwiGLU, SwiGLU-step and ReLU2, BF16 and FP16 outputs.
+    Other activations and recipes and FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH compile on first
+    use."""
     from ..quantization.nvfp4_quantization_utils import NVFP44Over6Config
     from ..tllm_enums import ActivationType
 

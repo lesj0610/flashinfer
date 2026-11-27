@@ -605,25 +605,34 @@ def _cutlass_activation_params(
 def _check_sm90_fp4_moe(
     runner: "MoERunner",
     per_token: bool,
-    activations: tuple[type[ActivationConfig], ...],
+    activations: Optional[tuple[type[ActivationConfig], ...]],
 ) -> None:
     """Reject on SM90 what ``flashinfer.fused_moe.sm90`` does not run yet: anything but NVFP4 x
     NVFP4, ``per_token`` (else per tensor), with ``activations`` at their default parameters
-    and no fused shared experts."""
+    (None: the runner's own activations) and no fused shared experts."""
     config = runner.config
     quant, activation = config.quant, config.activation
     if (
         quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4)
         or bool(quant.per_token_scale) != per_token
-        or type(activation) not in activations
-        or activation != type(activation)()
+        or (
+            activations is not None
+            and (
+                type(activation) not in activations or activation != type(activation)()
+            )
+        )
         or config.experts.num_fused_shared_experts
     ):
-        names = ", ".join(cls.__name__ for cls in activations)
+        names = (
+            "its activations"
+            if activations is None
+            else ", ".join(cls.__name__ for cls in activations)
+            + " at default parameters"
+        )
         mode = "per-token" if per_token else "per-tensor"
         raise NotImplementedError(
             f"SM90 FP4 MoE: {type(runner).__name__} outside NVFP4 x NVFP4 {mode} "
-            f"with {names} at default parameters is not implemented on SM90 yet."
+            f"with {names} is not implemented on SM90 yet."
         )
 
 
@@ -2622,11 +2631,11 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
             fc2_dequant,
         ]
 
-    # SM90 runs flashinfer.fused_moe.sm90 (per-tensor 4over6) on the same inputs.
+    # SM90 runs flashinfer.fused_moe.sm90 (per tensor) on the same inputs.
     def _check_support(self) -> None:
         super()._check_support()
         if self._device_arch == 90:
-            _check_sm90_fp4_moe(self, False, (SwiGLU, SwiGLUStep, ReLU2))
+            _check_sm90_fp4_moe(self, False, None)
 
     def _build(self) -> None:
         if self._device_arch != 90:
@@ -2677,16 +2686,9 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
                 self.config.routing.top_k,
                 self.config.routing.num_experts,
             )
-        # Per-expert overrides from the weight view (the config's own are its defaults).
-        overrides = {
-            name: value
-            for name, value in self._activation_params.items()
-            if value is not None
-            and value is not self._config_activation_params.get(name)
-        }
         cutlass_fp4_sm90_moe(
             dict(
-                overrides,
+                self._activation_params,
                 input=inputs[1],
                 token_selected_experts=inputs[2],
                 token_final_scales=inputs[3],

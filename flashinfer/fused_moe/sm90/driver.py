@@ -81,11 +81,12 @@ SM90_FP4_TACTICS: Tuple[SM90_TACTIC, ...] = tuple(
     if (cta_m // 128) * n // 2 <= 128
 )
 
-#: Activations of the M3 tuples (gate/up pairing follows ``ActivationType.is_gated``).
-SM90_FP4_ACTIVATIONS = (
-    ActivationType.Swiglu,
-    ActivationType.SwigluStep,
-    ActivationType.Relu2,
+#: Activations of the ``fp4_sm90`` GEMM1 epilogue: ``cutlass_fused_moe``'s (gate/up pairing
+#: follows ``ActivationType.is_gated``).
+SM90_FP4_ACTIVATIONS = tuple(
+    a
+    for a in ActivationType
+    if a not in (ActivationType.InvalidType, ActivationType.ClampedRelu2)
 )
 
 
@@ -377,10 +378,12 @@ class Sm90Fp4MoeRunner(TunableRunner):
             _geometry(self.w2),
             self.epi1.alpha,
             self.epi2.alpha,
-            self.epi1.act_params,
+            *self.epi1.act_params,
             int(self.epi1.act),
             self.per_token,
             self.epi1.fq_global,
+            self.epi1.bias,
+            self.epi2.bias,
             workspace,
             src_permuted,
             y,
@@ -430,11 +433,12 @@ def sm90_fp4_moe(
     routing : Sm90Routing
         Global expert ids int32 ``[num_tokens, top_k]`` and their weights.
     epi1 : Sm90EpilogueSpec
-        GEMM1: activation, ``alpha`` FP32 ``[num_local_experts]``; ``fq`` ``Fq.NONE`` for the
-        token-wise recipe (rows requantized with ``recipe`` per row, ``token_scale`` per token
-        on GEMM1) or ``Fq.NVFP4`` per tensor (under ``fq_global``).
+        GEMM1: activation, its ``act_params``, ``alpha`` FP32 ``[num_local_experts]``, ``bias``;
+        ``fq`` ``Fq.NONE`` for the token-wise recipe (rows requantized with ``recipe`` per
+        row, ``token_scale`` per token on GEMM1) or ``Fq.NVFP4`` per tensor (under
+        ``fq_global``).
     epi2 : Sm90EpilogueSpec
-        GEMM2: ``alpha`` FP32 ``[num_local_experts]``, ``out_dtype`` BF16 or FP16.
+        GEMM2: ``alpha`` FP32 ``[num_local_experts]``, ``bias``, ``out_dtype`` BF16 or FP16.
     out : Optional[torch.Tensor]
         Finalized output ``[num_tokens, hidden]`` (allocated if None).
     tactic : tuple or int
@@ -471,8 +475,6 @@ def sm90_fp4_moe(
     if (
         act not in SM90_FP4_ACTIVATIONS
         or epi1.fq not in (Fq.NONE, Fq.NVFP4)
-        or epi1.bias is not None
-        or epi2.bias is not None
         or epi2.fq != Fq.NONE
         or not epi2.gemm2
         or epi2.out_dtype not in (torch.bfloat16, torch.float16)
@@ -666,21 +668,25 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
     qs, act = a["quant_scales"], ActivationType(a["activation_type"])
     x, x_sf, out = a["input"], a.get("input_sf"), a["output"]
     fc1, fc2 = a["fc1_expert_weights"], a["fc2_expert_weights"]
-    unsupported = [
-        n
-        for n in (
-            "fc1_expert_biases",
-            "fc2_expert_biases",
-            "swiglu_alpha",
-            "swiglu_beta",
-            "swiglu_limit",
-            "situ_beta",
-            "situ_linear_beta",
-            "workspace_buffer",
-            "profile_ids",
-        )
-        if a.get(n) is not None
-    ]
+    profile_ids = a.get("profile_ids")
+    if profile_ids is not None and len(profile_ids) != 2:
+        raise ValueError("profile_ids must contain [gemm1_profile, gemm2_profile]")
+    unsupported = [n for n in ("workspace_buffer",) if a.get(n) is not None]
+    # As SM100: -1 keeps a GEMM's default tactic without the tuner; SM100 tactic ids mean
+    # nothing here.
+    if profile_ids is not None and list(profile_ids) != [-1, -1]:
+        unsupported.append("profile_ids")
+    biases = (a.get("fc1_expert_biases"), a.get("fc2_expert_biases"))
+    swiglu = tuple(a.get(n) for n in ("swiglu_alpha", "swiglu_beta", "swiglu_limit"))
+    # As cutlass_fused_moe: Swiglu with SwiGLU parameters runs SwigluBias; SiTU reads situ_beta
+    # and situ_linear_beta.
+    if act == ActivationType.Swiglu and any(t is not None for t in swiglu):
+        act = ActivationType.SwigluBias
+    act_params = (
+        (a.get("situ_beta"), a.get("situ_linear_beta"), None)
+        if act == ActivationType.Situ
+        else swiglu
+    )
     codes = x.dtype == torch.uint8
     ep_size, ep_rank = a.get("ep_size", 1), a.get("ep_rank", 0)
     if (
@@ -699,10 +705,15 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
         or qs[5].numel() != fc1.shape[0]
     ):
         raise _not_on_sm90(
-            "CUTLASS FP4 MoE outside NVFP4 x NVFP4 per-tensor with Swiglu, SwigluStep "
-            "or Relu2, one global input scale per tensor and no biases or activation "
-            f"parameters (set: {unsupported})"
+            "CUTLASS FP4 MoE outside NVFP4 x NVFP4 per tensor with one global input scale "
+            f"per tensor (set: {unsupported})"
         )
+    if (biases[0] is None) != (biases[1] is None):
+        raise ValueError("fc1_expert_biases and fc2_expert_biases go together")
+    if (
+        a.get("tp_rank", 0) != 0
+    ):  # as cutlass_fused_moe's finalize: fc2 biases on TP rank 0
+        biases = (biases[0], None)
     gated = act.is_gated
     experts, hidden = fc2.shape[0], fc2.shape[1]
     inter = fc2.shape[2] * (16 if fc2.dtype == torch.int64 else 2)
@@ -748,6 +759,8 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
             fq=Fq.NVFP4,
             recipe=bits,
             alpha=qs[2],
+            act_params=act_params,
+            bias=biases[0],
             fq_global=_device_scalar(qs[3], "the GEMM2 input global scale"),
         ),
         Sm90EpilogueSpec(
@@ -755,9 +768,10 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
             gemm2=True,
             out_dtype=a["output_dtype"],
             alpha=qs[5],
+            bias=biases[1],
         ),
         out=out,
-        tactic=a.get("tactic", -1),
+        tactic=None if profile_ids is not None else a.get("tactic", -1),
         recipe=recipe,
         exact=_exact(),
         x_global=None if codes else qs[0],

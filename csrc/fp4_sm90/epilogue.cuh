@@ -165,8 +165,8 @@ __device__ __forceinline__ float gelu_taylor(float z) {
 // tanh z as sigmoid(2 z) 2 - 1 (SituAdaptor).
 __device__ __forceinline__ float tanh_sg(float z) { return sigm(z * 2.f) * 2.f + -1.f; }
 
-// Per-expert activation parameters (ActivationParams of cutlass_fused_moe). act_params is
-// [E_local][3] FP32 (x, y, z); a NaN entry keeps the adaptor default:
+// Per-expert activation parameters (ActivationParams of cutlass_fused_moe): x, y and z are
+// FP32 [E_local] each; a null one keeps the adaptor default:
 //   SwigluBias: alpha x 1, beta y 0, limit z inf     SwigluStep: limit z 7
 //   PowLU: m x 2.5, limit z inf                      SiTU: beta x 4, linear beta y 25
 //   ClampedRelu2: limit z (required)
@@ -174,7 +174,8 @@ __device__ __forceinline__ float tanh_sg(float z) { return sigm(z * 2.f) * 2.f +
 struct ActQ {
   float x, y, z;
 };
-__device__ __forceinline__ ActQ act_params(int act, const float* ap, int e) {
+__device__ __forceinline__ ActQ act_params(int act, const float* px, const float* py,
+                                           const float* pz, int e) {
   ActQ q{1.f, 0.f, __int_as_float(0x7f800000)};
   if (act == int(Act::SwigluStep)) q.z = 7.f;
   if (act == int(Act::PowLU)) q.x = 2.5f;
@@ -182,12 +183,9 @@ __device__ __forceinline__ ActQ act_params(int act, const float* ap, int e) {
     q.x = 4.f;
     q.y = 25.f;
   }
-  if (ap != nullptr) {
-    const float* r = ap + 3 * static_cast<int64_t>(e);
-    if (!isnan(r[0])) q.x = r[0];
-    if (!isnan(r[1])) q.y = r[1];
-    if (!isnan(r[2])) q.z = r[2];
-  }
+  if (px != nullptr) q.x = px[e];
+  if (py != nullptr) q.y = py[e];
+  if (pz != nullptr) q.z = pz[e];
   return q;
 }
 
@@ -397,9 +395,9 @@ struct Epilogue {
     const float a = alpha * kAccScale;
     const bool pt = ep.tok_scale != nullptr;
     const int act = ep.act;
-    const epi::ActQ q =
-        kGemm2 ? epi::ActQ{1.f, 0.f, 0.f} : epi::act_params(act, ep.act_params, expert);
-    const T* bias = static_cast<const T*>(ep.bias);
+    const epi::ActQ q = kGemm2 ? epi::ActQ{1.f, 0.f, 0.f}
+                               : epi::act_params(act, ep.act_x, ep.act_y, ep.act_z, expert);
+    const void* const bias = ep.bias;
     const int64_t bias0 = static_cast<int64_t>(expert) * rows;
     const int lr = lane >> 2, lc = (lane & 3) * 2;
     const int p_end = n0 + n_valid;
@@ -408,16 +406,19 @@ struct Epilogue {
                             : m0 + wg * (kCtaM / 2) + 16 * warp + lr;
     char* const outb = static_cast<char*>(ep.out);
 
-    // Bias: gated [up; gate] halves of the expert's rows ([mi][0] gate, [mi][1] up); plain
-    // [mi][half] for columns + 8 half.
+    // Bias (BF16 or FP16, ep.bias_f16): gated [up; gate] halves of the expert's rows ([mi][0]
+    // gate, [mi][1] up); plain [mi][half] for columns + 8 half.
     float bb[kM64][2];
 #pragma unroll
     for (int mi = 0; mi < kM64; ++mi)
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         const int c = kGated ? col0 + 32 * mi : col0 + 64 * mi + 8 * h;
-        const int64_t o = kGated && h == 0 ? int64_t(ncols) + c : int64_t(c);
-        bb[mi][h] = bias != nullptr && c < ncols ? epi::to_f<T>(bias[bias0 + o]) : 0.f;
+        const int64_t o = bias0 + (kGated && h == 0 ? int64_t(ncols) + c : int64_t(c));
+        bb[mi][h] = bias == nullptr || c >= ncols ? 0.f
+                    : ep.bias_f16
+                        ? epi::to_f<half>(static_cast<const half*>(bias)[o])
+                        : epi::to_f<__nv_bfloat16>(static_cast<const __nv_bfloat16*>(bias)[o]);
       }
 
     // Value before the activation (rs: alpha x s of the row, per token).

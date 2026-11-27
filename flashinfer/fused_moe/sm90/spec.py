@@ -123,7 +123,10 @@ class Sm90EpilogueSpec:
     out_dtype: torch.dtype = torch.bfloat16
     alpha: Optional[torch.Tensor] = None
     tok_scale: Optional[torch.Tensor] = None
-    act_params: Optional[torch.Tensor] = None
+    # GEMM1 activation parameters x, y, z: FP32 [num_local_experts] each or None (default)
+    # (SwiGLU alpha / beta / limit, SiTU beta / linear beta)
+    act_params: Tuple[Optional[torch.Tensor], ...] = (None, None, None)
+    # per local expert [num_local_experts, GEMM rows] in the output dtype
     bias: Optional[torch.Tensor] = None
     # device FP32 scalar: Fq.NVFP4's global scale (None = 1); with Fq.NONE on a token-wise GEMM1,
     # the inverse global scale of the GEMM2 input rows (None = the recipe's)

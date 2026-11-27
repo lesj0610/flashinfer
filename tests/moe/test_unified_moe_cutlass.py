@@ -2578,8 +2578,8 @@ cutlass_nvfp4_required = pytest.mark.skipif(
 )
 
 
-def _is_sm90_cutlass_nvfp4_4over6_supported() -> bool:
-    """SM90 runs the per-tensor 4over6 SwiGLU tuple (flashinfer.fused_moe.sm90)."""
+def _is_sm90_cutlass_nvfp4_supported() -> bool:
+    """SM90 runs per-tensor NVFP4 x NVFP4 (flashinfer.fused_moe.sm90)."""
     return (
         torch.cuda.is_available()
         and is_sm90a_supported(torch.device("cuda"))
@@ -2592,9 +2592,9 @@ def _is_sm90_cutlass_nvfp4_4over6_supported() -> bool:
     )
 
 
-cutlass_nvfp4_4over6_required = pytest.mark.skipif(
+cutlass_nvfp4_or_sm90_required = pytest.mark.skipif(
     not _is_cutlass_nvfp4_runtime_supported()
-    and not _is_sm90_cutlass_nvfp4_4over6_supported(),
+    and not _is_sm90_cutlass_nvfp4_supported(),
     reason="requires SM90/SM100/SM110/SM12x CUTLASS NVFP4 GPU and CUDA toolkit",
 )
 
@@ -2737,7 +2737,7 @@ def _nvfp4_requant_hook(device):
     return hook
 
 
-@cutlass_nvfp4_required
+@cutlass_nvfp4_or_sm90_required
 @pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
 def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
     config, act, weights, view = _make_nvfp4_case(activation=activation)
@@ -2759,7 +2759,8 @@ def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
     expected = _nvfp4_quantized_reference(act, view, activation)
 
     assert layer.winner_backend == "cutlass_nvfp4"
-    assert runner._workspace is not None
+    # SM90 allocates its own workspace per call.
+    assert runner._workspace is not None or runner._device_arch == 90
     torch.testing.assert_close(actual, flat, rtol=0, atol=0)
     assert torch.isfinite(actual).all(), "CUTLASS NVFP4 produced non-finite output"
     # Identity is the only pure pass-through here, so GEMM1 output reaches the
@@ -2773,7 +2774,7 @@ def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
     _assert_numerically_close(actual, expected, rtol=ref_rtol, atol=ref_atol)
 
 
-@cutlass_nvfp4_4over6_required
+@cutlass_nvfp4_or_sm90_required
 @pytest.mark.parametrize(
     "recipe",
     [

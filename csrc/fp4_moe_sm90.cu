@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "fp4_sm90/kernel.cuh"
@@ -350,8 +351,9 @@ void fp4_moe_sm90_run(
     TensorView w1_codes, TensorView w1_sf, Array<int64_t> w1_geom, TensorView w2_codes,
     TensorView w2_sf, Array<int64_t> w2_geom,
     // epilogues
-    TensorView alpha1, TensorView alpha2, Optional<TensorView> act_params, int64_t act,
-    bool per_token, Optional<TensorView> fq_global,
+    TensorView alpha1, TensorView alpha2, Optional<TensorView> act_x, Optional<TensorView> act_y,
+    Optional<TensorView> act_z, int64_t act, bool per_token, Optional<TensorView> fq_global,
+    Optional<TensorView> bias1, Optional<TensorView> bias2,
     // scratch and outputs
     TensorView workspace, TensorView src_permuted, TensorView y, Optional<TensorView> out,
     // tactic
@@ -418,11 +420,24 @@ void fp4_moe_sm90_run(
     CHECK_DEVICE(fq_global.value(), x);
     TVM_FFI_ICHECK_EQ(fq_global.value().numel(), 1) << "fq_global must be a scalar";
   }
-  if (act_params.has_value()) {
-    CHECK_INPUT_AND_TYPE(act_params.value(), dl_float32);
-    CHECK_DEVICE(act_params.value(), x);
-    TVM_FFI_ICHECK_EQ(act_params.value().numel(), num_local_experts * 3)
-        << "act_params must be [num_local_experts, 3]";
+  // GEMM1 activation parameters (cutlass_fused_moe's ActivationParams)
+  for (const Optional<TensorView>* p : {&act_x, &act_y, &act_z}) {
+    if (!p->has_value()) continue;
+    CHECK_INPUT_AND_TYPE(p->value(), dl_float32);
+    CHECK_DEVICE(p->value(), x);
+    CHECK_DIM(1, p->value());
+    TVM_FFI_ICHECK_EQ(p->value().size(0), num_local_experts)
+        << "activation parameters must be [num_local_experts]";
+  }
+  // Per-expert biases of the GEMM rows, in the output dtype
+  for (const auto& [b, b_rows] : {std::pair{&bias1, a1.rows}, std::pair{&bias2, a2.rows}}) {
+    if (!b->has_value()) continue;
+    CHECK_INPUT(b->value());
+    CHECK_DEVICE(b->value(), x);
+    TVM_FFI_ICHECK(b->value().dtype() == y.dtype()) << "biases must have the output dtype";
+    CHECK_DIM(2, b->value());
+    TVM_FFI_ICHECK(b->value().size(0) == num_local_experts && b->value().size(1) == b_rows)
+        << "biases must be [num_local_experts, GEMM rows]";
   }
 
   CHECK_DIM(2, x);
@@ -517,9 +532,14 @@ void fp4_moe_sm90_run(
   g1.b.tiled = 1;
   g1.epi.alpha = static_cast<const float*>(alpha1.data_ptr());
   g1.epi.tok_scale = tok1;
-  g1.epi.act_params =
-      act_params.has_value() ? static_cast<const float*>(act_params.value().data_ptr()) : nullptr;
-  g1.epi.bias = nullptr;
+  auto ptr = [](const Optional<TensorView>& t) -> void* {
+    return t.has_value() ? t.value().data_ptr() : nullptr;
+  };
+  g1.epi.act_x = static_cast<const float*>(ptr(act_x));
+  g1.epi.act_y = static_cast<const float*>(ptr(act_y));
+  g1.epi.act_z = static_cast<const float*>(ptr(act_z));
+  g1.epi.bias = ptr(bias1);
+  g1.epi.bias_f16 = y.dtype() == dl_float16;
   g1.epi.out = at(l.act);
   g1.epi.out_ld = inter;
   // fq_global: per tensor GEMM1's output global scale, per token the row quantization's inverse
@@ -569,8 +589,8 @@ void fp4_moe_sm90_run(
   g2.b.tiled = 1;
   g2.epi.alpha = static_cast<const float*>(alpha2.data_ptr());
   g2.epi.tok_scale = tok2;
-  g2.epi.act_params = nullptr;
-  g2.epi.bias = nullptr;
+  g2.epi.bias = ptr(bias2);
+  g2.epi.bias_f16 = y.dtype() == dl_float16;
   g2.epi.out = y.data_ptr();
   g2.epi.out_ld = y.stride(0);
   g2.epi.fq_global = nullptr;
