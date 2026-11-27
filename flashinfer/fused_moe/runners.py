@@ -1755,6 +1755,7 @@ class _CutlassRunnerBase(MoERunner):
     # product as compound candidates for the outer end-to-end autotuner. N=1
     # preserves the legacy independent-winner behavior.
     _num_top_tactics_per_stage: ClassVar[int] = 2
+    _sm8x: Any = None  # set by check_support; replaces _inner
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -1800,7 +1801,9 @@ class _CutlassRunnerBase(MoERunner):
                 )
         body = self._sm8x_body_class()
         if body is not None and self._device_arch in body._supported_archs:
-            self._sm8x = body(self.config, self.device)
+            # Keep a built pipeline across repeated check_support calls.
+            if type(self._sm8x) is not body:
+                self._sm8x = body(self.config, self.device)
             self._sm8x.check_support()
 
     @staticmethod
@@ -1828,7 +1831,6 @@ class _CutlassRunnerBase(MoERunner):
         self._enable_pdl = enable_pdl
         self._use_fused_finalize = True
         self._inner: Any = None
-        self._sm8x = None  # set by check_support; replaces _inner
 
         # pack_inputs replaces this with the current MoELayer token bucket.
         self.tuning_config = TuningConfig()
@@ -3946,6 +3948,7 @@ class _CuTileFp8Runner(CuTileBf16Runner):
     _weight_fp4: ClassVar[bool] = False
     _supported_archs: ClassVar[tuple[int, ...]] = _CUTILE_FP8_ARCHS
     _precision_name = "FP8"
+    _sm8x: Any = None  # set by check_support
 
     @staticmethod
     def _fp8_mode(*, fused: bool, persistent: bool) -> int:
@@ -4016,10 +4019,6 @@ class _CuTileFp8Runner(CuTileBf16Runner):
             return (2, 2) if self._block_scaled else (4, 4)
         return (2, 1) if self.config.activation.is_gated else (1, 2)
 
-    def __init__(self, config: MoEConfig, device: torch.device):
-        super().__init__(config, device)
-        self._sm8x: Any = None  # set by check_support
-
     @classmethod
     def _sm8x_body_class(cls) -> Any:
         """The ``sm8x_fp8_moe`` pipeline that runs this mode where cuda-tile has
@@ -4044,7 +4043,9 @@ class _CuTileFp8Runner(CuTileBf16Runner):
     def _check_support(self) -> None:
         body = self._sm8x_body_class()
         if body is not None and self._device_arch in body._supported_archs:
-            self._sm8x = body(self.config, self.device)
+            # Keep a built pipeline across repeated check_support calls.
+            if type(self._sm8x) is not body:
+                self._sm8x = body(self.config, self.device)
         super()._check_support()
         if self._sm8x is not None:
             self._sm8x.check_support()
