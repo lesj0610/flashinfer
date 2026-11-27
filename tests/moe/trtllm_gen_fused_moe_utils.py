@@ -3913,12 +3913,11 @@ def run_moe_test(
         moe_gemm_backend=moe_gemm_backend,
         bias_or_activation_params=any(
             t is not None
-            for t in (
-                gemm1_bias,
-                gemm2_bias,
-                gemm1_alpha,
-                gemm1_beta,
-                gemm1_clamp_limit,
+            for t in (gemm1_bias, gemm2_bias)
+            + (
+                ()
+                if activation_type in (ActivationType.Situ, ActivationType.SwigluStep)
+                else (gemm1_alpha, gemm1_beta, gemm1_clamp_limit)
             )
         ),
     )

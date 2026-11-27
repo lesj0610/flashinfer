@@ -134,12 +134,21 @@ _ENTRY_AFMT = {
 }
 
 
-#: Activations each entry point runs on SM90 (at their default parameters).
+#: Activations each entry point runs on SM90 (at their default parameters); per token,
+#: TRT-LLM's ``_TRTLLM_PER_TOKEN_ACTIVATIONS``.
 _ENTRY_ACTIVATIONS = {
-    "trtllm": (ActivationType.Swiglu, ActivationType.Relu2),
+    "trtllm": (
+        ActivationType.Swiglu,
+        ActivationType.Geglu,
+        ActivationType.Relu2,
+        ActivationType.SwigluStep,
+        ActivationType.Identity,
+        ActivationType.Situ,
+    ),
     "cutlass": SM90_FP4_ACTIVATIONS,
     "cute_dsl": (ActivationType.Swiglu, ActivationType.Relu2),
 }
+_TRTLLM_PER_TOKEN_ACTIVATIONS = (ActivationType.Swiglu, ActivationType.Relu2)
 
 
 def sm90_fp4_moe_supports(entry: str, *, per_token: bool, activation_type: int) -> bool:
@@ -147,9 +156,12 @@ def sm90_fp4_moe_supports(entry: str, *, per_token: bool, activation_type: int) 
     ``"cute_dsl"``): per-token activation scales for CuTe DSL, per-tensor for CUTLASS, either
     for TRT-LLM, and an activation the entry runs on SM90. The entry points reject the rest on
     SM90 with ``NotImplementedError``."""
+    acts = _ENTRY_ACTIVATIONS[entry]
+    if entry == "trtllm" and per_token:
+        acts = _TRTLLM_PER_TOKEN_ACTIVATIONS
     return (entry == "trtllm" or per_token == (entry != "cutlass")) and ActivationType(
         activation_type
-    ) in _ENTRY_ACTIVATIONS[entry]
+    ) in acts
 
 
 def sm90_fp4_valid_tactics(
@@ -560,6 +572,15 @@ def trtllm_fp4_sm90_moe(
         a[f"output{i}_scalar"] for i in ("1_scale", "1_scale_gate", "2_scale")
     )
     recipe = resolve_nvfp4_4over6(a["nvfp4_4over6"]) if pt is not None else None
+    # As SM100: SiTU's alpha, beta and limit, SwigluStep's limit (per tensor here)
+    params = {
+        ActivationType.Situ: ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
+        ActivationType.SwigluStep: ("gemm1_clamp_limit",),
+    }.get(act, ())
+    if act == ActivationType.SwigluStep and (
+        a.get("gemm1_alpha") is not None or a.get("gemm1_beta") is not None
+    ):  # as SM100's launcher
+        raise ValueError("SwigluStep takes no gemm1_alpha or gemm1_beta.")
     unsupported = [
         n
         for n in (
@@ -576,12 +597,14 @@ def trtllm_fp4_sm90_moe(
             "valid_intermediate_size",
             "localized_weights",
         )
-        if a.get(n) is not None
+        if a.get(n) is not None and (pt is not None or n not in params)
     ]
     if (
         x.dtype != torch.uint8
         or x_scale is None
-        or act not in (ActivationType.Swiglu, ActivationType.Relu2)
+        or not sm90_fp4_moe_supports(
+            "trtllm", per_token=pt is not None, activation_type=int(act)
+        )
         or unsupported
         or a.get("_nfse")
         or None in (s1, s_gate, s2)
@@ -589,8 +612,8 @@ def trtllm_fp4_sm90_moe(
         or a["gemm1_weights"].dtype != torch.uint8
     ):
         raise _not_on_sm90(
-            "TRT-LLM FP4 MoE outside NVFP4 x NVFP4 with Swiglu or Relu2 "
-            f"(set: {unsupported})"
+            "TRT-LLM FP4 MoE outside NVFP4 x NVFP4 or with "
+            f"{act.name}{' per token' if pt is not None else ''} (set: {unsupported})"
         )
     if "hidden_states_scale_layout" in a:  # SM100's: linear only
         resolve_moe_act_sf_layout(a["hidden_states_scale_layout"])
@@ -604,6 +627,14 @@ def trtllm_fp4_sm90_moe(
             "hidden_states_scale other than linear [num_tokens, hidden / 16]"
         )
     experts, inter = a["local_num_experts"], a["intermediate_size"]
+    for n in params:
+        t = a.get(n)
+        if t is not None and (
+            t.dtype != torch.float32 or t.shape != (experts,) or t.device != x.device
+        ):  # as SM100's launcher
+            raise ValueError(
+                f"{n} must be FP32 [local_num_experts] on the input's device."
+            )
     gated = act.is_gated
     finalize, out = a["do_finalize"], a["output"]
     if (
@@ -630,19 +661,30 @@ def trtllm_fp4_sm90_moe(
         gated=False,
         scale_kind="nvfp4",
     )
-    # As SM100: GEMM1 under the gate scalar, GEMM2 input under output1_scale_scalar (gated over
-    # the gate scalar). Per token the rows are requantized per token, so it folds into GEMM2's
-    # alpha; per tensor it is GEMM1's NVFP4 output global scale, as SM100's FC1 output.
+    # As SM100: GEMM1 under the gate scalar, GEMM2 input under output1_scale_scalar (gated but
+    # SiTU over the gate scalar, SiTU's inside the activation). Per token the rows are
+    # requantized per token, so it folds into GEMM2's alpha; per tensor it is GEMM1's NVFP4
+    # output global scale, as SM100's FC1 output. The limits are in accumulator units.
     alpha1 = _per_expert(s_gate, experts)
     fc2 = _per_expert(s1, experts)
-    fc2 = fc2 / alpha1 if gated else fc2
+    fc2 = fc2 / alpha1 if gated and act != ActivationType.Situ else fc2
     alpha2 = _per_expert(s2, experts)
+    limit = a.get("gemm1_clamp_limit") if params else None
+    act_params = (None, None, None if limit is None else limit * alpha1)
+    if act == ActivationType.Situ:  # TRT-LLM's defaults: alpha 1, beta 1
+        one = torch.ones(experts, dtype=torch.float32, device=x.device)
+        ab = (a.get("gemm1_alpha"), a.get("gemm1_beta"))
+        act_params = (
+            *(one if t is None else t.contiguous() for t in ab),
+            act_params[2],
+        )
     if pt is None:
         epi1 = Sm90EpilogueSpec(
             int(act),
             fq=Fq.NVFP4,
             recipe=fp4_sm90_recipe_bits(None),
             alpha=alpha1,
+            act_params=act_params,
             fq_global=fc2.contiguous(),
         )
     else:

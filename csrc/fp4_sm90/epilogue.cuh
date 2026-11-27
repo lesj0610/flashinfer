@@ -168,8 +168,9 @@ __device__ __forceinline__ float tanh_sg(float z) { return sigm(z * 2.f) * 2.f +
 // Per-expert activation parameters (ActivationParams of cutlass_fused_moe): x, y and z are
 // FP32 [E_local] each; a null one keeps the adaptor default:
 //   SwigluBias: alpha x 1, beta y 0, limit z inf     SwigluStep: limit z 7
-//   PowLU: m x 2.5, limit z inf                      SiTU: beta x 4, linear beta y 25
-//   ClampedRelu2: limit z (required)
+//   PowLU: m x 2.5, limit z inf                      ClampedRelu2: limit z (required)
+//   SiTU: beta x 4, linear beta y 25, limit z inf (TRT-LLM's: the gate from above, the linear
+//   both ways)
 // Swiglu, Geglu, GegluTanh and the plain activations take none (GLUAdaptor / IdentityAdaptor).
 struct ActQ {
   float x, y, z;
@@ -212,6 +213,10 @@ __device__ __forceinline__ float act_gated(int act_rt, float g, float u, ActQ q)
       return fminf(a, q.z) * fmaxf(fminf(u, q.z), -q.z);
     }
     case int(Act::Situ):
+      if (q.z != __int_as_float(0x7f800000)) {
+        g = fminf(g, q.z);
+        u = fmaxf(fminf(u, q.z), -q.z);
+      }
       return (tanh_sg(g * (1.f / q.x)) * sigm(g) * q.x) * (tanh_sg(u * (1.f / q.y)) * q.y);
     default:  // not a gated activation: the host rejects it
       return __int_as_float(0x7fffffff);
