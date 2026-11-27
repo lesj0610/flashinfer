@@ -5545,24 +5545,15 @@ class _TrtllmRunnerBase(MoERunner):
                 "by the CUTLASS MXFP8 runners only."
             )
 
-    def check_support(self) -> None:
-        # Attach the SM8x pipeline only after every runner-level check, the
-        # subclasses' configuration and arch checks included, has passed. A repeated
-        # check keeps the attached (and possibly built) pipeline.
-        self._support_checked = False
-        attached, self._sm8x = getattr(self, "_sm8x", None), None
-        self._check_support()
+    def _attach_sm8x(self, arch: int) -> None:
+        """Attach the SM8x pipeline where ``arch`` runs it; a runner calls this once
+        its configuration and arch checks have passed. A repeated check keeps the
+        attached (and possibly built) pipeline."""
         body = self._sm8x_body_class()
-        if body is not None:
-            from ..utils import get_compute_capability
-
-            major, minor = get_compute_capability(self.device)
-            if major * 10 + minor in body._supported_archs:
-                if type(attached) is not body:
-                    attached = body(self.config, self.device)
-                self._sm8x = attached
-                self._sm8x.check_support()
-        self._support_checked = True
+        if body is not None and arch in body._supported_archs:
+            if type(self._sm8x) is not body:
+                self._sm8x = body(self.config, self.device)
+            self._sm8x.check_support()
 
     def _sm8x_body_class(self) -> Any:
         """The ``sm8x_fp8_moe`` pipeline that runs this runner where the trtllm-gen
@@ -6229,6 +6220,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
                 f"{type(self).__name__} is enabled only on validated "
                 f"SM100/SM103 targets, got sm{arch}."
             )
+        self._attach_sm8x(arch)
 
     def _sm8x_body_class(self) -> Any:
         from .api import QuantFormat
@@ -6618,6 +6610,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
                 f"{type(self).__name__} is enabled only on validated "
                 f"SM100/SM103 targets, got sm{arch}."
             )
+        self._attach_sm8x(arch)
 
     def _sm8x_body_class(self) -> Any:
         from .sm8x_fp8_moe import Sm8xTrtllmFp8PerTensorMoE
@@ -7453,13 +7446,21 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
             )
         do_finalize = bool(static["do_finalize"])
         if self._sm8x is not None:
-            num_tokens, hidden_size = self._problem_size(inputs)
-            self._cake._resolve_plan(
-                self.family(),
-                self._resolve_tactic(inputs, tactic),
-                num_tokens,
-                hidden_size,
-                self._intermediate_size,
+            # The Cake launch's expert, routing and geometry checks; the SM8x
+            # pipeline replaces the exported programs.
+            self._cake._check_stepfun_inputs(
+                family=self.family(),
+                hidden_states=moe_inputs.hidden_states,
+                gemm1_weights=static["gemm1_weights"],
+                gemm2_weights=static["gemm2_weights"],
+                routing_logits=routing_logits,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                num_experts=int(static["num_experts"]),
+                top_k=int(self.config.routing.top_k),
+                local_expert_offset=int(static["local_expert_offset"]),
+                local_num_experts=int(self._num_local_experts),
+                plan=self._resolve_tactic(inputs, tactic),
             )
             # The Cake router reads no routing scale, group or normalization
             # argument (Renormalize) and records no replay.
@@ -7753,6 +7754,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                     f"{type(self).__name__} cannot represent non-default "
                     "SwiGLU scalars for DeepSeekFp8×DeepSeekFp8."
                 )
+        self._attach_sm8x(arch)
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()

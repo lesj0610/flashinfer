@@ -1609,79 +1609,25 @@ def prepare_stepfun_moe(
     facts = _family_facts(family)
     device = _tensor("hidden_states", hidden_states, dim=2).device
     arch = arch_for(device)
-    _positive_int("num_experts", num_experts)
-    _positive_int("top_k", top_k)
-    _positive_int("local_expert_offset", local_expert_offset, minimum=0)
-    _positive_int("local_num_experts", local_num_experts)
-    if top_k > num_experts:
-        raise ValueError(f"top_k {top_k} exceeds num_experts {num_experts}")
-    if local_expert_offset + local_num_experts > num_experts:
-        raise ValueError(
-            f"local experts [{local_expert_offset}, {local_expert_offset + local_num_experts}) "
-            f"exceed num_experts {num_experts}"
-        )
-    if int(gemm1_weights.shape[0]) != local_num_experts:
-        raise ValueError(
-            f"gemm1_weights holds {gemm1_weights.shape[0]} expert rows, local_num_experts is "
-            f"{local_num_experts}"
-        )
-    num_tokens = _routing_checks(
+    resolved, g = _check_stepfun_inputs(
+        family=family,
+        hidden_states=hidden_states,
+        gemm1_weights=gemm1_weights,
+        gemm2_weights=gemm2_weights,
         routing_logits=routing_logits,
         topk_ids=topk_ids,
+        topk_weights=topk_weights,
         num_experts=num_experts,
         top_k=top_k,
         local_expert_offset=local_expert_offset,
         local_num_experts=local_num_experts,
-        tile_tokens_dim=1,
-        device=device,
-    )
-    if num_tokens != int(hidden_states.shape[0]):
-        raise ValueError(
-            f"the routing input describes {num_tokens} tokens, hidden_states "
-            f"{hidden_states.shape[0]}"
-        )
-    per_byte = act_per_byte(family)
-    hidden_size = int(hidden_states.shape[1]) * per_byte
-    probe = _geometry(
-        family,
-        hidden_states,
-        gemm1_weights,
-        gemm2_weights,
-        top_k=top_k,
-        num_experts_for_ctas=num_experts,
-        tile_tokens_dim=1,
-    )
-    resolved = _resolve_plan(
-        family, plan, num_tokens, hidden_size, probe.intermediate_size
+        plan=plan,
     )
     tile = resolved.tile_n
-    g = _geometry(
-        family,
-        hidden_states,
-        gemm1_weights,
-        gemm2_weights,
-        top_k=top_k,
-        num_experts_for_ctas=num_experts,
-        tile_tokens_dim=tile,
-    )
     T, H, I = g.num_tokens, g.hidden_size, g.intermediate_size
     fc1_unit = _unit(resolved.fc1_program)
     routing_constants = _constants()["routing"]
     requant_constants = _constants()["requant"]
-    if topk_ids is not None:
-        if topk_weights is None:
-            raise ValueError("topk_weights is required with topk_ids")
-        weights = _tensor("topk_weights", topk_weights, device=device, dim=2)
-        if tuple(weights.shape) != (T, top_k):
-            raise ValueError(
-                f"topk_weights must be [{T}, {top_k}], got {tuple(weights.shape)}"
-            )
-        if weights.dtype not in _FINALIZE_WEIGHT_DTYPES:
-            raise ValueError(
-                f"topk_weights must be bfloat16 or float32, got {weights.dtype}"
-            )
-    elif topk_weights is not None:
-        raise ValueError("topk_weights is taken with topk_ids only")
 
     def table(shape: tuple[int, ...], dtype: torch.dtype = torch.int32) -> torch.Tensor:
         return torch.empty(shape, dtype=dtype, device=device)
@@ -1921,6 +1867,95 @@ def prepare_stepfun_moe(
 # ---------------------------------------------------------------------------
 # Stage entries (caller-owned buffers; the operand lists of the former FFI operations)
 # ---------------------------------------------------------------------------
+
+
+def _check_stepfun_inputs(
+    *,
+    family: str,
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    routing_logits: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    num_experts: int,
+    top_k: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    plan: Plan | int | None,
+) -> tuple[Plan, _Geometry]:
+    """:func:`prepare_stepfun_moe`'s expert, routing and geometry checks on the
+    2-D ``hidden_states``; returns the resolved plan and its geometry."""
+    device = hidden_states.device
+    _positive_int("num_experts", num_experts)
+    _positive_int("top_k", top_k)
+    _positive_int("local_expert_offset", local_expert_offset, minimum=0)
+    _positive_int("local_num_experts", local_num_experts)
+    if top_k > num_experts:
+        raise ValueError(f"top_k {top_k} exceeds num_experts {num_experts}")
+    if local_expert_offset + local_num_experts > num_experts:
+        raise ValueError(
+            f"local experts [{local_expert_offset}, {local_expert_offset + local_num_experts}) "
+            f"exceed num_experts {num_experts}"
+        )
+    if int(gemm1_weights.shape[0]) != local_num_experts:
+        raise ValueError(
+            f"gemm1_weights holds {gemm1_weights.shape[0]} expert rows, local_num_experts is "
+            f"{local_num_experts}"
+        )
+    num_tokens = _routing_checks(
+        routing_logits=routing_logits,
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        tile_tokens_dim=1,
+        device=device,
+    )
+    if num_tokens != int(hidden_states.shape[0]):
+        raise ValueError(
+            f"the routing input describes {num_tokens} tokens, hidden_states "
+            f"{hidden_states.shape[0]}"
+        )
+    per_byte = act_per_byte(family)
+    hidden_size = int(hidden_states.shape[1]) * per_byte
+    probe = _geometry(
+        family,
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        top_k=top_k,
+        num_experts_for_ctas=num_experts,
+        tile_tokens_dim=1,
+    )
+    resolved = _resolve_plan(
+        family, plan, num_tokens, hidden_size, probe.intermediate_size
+    )
+    g = _geometry(
+        family,
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        top_k=top_k,
+        num_experts_for_ctas=num_experts,
+        tile_tokens_dim=resolved.tile_n,
+    )
+    if topk_ids is not None:
+        if topk_weights is None:
+            raise ValueError("topk_weights is required with topk_ids")
+        weights = _tensor("topk_weights", topk_weights, device=device, dim=2)
+        if tuple(weights.shape) != (g.num_tokens, top_k):
+            raise ValueError(
+                f"topk_weights must be [{g.num_tokens}, {top_k}], got {tuple(weights.shape)}"
+            )
+        if weights.dtype not in _FINALIZE_WEIGHT_DTYPES:
+            raise ValueError(
+                f"topk_weights must be bfloat16 or float32, got {weights.dtype}"
+            )
+    elif topk_weights is not None:
+        raise ValueError("topk_weights is taken with topk_ids only")
+    return resolved, g
 
 
 def prepare_routing(
