@@ -94,7 +94,9 @@ class Sm8xSiluQuant:
     """``out_q``, ``out_s`` of the generated activation kernel from the BF16 gate_up
     ``y`` ``(M, 2H)``: FlashInfer's ``silu_and_mul`` (the chain's activation), then per
     row and group of 128 columns ``scale = max(absmax, 1e-10) / 448`` (an FP32 division)
-    and ``q = e4m3(clamp(act * (1 / scale), -448, 448))`` (round to nearest even)."""
+    and ``q = e4m3(clamp(act * (1 / scale), -448, 448))`` (round to nearest even). As in
+    the kernel's ``fmaxf`` / ``fminf``, the absmax and the clamp skip a NaN: a NaN
+    element leaves its group's scale to the finite ones and quantizes to 448."""
 
     def __init__(self, m: int, h: int, device: torch.device) -> None:
         from ..activation import get_act_and_mul_module
@@ -106,20 +108,25 @@ class Sm8xSiluQuant:
         self.amax = torch.empty(self.groups[:2], dtype=torch.bfloat16, device=device)
         self.inverse = torch.empty(self.groups[:2], dtype=torch.float32, device=device)
         self.scaled = torch.empty(self.groups, dtype=torch.float32, device=device)
+        self.zero = torch.zeros((), dtype=torch.bfloat16, device=device)
         # a device divisor: a true division (a host scalar divides by its reciprocal)
         self.limit = torch.full((), _E4M3_MAX, dtype=torch.float32, device=device)
+        self.neg_limit = torch.full((), -_E4M3_MAX, dtype=torch.float32, device=device)
 
     def __call__(self, y, out_q, out_s) -> None:
         from ..activation import silu_and_mul
 
         silu_and_mul(y, out=self.act)
         torch.abs(self.act, out=self.mag)
+        torch.fmax(self.mag, self.zero, out=self.mag)  # a NaN magnitude counts as 0
         torch.amax(self.mag.view(self.groups), -1, out=self.amax)
         scale = out_s.view(self.groups[:2])
         scale.copy_(self.amax).clamp_(min=_EPS).div_(self.limit)
         torch.reciprocal(scale, out=self.inverse)
         torch.mul(self.act.view(self.groups), self.inverse[..., None], out=self.scaled)
-        out_q.view(self.groups).copy_(self.scaled.clamp_(-_E4M3_MAX, _E4M3_MAX))
+        torch.fmin(self.scaled, self.limit, out=self.scaled)  # NaN -> 448
+        torch.fmax(self.scaled, self.neg_limit, out=self.scaled)
+        out_q.view(self.groups).copy_(self.scaled)
 
 
 class Sm8xSiluQuantStage:
