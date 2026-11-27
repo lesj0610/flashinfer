@@ -23,6 +23,7 @@ on the weights in each entry point's own SM100+ layout. Other tuples raise on SM
 from __future__ import annotations
 
 import functools
+import math
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -486,10 +487,13 @@ class Sm90Fp4MoeRunner(TunableRunner):
         rows = tokens * top_k
         # The scratch is cut from the caller's buffer; what the call returns is allocated.
         buf = kwargs.get("workspace_buffer")
+        # TRT-LLM's buffer: the call's scratch and rows, all internal (never returned), cut in
+        # SM100's allocation order by its allocator; without it plain allocations.
+        alloc = _CarveAllocator(kwargs.get("trtllm_workspace"))
         carve_src = buf is not None and self.do_finalize and lora is None
         carve_y = buf is not None and self.do_finalize
         if buf is None:
-            workspace = torch.empty(size, dtype=torch.uint8, device=x.device)
+            workspace = alloc.alloc((size,), torch.uint8, x.device)
         else:
             src_off, y_off, end = module.fp4_moe_sm90_scratch(
                 tokens,
@@ -510,12 +514,12 @@ class Sm90Fp4MoeRunner(TunableRunner):
         if carve_src:
             src_permuted = raw[src_off : src_off + 4 * rows].view(torch.int32)
         else:
-            src_permuted = torch.empty(rows, dtype=torch.int32, device=x.device)
+            src_permuted = alloc.alloc((rows,), torch.int32, x.device)
         if carve_y:
             y_bytes = rows * hidden * out_dtype.itemsize
             y = raw[y_off : y_off + y_bytes].view(out_dtype).view(rows, hidden)
         else:
-            y = torch.empty(rows, hidden, dtype=out_dtype, device=x.device)
+            y = alloc.alloc((rows, hidden), out_dtype, x.device)
         if self.do_finalize and out is None:
             out = torch.empty(tokens, hidden, dtype=out_dtype, device=x.device)
         fc2_input_out = kwargs.get("fc2_input_out")
@@ -604,6 +608,7 @@ def sm90_fp4_moe(
     gemm1_lora_delta: Optional[torch.Tensor] = None,
     keep_unrouted: bool = False,
     workspace_buffer: Optional[torch.Tensor] = None,
+    trtllm_workspace: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """SM90 FP4 MoE: prep, GEMM1, row quantization (token-wise), GEMM2, finalize.
 
@@ -679,6 +684,11 @@ def sm90_fp4_moe(
         Tensors the call returns (``y`` and ``src_permuted`` of ``do_finalize=False``,
         ``src_permuted`` with ``gemm1_lora_delta``) are allocated, not cut from it. Not passed
         to autotuning, which allocates its own.
+    trtllm_workspace : Optional[torch.Tensor]
+        TRT-LLM's ``workspace_buffer`` (checked by ``trtllm_fp4_sm90_moe``, ``do_finalize`` without
+        ``gemm1_lora_delta``) in SM100's allocation: each call and each autotuning candidate cuts
+        the scratch, ``src_permuted`` and ``y`` from offset 0 on 256 B boundaries, a tensor that
+        does not fit allocated. Exclusive with ``workspace_buffer``.
 
     Returns
     -------
@@ -686,6 +696,8 @@ def sm90_fp4_moe(
         See ``do_finalize``; with ``gemm1_lora_delta`` ``[out, src_permuted, activation]`` or
         ``[y, topk_weights, src_permuted, activation]``.
     """
+    if workspace_buffer is not None and trtllm_workspace is not None:
+        raise ValueError("SM90 FP4 MoE: one workspace buffer, not two.")
     act = ActivationType(epi1.act)
     per_token = epi1.fq == Fq.NONE
     num_local = routing.num_local_experts
@@ -754,8 +766,12 @@ def sm90_fp4_moe(
         tuning = _tuning(
             routing.num_experts, x.shape[0], tune_max_num_tokens, inputs, x_sf_swizzled
         )
+        # The candidates' launches get the buffer, as SM100's tuner: each carves from offset 0.
+        tune = (
+            {} if trtllm_workspace is None else {"trtllm_workspace": trtllm_workspace}
+        )
         _, tactic = AutoTuner.get().choose_one(
-            "flashinfer::fp4_moe_sm90", [runner], tuning, inputs
+            "flashinfer::fp4_moe_sm90", [runner], tuning, inputs, **tune
         )
     extra: Dict[str, Any] = {}
     if fc2_input_out is not None:
@@ -764,6 +780,8 @@ def sm90_fp4_moe(
         extra.update(gemm1_lora_delta=gemm1_lora_delta)
     if workspace_buffer is not None:
         extra.update(workspace_buffer=workspace_buffer)
+    if trtllm_workspace is not None:
+        extra.update(trtllm_workspace=trtllm_workspace)
     return runner(inputs, tactic=tactic, **extra)
 
 
@@ -843,6 +861,55 @@ def _check_workspace_buffer(ws: torch.Tensor, device: torch.device, need: int) -
         )
 
 
+def _check_trtllm_workspace(
+    ws: torch.Tensor, device: torch.device, returns_intermediates: bool
+) -> None:
+    """SM100's TRT-LLM launcher checks of a ``workspace_buffer`` (bind_workspace_buffer, its
+    ``do_finalize``), in its order and words; no size check (what does not fit is allocated)."""
+    if returns_intermediates:
+        raise RuntimeError(
+            "workspace_buffer requires do_finalize=True and is incompatible with "
+            "gemm1_lora_delta, because returned intermediates cannot live in a shared workspace."
+        )
+    if ws.dtype not in (torch.int8, torch.uint8):
+        raise RuntimeError(
+            "workspace_buffer dtype must be uint8 or int8, got "
+            f"{str(ws.dtype).replace('torch.', '')}"
+        )
+    if ws.dim() != 1:
+        raise RuntimeError(f"workspace_buffer must be 1-D, got ndim={ws.dim()}")
+    if not ws.is_contiguous():
+        raise RuntimeError("workspace_buffer must be contiguous.")
+    if ws.device.type != "cuda" or ws.device.index != device.index:
+        raise RuntimeError(
+            "workspace_buffer must be on the same CUDA device as hidden_states."
+        )
+    if ws.data_ptr() % _WORKSPACE_ALIGN:
+        raise RuntimeError(
+            f"workspace_buffer must be {_WORKSPACE_ALIGN}-byte aligned "
+            "(torch.empty on CUDA satisfies this)."
+        )
+
+
+class _CarveAllocator:
+    """SM100's TensorAllocator (TRT-LLM launcher): a call's tensors, in allocation order, from
+    offset 0 of the caller's buffer, each on a 256 B boundary; one past its end is allocated
+    (the cursor stays). Without a buffer every tensor is allocated. A buffer shared by launches
+    needs the caller's stream order, as SM100's."""
+
+    def __init__(self, buf: Optional[torch.Tensor]):
+        self.buf = None if buf is None else buf.view(torch.uint8)
+        self.used = 0
+
+    def alloc(self, shape, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        nbytes = math.prod(shape) * dtype.itemsize
+        offset = -(-self.used // _WORKSPACE_ALIGN) * _WORKSPACE_ALIGN
+        if self.buf is None or offset + nbytes > self.buf.shape[0]:
+            return torch.empty(shape, dtype=dtype, device=device)
+        self.used = offset + nbytes
+        return self.buf[offset : offset + nbytes].view(dtype).view(shape)
+
+
 # ---------------------------------------------------------------------------------------
 # Entry points: the SM100+ public APIs' arguments, their M3 tuples on SM90.
 # ---------------------------------------------------------------------------------------
@@ -874,6 +941,18 @@ def trtllm_fp4_sm90_moe(
     ):  # as SM100's launcher
         raise ValueError("SwigluStep takes no gemm1_alpha or gemm1_beta.")
     loc = _check_localized(a, x)
+    if a.get("routing_metadata") is not None and (
+        a.get("gemm1_lora_delta") is not None
+        or a.get("_nfse")
+        or a.get("workspace_buffer") is not None
+        or a.get("fc2_input_out") is not None
+    ):
+        # core.py's check of the SM100 op, which SM90's early return skips; routing_metadata
+        # alone is rejected below with the others SM90 does not support
+        raise ValueError(
+            "routing_metadata supports neither gemm1_lora_delta, fused shared experts, "
+            "workspace_buffer nor fc2_input_out"
+        )
     fo, inter, top_k = a.get("fc2_input_out"), a["intermediate_size"], ids.shape[1]
     if fo is not None and (  # SM100's checks
         not isinstance(fo, (tuple, list)) or len(fo) != 3
@@ -899,7 +978,6 @@ def trtllm_fp4_sm90_moe(
             "gemm1_clamp_limit",
             "gemm2_bias",
             "gemm1_lora_delta",
-            "workspace_buffer",
             "routing_metadata",
         )
         if a.get(n) is not None and n not in params + biases + lora_ok
@@ -1126,6 +1204,9 @@ def trtllm_fp4_sm90_moe(
         epi1 = Sm90EpilogueSpec(
             int(act1), alpha=alpha1, act_params=act_params, bias=bias[0], out_scale=fc2
         )
+    ws = a.get("workspace_buffer")
+    if ws is not None:  # SM100's bind_workspace_buffer, as its launch starts
+        _check_trtllm_workspace(ws, x.device, not finalize or lora is not None)
     return sm90_fp4_moe(
         x.view(torch.uint8),
         x_scale.view(torch.uint8).reshape(tokens, hidden // 16),
@@ -1153,6 +1234,7 @@ def trtllm_fp4_sm90_moe(
         localized=localized,
         fc2_input_out=fo,
         gemm1_lora_delta=lora,
+        trtllm_workspace=ws,
     )
 
 
