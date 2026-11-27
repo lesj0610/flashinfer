@@ -327,7 +327,6 @@ def skip_checks(
         type(moe_impl).__name__ == "FP4Moe"
         and moe_impl.quant_mode == QuantMode.FP4_NVFP4_NVFP4
         and moe_gemm_backend == MoeGemmBackend.TRTLLM
-        and not routing_config.get("num_fused_shared_experts", 0)
         and not activation_params
         and sm90_fp4_moe_runs(
             "trtllm", per_token=False, activation_type=activation_type

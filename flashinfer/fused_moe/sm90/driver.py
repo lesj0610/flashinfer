@@ -745,6 +745,29 @@ def _per_expert(t: torch.Tensor, experts: int) -> torch.Tensor:
     return t.expand(experts) if t.numel() == 1 else t[:experts]
 
 
+def _check_per_expert_param(
+    t: Optional[torch.Tensor], n: str, x: torch.Tensor, experts: int
+) -> None:
+    """SM100's check of a per-expert activation parameter (TRT-LLM's
+    check_optional_per_expert_float_tensor), in its order."""
+    if t is None:
+        return
+    if t.device.type != "cuda":
+        raise RuntimeError(f"{n} must be a CUDA tensor.")
+    if t.device != x.device:
+        raise RuntimeError(f"{n} must be on the same device as hidden_states.")
+    if t.dtype != torch.float32:
+        raise RuntimeError(f"{n} must be float32.")
+    if t.dim() != 1:
+        raise RuntimeError(f"{n} must be 1D.")
+    if t.shape[0] != experts:
+        raise RuntimeError(
+            f"{n} must have shape [local_num_experts + num_fused_shared_experts]."
+        )
+    if not t.is_contiguous():
+        raise RuntimeError(f"{n} must be contiguous.")
+
+
 # ---------------------------------------------------------------------------------------
 # Entry points: the SM100+ public APIs' arguments, their M3 tuples on SM90.
 # ---------------------------------------------------------------------------------------
@@ -813,9 +836,8 @@ def trtllm_fp4_sm90_moe(
             "trtllm", per_token=pt is not None, activation_type=int(act)
         )
         or unsupported
-        or a.get("_nfse")
         or None in (s1, s_gate, s2)
-        or s_gate.dim() > 1
+        or (s_gate.dim() > 1 and not a.get("_nfse"))  # SM100's check below with them
         or a["gemm1_weights"].dtype != torch.uint8
     ):
         raise _not_on_sm90(
@@ -858,7 +880,9 @@ def trtllm_fp4_sm90_moe(
         raise _not_on_sm90(
             "hidden_states_scale other than linear [num_tokens, hidden / 16]"
         )
-    experts, inter = a["local_num_experts"], a["intermediate_size"]
+    # SM100's experts: the local ones, then the fused shared (every token's last slots)
+    nfse = a.get("_nfse") or 0
+    experts, inter = a["local_num_experts"] + nfse, a["intermediate_size"]
     for n, v, padded in (
         ("valid_hidden_size", vh, hidden),
         ("valid_intermediate_size", vi, inter),
@@ -870,11 +894,45 @@ def trtllm_fp4_sm90_moe(
     # GEMM1 and GEMM2 run on the leading valid rows / K of the padded weights, as SM100's
     # roundUp(valid, 128) (at most the padded size); the padding past them is never read.
     ri = inter if vi is None else min(_round_up(vi, 128), inter)
+    # SM100's per-expert checks, in its order: SwigluStep's limit, then with fused shared
+    # experts the expert-major tensors and the other activation parameters
+    first = params if act == ActivationType.SwigluStep else ()
+    for n in first:
+        _check_per_expert_param(a.get(n), n, x, experts)
+    if nfse:
+        each = "must be local_num_experts + num_fused_shared_experts."
+        for n in ("gemm1", "gemm2"):
+            if a[f"{n}_weights"].shape[0] != experts:
+                raise RuntimeError(f"{n} weights dim 0 {each}")
+        # SM100 passes gemm1_lora_delta in gemm1_bias's place, so a delta fails as gemm1_bias
+        g1 = a.get("gemm1_lora_delta")
+        for n, t, d in (
+            ("output1_scales_scalar", s1, 1),
+            ("output1_scales_gate_scalar", s_gate, 1),
+            ("output2_scales_scalar", s2, 1),
+            *(
+                (n, g1 if g1 is not None and n == "gemm1_bias" else a.get(n), 2)
+                for n in biases
+            ),
+        ):
+            if t is not None and t.dim() != d:
+                raise RuntimeError(f"{n} must be {d}D.")
+            if t is not None and t.shape[0] != experts:
+                raise RuntimeError(f"{n} dim 0 {each}")
     for n in params:
         t = a.get(n)
-        if t is not None and (
-            t.dtype != torch.float32 or t.shape != (experts,) or t.device != x.device
-        ):  # as SM100's launcher
+        if n in first:
+            continue
+        if nfse:
+            _check_per_expert_param(t, n, x, experts)
+        elif (
+            t is not None
+            and (
+                t.dtype != torch.float32
+                or t.shape != (experts,)
+                or t.device != x.device
+            )
+        ):  # SM100 checks none of them without fused shared experts; SM90 reads [experts]
             raise ValueError(
                 f"{n} must be FP32 [local_num_experts] on the input's device."
             )
@@ -902,7 +960,8 @@ def trtllm_fp4_sm90_moe(
             or t.device != x.device
         ):
             raise ValueError(
-                f"{n} must be FP32 [local_num_experts, {rows}] on the input's device."
+                f"{n} must be FP32 [local_num_experts + num_fused_shared_experts, "
+                f"{rows}] on the input's device."
             )
     if bias[0] is not None:  # the leading valid rows (shuffled within each 32 rows)
         bias[0] = bias[0][:, : ri * (2 if gated else 1)]
@@ -1001,7 +1060,7 @@ def trtllm_fp4_sm90_moe(
             ids,
             weights,
             ids.shape[1],
-            a["num_experts"],
+            a["num_experts"] + nfse,
             a["local_expert_offset"],
             experts,
         ),
