@@ -50,8 +50,9 @@ class Sm8xProjection:
             _FMT,
             _I32_MAX,
             _aligned,
-            _group_rows,
             _mx_rows,
+            _route_ints,
+            _route_rows,
             _weight,
         )
 
@@ -89,22 +90,22 @@ class Sm8xProjection:
         step = rows
         if rows * kp > _I32_MAX and rows > 128:
             step = max(128, _I32_MAX // kp // 128 * 128)
-        keys = torch.arange(rows, device=device) % heads
+        keys = torch.arange(rows, dtype=torch.int32, device=device) % heads
         self.chunks = []
         for r0 in range(0, rows, step):
             m = min(step, rows - r0)
             max_blocks = m // _ROWS + heads  # each head's last block partial
-            ints = (1 + 2 * max_blocks, max_blocks * _ROWS)
-            meta, rowmap = torch.empty(
+            ints = _route_ints(m, heads, _ROWS, max_blocks)
+            meta, rowmap, workspace = torch.empty(
                 sum(ints), dtype=torch.int32, device=device
             ).split(ints)
-            sk, perm = torch.sort(keys[r0 : r0 + m], stable=True)
-            ip = torch.searchsorted(sk, torch.arange(heads + 1, device=device))
-            _group_rows(ip[:-1], ip[1:], m, _ROWS, max_blocks, meta, rowmap, perm)
-            # prep_f8 writes its own (unrouted) meta and rowmap: kept apart
-            scratch = torch.empty(sum(ints), dtype=torch.int32, device=device).split(
-                ints
+            _route_rows(
+                keys[r0 : r0 + m], heads, _ROWS, max_blocks, meta, rowmap, workspace
             )
+            # prep_f8 writes its own (unrouted) meta and rowmap: kept apart
+            scratch = torch.empty(
+                sum(ints[:2]), dtype=torch.int32, device=device
+            ).split(ints[:2])
             self.chunks.append(
                 (
                     x[r0 : r0 + m].reshape(-1),

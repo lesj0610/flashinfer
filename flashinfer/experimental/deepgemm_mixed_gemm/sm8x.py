@@ -31,7 +31,8 @@ from flashinfer.fused_moe.core import _w4a16_moe_sm80_module
 from flashinfer.gemm.sm8x_fp4_dense import _pad
 from flashinfer.gemm.sm8x_fp8_dense import (
     Sm8xRowsFp4Runner,
-    _group_rows,
+    _route_ints,
+    _route_rows,
     _rows_tuning_config,
 )
 
@@ -99,11 +100,14 @@ class Sm8xMixedGemm:
         )
         self.r = 64 if tactic in (None, -1) else tactic
         self.max_blocks = m // self.r + 1
-        ints = (1 + 2 * self.max_blocks, self.max_blocks * self.r)
-        self.meta, self.rowmap = torch.empty(
+        ints = _route_ints(m, 1, self.r, self.max_blocks)
+        self.meta, self.rowmap, workspace = torch.empty(
             sum(ints), dtype=torch.int32, device=device
         ).split(ints)
-        _group_rows(starts, ends, m, self.r, self.max_blocks, self.meta, self.rowmap)
+        _route_rows(
+            torch.zeros(m, dtype=torch.int32, device=device), 1, self.r,
+            self.max_blocks, self.meta, self.rowmap, workspace,
+        )  # fmt: skip
         # the activation in its blocks' row order (here the rows' own), the rest zero
         self.act = torch.zeros(
             (self.max_blocks * self.r, k), dtype=torch.bfloat16, device=device
