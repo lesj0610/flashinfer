@@ -3911,15 +3911,9 @@ def run_moe_test(
             gemm1_lora_delta if gemm1_lora_delta is not None else gemm1_lora_args
         ),
         moe_gemm_backend=moe_gemm_backend,
-        bias_or_activation_params=any(
-            t is not None
-            for t in (gemm1_bias, gemm2_bias)
-            + (
-                ()
-                if activation_type in (ActivationType.Situ, ActivationType.SwigluStep)
-                else (gemm1_alpha, gemm1_beta, gemm1_clamp_limit)
-            )
-        ),
+        activation_params=activation_type
+        not in (ActivationType.Situ, ActivationType.SwigluStep)
+        and any(t is not None for t in (gemm1_alpha, gemm1_beta, gemm1_clamp_limit)),
     )
 
     torch.cuda.synchronize()

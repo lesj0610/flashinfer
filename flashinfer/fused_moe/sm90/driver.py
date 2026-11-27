@@ -572,11 +572,12 @@ def trtllm_fp4_sm90_moe(
         a[f"output{i}_scalar"] for i in ("1_scale", "1_scale_gate", "2_scale")
     )
     recipe = resolve_nvfp4_4over6(a["nvfp4_4over6"]) if pt is not None else None
-    # As SM100: SiTU's alpha, beta and limit, SwigluStep's limit (per tensor here)
+    # As SM100: SiTU's alpha, beta and limit, SwigluStep's limit, the biases (per tensor here)
     params = {
         ActivationType.Situ: ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
         ActivationType.SwigluStep: ("gemm1_clamp_limit",),
     }.get(act, ())
+    biases = ("gemm1_bias", "gemm2_bias")
     if act == ActivationType.SwigluStep and (
         a.get("gemm1_alpha") is not None or a.get("gemm1_beta") is not None
     ):  # as SM100's launcher
@@ -597,7 +598,7 @@ def trtllm_fp4_sm90_moe(
             "valid_intermediate_size",
             "localized_weights",
         )
-        if a.get(n) is not None and (pt is not None or n not in params)
+        if a.get(n) is not None and (pt is not None or n not in params + biases)
     ]
     if (
         x.dtype != torch.uint8
@@ -636,6 +637,20 @@ def trtllm_fp4_sm90_moe(
                 f"{n} must be FP32 [local_num_experts] on the input's device."
             )
     gated = act.is_gated
+    # TRT-LLM's biases: FP32 on the weights' (shuffled) rows, in accumulator units
+    bias = [a.get(n) for n in biases]
+    for n, t, rows in zip(
+        biases, bias, (inter * (2 if gated else 1), hidden), strict=True
+    ):
+        if t is not None and (
+            t.dtype != torch.float32
+            or t.shape != (experts, rows)
+            or t.device != x.device
+        ):
+            raise ValueError(
+                f"{n} must be FP32 [local_num_experts, {rows}] on the input's device."
+            )
+    bias = [None if t is None else t.contiguous() for t in bias]
     finalize, out = a["do_finalize"], a["output"]
     if (
         finalize
@@ -685,6 +700,7 @@ def trtllm_fp4_sm90_moe(
             recipe=fp4_sm90_recipe_bits(None),
             alpha=alpha1,
             act_params=act_params,
+            bias=bias[0],
             fq_global=fc2.contiguous(),
         )
     else:
@@ -704,7 +720,9 @@ def trtllm_fp4_sm90_moe(
             experts,
         ),
         epi1,
-        Sm90EpilogueSpec(int(ActivationType.Identity), gemm2=True, alpha=alpha2),
+        Sm90EpilogueSpec(
+            int(ActivationType.Identity), gemm2=True, alpha=alpha2, bias=bias[1]
+        ),
         out=out if finalize else None,
         tactic=a.get("tactic", -1),
         recipe=recipe,

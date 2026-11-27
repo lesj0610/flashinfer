@@ -436,14 +436,19 @@ void fp4_moe_sm90_run(
     TVM_FFI_ICHECK_EQ(p->value().size(0), num_local_experts)
         << "activation parameters must be [num_local_experts]";
   }
-  // Per-expert biases of the GEMM rows, in the output dtype
-  for (const auto& [b, b_rows] : {std::pair{&bias1, a1.rows}, std::pair{&bias2, a2.rows}}) {
+  // Per-expert biases of the GEMM rows: the output dtype on the logical rows, or TRT-LLM's FP32
+  // on the rows of TRT-LLM shuffled weights (accumulator units, per tensor)
+  for (const auto& [b, a] : {std::pair{&bias1, &a1}, std::pair{&bias2, &a2}}) {
     if (!b->has_value()) continue;
     CHECK_INPUT(b->value());
     CHECK_DEVICE(b->value(), x);
-    TVM_FFI_ICHECK(b->value().dtype() == y.dtype()) << "biases must have the output dtype";
+    const bool trtllm_rows =
+        afmt_trtllm(a->fmt) && (a->pair == Pair::kNone || a->pair == Pair::kTrtllmW31);
+    TVM_FFI_ICHECK(b->value().dtype() == y.dtype() ||
+                   (b->value().dtype() == dl_float32 && trtllm_rows && !per_token))
+        << "biases must have the output dtype, or be FP32 per tensor on TRT-LLM shuffled weights";
     CHECK_DIM(2, b->value());
-    TVM_FFI_ICHECK(b->value().size(0) == num_local_experts && b->value().size(1) == b_rows)
+    TVM_FFI_ICHECK(b->value().size(0) == num_local_experts && b->value().size(1) == a->rows)
         << "biases must be [num_local_experts, GEMM rows]";
   }
 
@@ -547,6 +552,7 @@ void fp4_moe_sm90_run(
   g1.epi.act_z = static_cast<const float*>(ptr(act_z));
   g1.epi.bias = ptr(bias1);
   g1.epi.bias_f16 = y.dtype() == dl_float16;
+  g1.epi.bias_trtllm = bias1.has_value() && bias1.value().dtype() == dl_float32;
   g1.epi.out = at(l.act);
   g1.epi.out_ld = inter;
   // fq_global: per tensor GEMM1's output global scale, per token the row quantization's inverse
@@ -599,6 +605,7 @@ void fp4_moe_sm90_run(
   g2.epi.tok_scale = tok2;
   g2.epi.bias = ptr(bias2);
   g2.epi.bias_f16 = y.dtype() == dl_float16;
+  g2.epi.bias_trtllm = bias2.has_value() && bias2.value().dtype() == dl_float32;
   g2.epi.out = y.data_ptr();
   g2.epi.out_ld = y.stride(0);
   g2.epi.fq_global = nullptr;

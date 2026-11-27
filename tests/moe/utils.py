@@ -314,7 +314,7 @@ def skip_checks(
     zero_hidden_states=False,
     gemm1_lora_delta=None,
     moe_gemm_backend=None,
-    bias_or_activation_params=False,
+    activation_params=False,
 ):
     """Common skip logic for all tests."""
     from tests.moe.trtllm_gen_fused_moe_utils import MoeGemmBackend
@@ -329,7 +329,7 @@ def skip_checks(
         and moe_gemm_backend == MoeGemmBackend.TRTLLM
         and gemm1_lora_delta is None
         and not routing_config.get("num_fused_shared_experts", 0)
-        and not bias_or_activation_params
+        and not activation_params
         and sm90_fp4_moe_runs(
             "trtllm", per_token=False, activation_type=activation_type
         )

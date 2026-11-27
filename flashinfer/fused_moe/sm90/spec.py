@@ -126,7 +126,8 @@ class Sm90EpilogueSpec:
     # GEMM1 activation parameters x, y, z: FP32 [num_local_experts] each or None (default)
     # (SwiGLU alpha / beta / limit, SiTU beta / linear beta)
     act_params: Tuple[Optional[torch.Tensor], ...] = (None, None, None)
-    # per local expert [num_local_experts, GEMM rows] in the output dtype
+    # per local expert [num_local_experts, GEMM rows]: the output dtype on the logical rows, or
+    # FP32 on the rows of TRT-LLM shuffled weights in accumulator units (TRT-LLM's, per tensor)
     bias: Optional[torch.Tensor] = None
     # device FP32 scalar or [num_local_experts]: Fq.NVFP4's global scale (None = 1); with Fq.NONE
     # on a token-wise GEMM1, the inverse global scale of the GEMM2 input rows (scalar, None = the

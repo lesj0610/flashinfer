@@ -166,7 +166,8 @@ struct EpiArgs {
   const float* act_x;
   const float* act_y;
   const float* act_z;
-  const void* bias;        // per expert [rows], BF16 or FP16 (bias_f16); null = none
+  const void* bias;        // per expert [rows], BF16 or FP16 (bias_f16) or FP32 (bias_trtllm);
+                           // null = none
   void* out;               // output
   int64_t out_ld;          // elements between output rows
   const float* fq_global;  // device fp32 scalar or per expert (fq_per_expert): global scale of
@@ -177,6 +178,7 @@ struct EpiArgs {
   uint8_t out_f16;         // 1: FP16 output, 0: BF16 output
   uint8_t out_tiled;       // 1: write GEMM2 input tiles (expert order, SW128); 0: row-major
   uint8_t bias_f16;        // 1: FP16 bias, 0: BF16 bias
+  uint8_t bias_trtllm;     // 1: TRT-LLM's FP32 bias on the weight's rows, accumulator units
   uint8_t fq_per_expert;   // 1: fq_global is [E_local] (TRT-LLM's per-expert scalars)
 };
 

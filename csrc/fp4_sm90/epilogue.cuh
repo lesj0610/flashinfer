@@ -50,6 +50,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "a_layout.cuh"
 #include "params.cuh"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/common.h"
 #include "tensorrt_llm/kernels/quantization_utils.cuh"
@@ -411,19 +412,27 @@ struct Epilogue {
                             : m0 + wg * (kCtaM / 2) + 16 * warp + lr;
     char* const outb = static_cast<char*>(ep.out);
 
-    // Bias (BF16 or FP16, ep.bias_f16): gated [up; gate] halves of the expert's rows ([mi][0]
-    // gate, [mi][1] up); plain [mi][half] for columns + 8 half.
+    // Bias of [mi][0] gate, [mi][1] up (gated) or [mi][half] for columns + 8 half (plain). BF16
+    // or FP16 (ep.bias_f16): the logical rows, gated [up; gate] halves. TRT-LLM's
+    // (ep.bias_trtllm): FP32 on the weight's rows (w3/w1 interleave, shuffle) in accumulator
+    // units, so x alpha.
     float bb[kM64][2];
 #pragma unroll
     for (int mi = 0; mi < kM64; ++mi)
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         const int c = kGated ? col0 + 32 * mi : col0 + 64 * mi + 8 * h;
-        const int64_t o = bias0 + (kGated && h == 0 ? int64_t(ncols) + c : int64_t(c));
-        bb[mi][h] = bias == nullptr || c >= ncols ? 0.f
-                    : ep.bias_f16
-                        ? epi::to_f<half>(static_cast<const half*>(bias)[o])
-                        : epi::to_f<__nv_bfloat16>(static_cast<const __nv_bfloat16*>(bias)[o]);
+        if (bias == nullptr || c >= ncols) {
+          bb[mi][h] = 0.f;
+        } else if (ep.bias_trtllm) {
+          const int q = kGated ? 2 * c + (h == 0 ? 1 : 0) : c;
+          bb[mi][h] = static_cast<const float*>(bias)[bias0 + trtllm_perm(q)] * alpha;
+        } else {
+          const int64_t o = bias0 + (kGated && h == 0 ? int64_t(ncols) + c : int64_t(c));
+          bb[mi][h] = ep.bias_f16
+                          ? epi::to_f<half>(static_cast<const half*>(bias)[o])
+                          : epi::to_f<__nv_bfloat16>(static_cast<const __nv_bfloat16*>(bias)[o]);
+        }
       }
 
     // Value before the activation (rs: alpha x s of the row, per token).
