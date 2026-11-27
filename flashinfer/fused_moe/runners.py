@@ -7675,18 +7675,22 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         from flashinfer.tllm_enums import RoutingMethodType
         from flashinfer.utils import get_compute_capability
 
-        if not is_prims_ts_available():
-            raise RuntimeError(
-                "PrimsTsRunner requires nvidia-cutlass-dsl with "
-                "cutlass.experimental.primitives and task_scheduling."
-            )
         compute_capability = get_compute_capability(self.device)
         arch = compute_capability[0] * 10 + compute_capability[1]
-        if arch not in _PRIMS_TS_ARCHS:
-            raise NotImplementedError(
-                f"{type(self).__name__} is enabled only on SM100/SM103, "
-                f"got SM{compute_capability[0]}{compute_capability[1]}."
-            )
+        body = self._sm8x_body_class()
+        # The SM8x pipeline replaces the Prims-TS GEMMs and their DSL.
+        if body is None or arch not in body._supported_archs:
+            if not is_prims_ts_available():
+                raise RuntimeError(
+                    "PrimsTsRunner requires nvidia-cutlass-dsl with "
+                    "cutlass.experimental.primitives and task_scheduling."
+                )
+            if arch not in _PRIMS_TS_ARCHS:
+                raise NotImplementedError(
+                    f"{type(self).__name__} is enabled only on SM100/SM103 (the FP8 "
+                    "pairs also on SM80/86/87/89), "
+                    f"got SM{compute_capability[0]}{compute_capability[1]}."
+                )
         if self.config.experts.intermediate_size % 128 != 0:
             raise NotImplementedError(
                 f"{type(self).__name__} requires intermediate_size % 128 == 0, "
@@ -7775,6 +7779,25 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
         self._inner: Any = None
 
+    def _sm8x_body_class(self) -> Any:
+        from .sm8x_fp8_moe import (
+            Sm8xPrimsTsDeepSeekFp8MoE,
+            Sm8xTrtllmFp8PerTensorMoE,
+            Sm8xTrtllmMxfp8MoE,
+        )
+
+        return {
+            (
+                QuantFormat.FP8PerTensor,
+                QuantFormat.FP8PerTensor,
+            ): Sm8xTrtllmFp8PerTensorMoE,
+            (
+                QuantFormat.DeepSeekFp8,
+                QuantFormat.DeepSeekFp8,
+            ): Sm8xPrimsTsDeepSeekFp8MoE,
+            (QuantFormat.MXFP8, QuantFormat.MXFP8): Sm8xTrtllmMxfp8MoE,
+        }.get(self.config.quant.pair)
+
     def _weight_layout(self) -> int:
         from flashinfer.tllm_enums import WeightLayout
 
@@ -7844,6 +7867,8 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
         self._require_built()
+        if self._sm8x is not None:
+            return [(0, 0)]  # one pipeline; its forward ignores the tactic
         # Under autotune the pack's ``inputs_pre_hook`` has already synced the
         # inner extras; a direct call with the packed list syncs here.
         self._sync_inner_static_extras(getattr(inputs, "launch_state", None))
@@ -7966,14 +7991,6 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self._validate_pack_contract(act)
 
         from flashinfer.tllm_enums import RoutingMethodType
-        from flashinfer.prims_ts.moe.support import (
-            is_prims_ts_bf16_supported,
-            is_prims_ts_fp8_block_scale_supported,
-            is_prims_ts_fp8_per_tensor_supported,
-            is_prims_ts_mxfp4_bf16_supported,
-            is_prims_ts_mxfp4_mxfp8_supported,
-            is_prims_ts_nvfp4_supported,
-        )
         from .core import MoeRunnerInputs
 
         routing = self.config.routing
@@ -8117,6 +8134,18 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                 ),
             )
 
+        if self._sm8x is not None:
+            return self._pack_sm8x(moe_inputs, static_kwargs, v, act, hidden_size)
+
+        from flashinfer.prims_ts.moe.support import (
+            is_prims_ts_bf16_supported,
+            is_prims_ts_fp8_block_scale_supported,
+            is_prims_ts_fp8_per_tensor_supported,
+            is_prims_ts_mxfp4_bf16_supported,
+            is_prims_ts_mxfp4_mxfp8_supported,
+            is_prims_ts_nvfp4_supported,
+        )
+
         self._ensure_inner(hidden_size)
         if is_nvfp4:
             support_fn = is_prims_ts_nvfp4_supported
@@ -8162,6 +8191,63 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             moe_inputs.to_list(),
             tuning_config=tuning_config,
             launch_state=launch_state,
+        )
+
+    def _pack_sm8x(
+        self,
+        moe_inputs: Any,
+        static_kwargs: dict[str, Any],
+        view: dict,
+        act: MoEActivationPack,
+        hidden_size: int,
+    ) -> List[torch.Tensor]:
+        """``pack_inputs``' tail for the SM8x pipeline, in place of the inner
+        Prims-TS runner and its support check."""
+        from ..tllm_enums import Fp8QuantizationType
+        from .shared.tuning import make_moe_tuning_config, moe_topk_ids_init
+
+        if hidden_size % 128:
+            # The rest of the support check's limits are the runner's and the
+            # pipeline's own.
+            raise RuntimeError(
+                "Config not supported by Prims-TS kernel (hidden_size and "
+                "intermediate_size must be multiples of 128)"
+            )
+        if self._pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor):
+            # The TRT-LLM runner's names of the three scales.
+            for name in (
+                "output1_scales_scalar",
+                "output1_scales_gate_scalar",
+                "output2_scales_scalar",
+            ):
+                static_kwargs[name] = view[name]
+        self._sm8x._ensure_workspace(moe_inputs.hidden_states.shape[0], hidden_size)
+        # The inner Prims-TS runners' tuning config.
+        num_experts = self.config.routing.num_experts
+        tuning_config = make_moe_tuning_config(
+            moe_inputs,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            fp8_quantization_type={
+                (
+                    QuantFormat.DeepSeekFp8,
+                    QuantFormat.DeepSeekFp8,
+                ): Fp8QuantizationType.DeepSeekFp8,
+                (QuantFormat.MXFP8, QuantFormat.MXFP8): Fp8QuantizationType.MxFp8,
+            }.get(self._pair, Fp8QuantizationType.NoneFp8),
+            init_packed_topk_ids=moe_topk_ids_init(
+                num_experts,
+                packed=act.routing_input_mode != RoutingInputMode.UnpackedPrecomputed,
+            ),
+            tune_max_num_tokens=self._tune_max_num_tokens,
+            keep_empty_expert_weights_static=True,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
+        return _TrtllmPackedInputs(
+            moe_inputs.to_list(),
+            tuning_config=tuning_config,
+            launch_state=_TrtllmLaunchState(static_kwargs),
         )
 
 

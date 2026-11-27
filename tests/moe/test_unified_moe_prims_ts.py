@@ -78,7 +78,25 @@ _NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
 _BF16 = QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)
 
 
+# The pairs PrimsTsRunner runs on SM80/86/87/89, on the TRT-LLM runners' SM8x
+# pipeline (no nvidia-cutlass-dsl).
+_SM8X_PAIRS = (
+    (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+    (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+    (QuantFormat.MXFP8, QuantFormat.MXFP8),
+)
+
+
+def _sm8x_gpu() -> bool:
+    return (
+        torch.cuda.is_available()
+        and get_compute_capability(torch.device("cuda"))[0] == 8
+    )
+
+
 def _prims_ts_gpu_available() -> bool:
+    if _sm8x_gpu():
+        return True
     if not torch.cuda.is_available() or not is_prims_ts_available():
         return False
     return get_compute_capability(torch.device("cuda")) in ((10, 0), (10, 3))
@@ -86,7 +104,8 @@ def _prims_ts_gpu_available() -> bool:
 
 prims_ts_unified_required = pytest.mark.skipif(
     not _prims_ts_gpu_available(),
-    reason="Unified Prims-TS MoE requires SM100/SM103 and nvidia-cutlass-dsl",
+    reason="Unified Prims-TS MoE requires SM100/SM103 and nvidia-cutlass-dsl, "
+    "or SM80/86/87/89 for the FP8 pairs",
 )
 
 
@@ -441,6 +460,15 @@ class TestPrimsTsUnifiedValidation:
 
 @prims_ts_unified_required
 class TestPrimsTsUnifiedGpu:
+    @pytest.fixture(autouse=True)
+    def _sm8x_pairs_only(self, request):
+        if not _sm8x_gpu():
+            return
+        callspec = getattr(request.node, "callspec", None)
+        quant = callspec.params.get("quant") if callspec is not None else None
+        if quant is None or quant.pair not in _SM8X_PAIRS:
+            pytest.skip("Prims-TS runs only the FP8 pairs on SM80/86/87/89")
+
     def test_nvfp4_layer_and_direct_runner_match_reference(self):
         act, weights, config, tensors = _make_packs_and_config(
             16, max_tokens=16, **SMALL

@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch.utils.weak import WeakIdKeyDictionary
 
 from ..gemm.sm8x_fp4_dense import _unswizzle
+from ..utils import get_shuffle_matrix_a_row_indices
 from ..gemm.sm8x_fp8_dense import (
     _run_group_groupwise,
     sm8x_grouped_mm_fp4,
@@ -1027,6 +1028,65 @@ class Sm8xTrtllmDeepSeekFp8MoE(_Sm8xTrtllmFp8MoEBase):
             1,
         )
         return out
+
+
+class Sm8xPrimsTsDeepSeekFp8MoE(Sm8xTrtllmDeepSeekFp8MoE):
+    """``PrimsTsRunner`` with DeepSeek FP8 on SM8x: the TRT-LLM DeepSeek pipeline over
+    the Prims-TS weights, whose E4M3 rows ``shuffle_matrix_a`` reordered with epilogue
+    tile 64 (within 16-row blocks; the 128x128 scales stay unshuffled). The order stays
+    within every 128-row scale block and alike in both halves of ``[up | gate]``, so
+    GEMM1 yields the intermediate's columns and GEMM2 the hidden ones in the shuffled
+    order: the intermediate goes back to GEMM2's unshuffled K order, and the output
+    (after the finalize, which acts per column) to the hidden order."""
+
+    def __init__(self, config: MoEConfig, device: torch.device) -> None:
+        super().__init__(config, device)
+        self._column_orders: Dict[int, torch.Tensor] = {}
+
+    def _column_order(self, size: int) -> torch.Tensor:
+        """``order`` with ``unshuffled[:, c] == shuffled[:, order[c]]`` for ``size``
+        shuffled columns."""
+        order = self._column_orders.get(size)
+        if order is None:
+            shuffled_from = get_shuffle_matrix_a_row_indices(torch.empty(size, 0), 64)
+            order = torch.empty_like(shuffled_from)
+            order[shuffled_from] = torch.arange(size)
+            order = order.to(self.device)
+            self._column_orders[size] = order
+        return order
+
+    def _allocate_workspace(
+        self, bucket: int, hidden_size: int
+    ) -> _GroupedGemmWorkspace:
+        workspace = super()._allocate_workspace(bucket, hidden_size)
+        # Outside any graph capture, like the workspace.
+        self._column_order(self.config.experts.intermediate_size)
+        self._column_order(hidden_size)
+        return workspace
+
+    def _gemm2(self, inputs, layout, workspace, intermediate, tactic) -> torch.Tensor:
+        order = self._column_orders[intermediate.shape[1]]
+        return super()._gemm2(
+            inputs, layout, workspace, intermediate.index_select(1, order), tactic
+        )
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        if not self.config.finalize.do_finalize:
+            result = super().forward(inputs, tactic, do_preparation, **kwargs)
+            result[0] = result[0].index_select(
+                1, self._column_orders[result[0].shape[1]]
+            )
+            return result
+        out = inputs[-1]
+        staged = torch.empty_like(out)
+        super().forward([*inputs[:-1], staged], tactic, do_preparation, **kwargs)
+        return torch.index_select(staged, 1, self._column_orders[out.shape[1]], out=out)
 
 
 class Sm8xTrtllmFp8PerTensorMoE(_Sm8xTrtllmFp8MoEBase):

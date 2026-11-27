@@ -1159,12 +1159,13 @@ class PrimsTsConfig:
     dictionary under ``"trtllm_fp8_block"``.
 
     The GEMM middle stage is Prims-TS; routing and finalize stay on the
-    TRT-LLM Gen path.
+    TRT-LLM Gen path. On SM80/86/87/89 the FP8PerTensor, DeepSeekFp8 and MXFP8
+    pairs run the same forward on the SM8x pipeline of their TRT-LLM runner.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in _PRIMS_TS_ARCHS
+        return arch in _PRIMS_TS_ARCHS or arch in (80, 86, 87, 89)
 
     @staticmethod
     def prepare_weights(
