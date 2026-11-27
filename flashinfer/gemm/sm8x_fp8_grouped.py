@@ -117,7 +117,7 @@ class Sm8xContiguousGroupGemm:
     def __init__(self, m: int, k: int, a_dtype: torch.dtype, b, b_scale) -> None:
         from ..fused_moe.core import _w4a16_moe_sm80_module
         from .sm8x_fp4_dense import _pad
-        from .sm8x_fp8_dense import _FMT, _I32_MAX, _weight
+        from .sm8x_fp8_dense import _E4M3, _FMT, _I32_MAX, GW_E4M3_ALPHA, _weight
 
         groups, n = int(b.shape[0]), int(b.shape[1])
         device = b.device
@@ -126,6 +126,8 @@ class Sm8xContiguousGroupGemm:
         self.fmt = (_FMT[a_dtype], _FMT[b.dtype])
         self.w = _weight(b.transpose(1, 2), k, n, False)
         self.b_scale = b_scale
+        # E4M3 weights: their scales over 2^8 per call, alpha 2^8 (gw_e4m3_weight_scales)
+        self.gsb = torch.empty_like(b_scale) if b.dtype == _E4M3 else None
         # the GEMM's activation offsets are 32-bit: chunks of whole 128-row blocks
         step = m
         if m * kp > _I32_MAX and m > 128:
@@ -140,11 +142,19 @@ class Sm8xContiguousGroupGemm:
             ).split(ints)
             self.chunks.append((r0, rows, blocks, meta, rowmap))
         self.act = torch.empty((min(step, m), kp), dtype=torch.bfloat16, device=device)
-        self.alpha = torch.ones(1, dtype=torch.float32, device=device)
+        self.alpha = torch.full(
+            (1,), GW_E4M3_ALPHA if self.gsb is not None else 1.0,
+            dtype=torch.float32, device=device,
+        )  # fmt: skip
         self.module = _w4a16_moe_sm80_module(None, False, None, False)
 
     def __call__(self, a, a_scale, m_indices, out) -> None:
+        from .sm8x_fp8_dense import gw_e4m3_weight_scales
+
         w, rs, ks, bs = self.w
+        b_scale = self.b_scale
+        if self.gsb is not None:
+            b_scale = gw_e4m3_weight_scales(b_scale, out=self.gsb)
         x = a.view(torch.uint8)
         for r0, rows, blocks, meta, rowmap in self.chunks:
             act = self.act[:rows]
@@ -158,7 +168,7 @@ class Sm8xContiguousGroupGemm:
             self.module.gemm_f8(
                 w, self.alpha, None, act, meta, rowmap, out[r0 : r0 + rows], _ROWS,
                 self.n, self.k, blocks, self.groups, rs, ks, bs, self.fmt[1], False, None,
-                None, False, 0, a_scale[r0:], self.b_scale, 1, None,
+                None, False, 0, a_scale[r0:], b_scale, 1, None,
             )  # fmt: skip
 
 
