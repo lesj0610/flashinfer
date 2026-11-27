@@ -1837,8 +1837,9 @@ class _CutlassRunnerBase(MoERunner):
         # Retain geometrically sized buffers because captured CUDA graphs keep
         # their raw pointers. Deterministic capacities make a request shape
         # select the same pointer regardless of allocation history.
-        self._workspace_cache: dict[tuple[int, int], torch.Tensor] = {}
-        self._workspace: torch.Tensor | None = None
+        # The SM8x pipeline (``_sm8x``) shares its stage buffers through these.
+        self._workspace_cache: dict[tuple[int, int], Any] = {}
+        self._workspace: Any = None
         self._workspace_num_tokens = 0
         self._workspace_hidden_size: int | None = None
 
@@ -2075,7 +2076,9 @@ class _CutlassRunnerBase(MoERunner):
 
     def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
         if self._sm8x is not None:
-            self._sm8x._ensure_workspace(num_tokens, hidden_size)
+            # The pipeline's stage buffers, cached per token bucket.
+            self._workspace = self._sm8x._ensure_workspace(num_tokens, hidden_size)
+            self._workspace_cache = self._sm8x._workspace_cache
             return
         max_num_tokens = self.config.execution.tune_max_num_tokens
         if num_tokens > max_num_tokens:
@@ -2638,6 +2641,12 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
             inputs[10].view(torch.int32),
             inputs[11],
         ]
+
+    @staticmethod
+    def _sm8x_body_class() -> Any:
+        from .sm8x_fp8_moe import Sm8xCutlassNvfp4MoE
+
+        return Sm8xCutlassNvfp4MoE
 
 
 class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
@@ -4044,16 +4053,17 @@ class _CuTileFp8Runner(CuTileBf16Runner):
         return Sm8xCuTileFp8PerTensorMoE
 
     def _uses_cuda_tile(self) -> bool:
-        return self._sm8x is None
+        body = self._sm8x_body_class()
+        return body is None or self._device_arch not in body._supported_archs
 
     def _check_support(self) -> None:
-        body = self._sm8x_body_class()
-        if body is not None and self._device_arch in body._supported_archs:
-            # Keep a built pipeline across repeated check_support calls.
+        super()._check_support()
+        if not self._uses_cuda_tile():
+            # Attach once the runner checks have passed; a repeated check keeps
+            # the attached (and possibly built) pipeline.
+            body = self._sm8x_body_class()
             if type(self._sm8x) is not body:
                 self._sm8x = body(self.config, self.device)
-        super()._check_support()
-        if self._sm8x is not None:
             self._sm8x.check_support()
 
     def _build(self) -> None:
@@ -6232,7 +6242,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         from .api import QuantFormat
         from .sm8x_fp8_moe import Sm8xTrtllmDeepSeekFp8MoE, Sm8xTrtllmMxfp8MoE
 
-        if self._pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
+        if self.config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
             return Sm8xTrtllmMxfp8MoE
         return Sm8xTrtllmDeepSeekFp8MoE
 
