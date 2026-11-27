@@ -351,18 +351,19 @@ __global__ void __launch_bounds__(kTileThreads) prep_tiles(PrepArgs a, TileParam
       }
     } else if constexpr (kMode == TileMode::kFp4) {
       uint8_t const* const xrow = static_cast<uint8_t const*>(a.x) + int64_t(token) * a.x_ld;
-      int const sf_cols = k / 16;
+      int const k16 = k / 16;  // 16-value groups of the logical K
       for (int j = threadIdx.x; j < chunks; j += kTileThreads) {
         uint4 lo = zero, hi = zero;
-        if (j < sf_cols) {
+        if (j < k16) {
           uint64_t const codes = *reinterpret_cast<uint64_t const*>(xrow + j * 8);
           if (a.x_fmt == XFmt::kMxfp4Swz128x4) {  // one UE8M0 SF per 32 values
-            dequant16_mx(codes, a.x_sf[tk::get_sf_out_offset_128x4(token, j / 2, k / 32)], lo, hi);
+            dequant16_mx(codes, a.x_sf[tk::get_sf_out_offset_128x4(token, j / 2, a.x_sf_cols)], lo,
+                         hi);
           } else {
-            int64_t const sf_off = a.x_fmt == XFmt::kNvfp4Linear ? int64_t(token) * sf_cols + j
+            int64_t const sf_off = a.x_fmt == XFmt::kNvfp4Linear ? int64_t(token) * a.x_sf_cols + j
                                    : a.x_fmt == XFmt::kNvfp4Swz128x4
-                                       ? tk::get_sf_out_offset_128x4(token, j, sf_cols)
-                                       : tk::get_sf_out_offset_8x4(token, j, sf_cols);
+                                       ? tk::get_sf_out_offset_128x4(token, j, a.x_sf_cols)
+                                       : tk::get_sf_out_offset_8x4(token, j, a.x_sf_cols);
             dequant16(codes, a.x_sf[sf_off], a.f16, lo, hi);
           }
         }
@@ -555,9 +556,12 @@ inline void launch_fp4_sm90_prep(const PrepArgs& a, cudaStream_t stream) {
                        "fp4_sm90 prep: an FP4 input is neither quantized again nor given a "
                        "per-token scale here");
       FLASHINFER_CHECK(
-          a.x_sf != nullptr && a.k % (mx_in ? 32 : 16) == 0 && a.x_ld % 8 == 0 && aligned(a.x, 8),
-          mx_in ? "fp4_sm90 prep: FP4 input needs x_sf, k % 32 == 0 and 8-byte rows"
-                : "fp4_sm90 prep: FP4 input needs x_sf, k % 16 == 0 and 8-byte rows");
+          a.x_sf != nullptr && a.k % (mx_in ? 32 : 16) == 0 && a.x_ld % 8 == 0 && aligned(a.x, 8) &&
+              a.x_sf_cols >= a.k / (mx_in ? 32 : 16),
+          mx_in ? "fp4_sm90 prep: FP4 input needs x_sf, k % 32 == 0, 8-byte rows and k / 32 scale "
+                  "columns"
+                : "fp4_sm90 prep: FP4 input needs x_sf, k % 16 == 0, 8-byte rows and k / 16 scale "
+                  "columns");
       FLASHINFER_CHECK(!mx_in || !a.f16,
                        "fp4_sm90 prep: an MXFP4 input needs BF16 B (FP16 cannot hold 2^(e-127))");
     } else {

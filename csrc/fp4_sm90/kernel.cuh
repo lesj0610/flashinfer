@@ -95,6 +95,8 @@ inline void check_fp4_sm90_gemm_args(const GemmArgs& g) {
                                          << " does not match the kernel (" << int(kF) << ")";
   TVM_FFI_CHECK(a.rows > 0 && a.k > 0 && a.rows_phys > 0, ValueError)
       << "SM90 FP4 GEMM: empty weight (rows " << a.rows << ", k " << a.k << ")";
+  TVM_FFI_CHECK(a.rows_phys >= a.rows, ValueError)
+      << "SM90 FP4 GEMM: physical rows " << a.rows_phys << " must be >= rows " << a.rows;
   TVM_FFI_CHECK(a.k % sf_block(kF) == 0, ValueError)
       << "SM90 FP4 GEMM: K " << a.k << " must be a multiple of the scale block " << sf_block(kF);
   TVM_FFI_CHECK(a.k_phys >= a.k && a.k_phys % 16 == 0, ValueError)

@@ -536,10 +536,11 @@ def sm90_fp4_moe(
     ----------
     x : torch.Tensor
         BF16/FP16 ``[num_tokens, hidden]`` (quantized in prep with ``recipe`` under
-        ``x_global``) or NVFP4 codes uint8 ``[num_tokens, hidden / 2]``.
+        ``x_global``) or NVFP4 codes uint8 ``[num_tokens, >= hidden / 2]``, with ``hidden``
+        GEMM1's K (``w1.k``): GEMM1 reads the leading ``hidden`` values of a wider row.
     x_sf : Optional[torch.Tensor]
-        E4M3 block scales of NVFP4 ``x``: linear ``[num_tokens, hidden / 16]`` or
-        128x4-swizzled (``x_sf_swizzled``).
+        E4M3 block scales of NVFP4 ``x``, as wide as ``x``: linear or 128x4-swizzled
+        (``x_sf_swizzled``).
     w1, w2 : Sm90WeightView
         GEMM1 (gated: gate/up pair) and GEMM2 weights in an SM100+ entry point's layout.
     routing : Sm90Routing
@@ -552,7 +553,8 @@ def sm90_fp4_moe(
     epi2 : Sm90EpilogueSpec
         GEMM2: ``alpha`` FP32 ``[num_local_experts]``, ``bias``, ``out_dtype`` BF16 or FP16.
     out : Optional[torch.Tensor]
-        Finalized output ``[num_tokens, hidden]`` (allocated if None).
+        Finalized output ``[num_tokens, <= hidden]``, the leading columns of GEMM2's rows
+        (allocated ``hidden`` wide if None).
     tactic : tuple or int
         ``(cta_m, n, stages)``; -1 autotunes (or the untuned default outside tuning).
     recipe : Optional[NVFP44Over6Config]
@@ -704,8 +706,6 @@ def trtllm_fp4_sm90_moe(
             "fc2_input_out",
             "workspace_buffer",
             "routing_metadata",
-            "valid_hidden_size",
-            "valid_intermediate_size",
         )
         if a.get(n) is not None and (pt is not None or n not in params + biases)
     ]
@@ -728,6 +728,31 @@ def trtllm_fp4_sm90_moe(
     if "hidden_states_scale_layout" in a:  # SM100's: linear only
         resolve_moe_act_sf_layout(a["hidden_states_scale_layout"])
     tokens, hidden = x.shape[0], x.shape[1] * 2
+    # SM100's checks, in its order: GEMM2's N (roundUp(valid hidden, 128) <= hidden), unfinalized
+    # rows as wide as the hidden size, a finalized output exactly valid_hidden_size wide.
+    from ..core import (
+        _check_valid_hidden_size_supports_finalize,
+        _infer_trtllm_moe_output_hidden_size,
+        _round_up,
+    )
+
+    vh, vi = a["valid_hidden_size"], a["valid_intermediate_size"]
+    finalize, out = a["do_finalize"], a["output"]
+    rh = _infer_trtllm_moe_output_hidden_size(hidden, vh)
+    _check_valid_hidden_size_supports_finalize(vh, finalize, hidden)
+    if finalize and out is not None:
+        if (
+            out.dtype != torch.bfloat16
+            or out.dim() != 2
+            or out.shape[0] != tokens
+            or not 0 < out.shape[1] <= hidden
+        ):
+            raise _not_on_sm90("an output other than BF16 [num_tokens, <= hidden]")
+        if vh is not None and out.shape[1] != vh:
+            raise ValueError(
+                f"output.shape[1] must equal valid_hidden_size={vh} when "
+                f"valid_hidden_size is provided, got {out.shape[1]}"
+            )
     if pt is not None and (
         pt.dtype != torch.float32 or pt.numel() != tokens or not pt.is_contiguous()
     ):
@@ -737,6 +762,17 @@ def trtllm_fp4_sm90_moe(
             "hidden_states_scale other than linear [num_tokens, hidden / 16]"
         )
     experts, inter = a["local_num_experts"], a["intermediate_size"]
+    for n, v, padded in (
+        ("valid_hidden_size", vh, hidden),
+        ("valid_intermediate_size", vi, inter),
+    ):  # as SM100's launcher
+        if v is not None and not 0 < v <= padded:
+            raise ValueError(
+                f"{n}={v} must be positive and <= padded dimension {padded}"
+            )
+    # GEMM1 and GEMM2 run on the leading valid rows / K of the padded weights, as SM100's
+    # roundUp(valid, 128) (at most the padded size); the padding past them is never read.
+    ri = inter if vi is None else min(_round_up(vi, 128), inter)
     for n in params:
         t = a.get(n)
         if t is not None and (
@@ -748,9 +784,7 @@ def trtllm_fp4_sm90_moe(
     gated = act.is_gated
     # TRT-LLM's biases: FP32 on the weights' (shuffled) rows, in accumulator units
     bias = [a.get(n) for n in biases]
-    for n, t, rows in zip(
-        biases, bias, (inter * (2 if gated else 1), hidden), strict=True
-    ):
+    for n, t, rows in zip(biases, bias, (inter * (2 if gated else 1), rh), strict=True):
         if t is not None and (
             t.dtype != torch.float32
             or t.shape != (experts, rows)
@@ -759,14 +793,11 @@ def trtllm_fp4_sm90_moe(
             raise ValueError(
                 f"{n} must be FP32 [local_num_experts, {rows}] on the input's device."
             )
+    if bias[0] is not None:  # the leading valid rows (shuffled within each 32 rows)
+        bias[0] = bias[0][:, : ri * (2 if gated else 1)]
     bias = [None if t is None else t.contiguous() for t in bias]
-    finalize, out = a["do_finalize"], a["output"]
-    if (
-        finalize
-        and out is not None
-        and (out.shape != (tokens, hidden) or out.dtype != torch.bfloat16)
-    ):
-        raise _not_on_sm90("an output other than BF16 [num_tokens, hidden]")
+    if finalize and out is None and vh is not None:
+        out = torch.empty(tokens, vh, dtype=torch.bfloat16, device=x.device)
     w1 = sm90_weight_view(
         "trtllm",
         a["gemm1_weights"],
@@ -780,11 +811,13 @@ def trtllm_fp4_sm90_moe(
         "trtllm",
         a["gemm2_weights"],
         a["gemm2_weights_scale"],
-        rows=hidden,
+        rows=rh,
         k=inter,
         gated=False,
         scale_kind="nvfp4",
     )
+    w1 = replace(w1, rows=ri * (2 if gated else 1), half_rows=ri if gated else 0, k=rh)
+    w2 = replace(w2, k=ri)
     # The full-width weights are checked; a localized launch computes on its shards, as SM100
     localized = None
     if loc is not None:

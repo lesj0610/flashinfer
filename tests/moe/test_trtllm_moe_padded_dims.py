@@ -55,11 +55,16 @@ _SHAPES = [(2688, 1856), (2688, 928), (1024, 176)]
 _CONTAM = 42.0
 
 
-def _skip_unless_sm100():
+def _skip_unless_sm100(quant_mode):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
-    if get_compute_capability(torch.device("cuda"))[0] not in [10]:
-        pytest.skip("TRT-LLM MoE tests are only guaranteed on SM100/SM103 GPUs.")
+    major = get_compute_capability(torch.device("cuda"))[0]
+    if major == 9 and quant_mode != QuantMode.FP4_NVFP4_NVFP4:
+        pytest.skip("SM90 runs the TRT-LLM NVFP4 x NVFP4 MoE only.")
+    if major not in [9, 10]:
+        pytest.skip(
+            "TRT-LLM MoE tests are only guaranteed on SM90 and SM100/SM103 GPUs."
+        )
 
 
 @pytest.mark.parametrize("hidden_size,intermediate_size", _SHAPES)
@@ -408,7 +413,7 @@ def _run_padded_moe(
 def test_padded_moe_matches_unpadded_reference(
     quant_mode, activation_type, valid_hidden_size, valid_intermediate_size
 ):
-    _skip_unless_sm100()
+    _skip_unless_sm100(quant_mode)
     if quant_mode == QuantMode.FP8_BLOCK_SCALE_MXFP8 and valid_intermediate_size % 32:
         pytest.skip("MxFP8 needs a 32-aligned intermediate_size")
     kernel_output, reference_output, tol = _run_padded_moe(

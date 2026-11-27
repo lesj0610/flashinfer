@@ -563,7 +563,7 @@ void fp4_moe_sm90_run(
   } else {
     TVM_FFI_ICHECK(x.dtype() == dl_uint8 && x_sf.has_value()) << "an FP4 x is uint8 codes + scales";
     TVM_FFI_ICHECK(!quantize) << "an FP4 x is already quantized";
-    TVM_FFI_ICHECK_EQ(2 * x.size(1), hidden) << "FP4 x must be [num_tokens, hidden / 2]";
+    TVM_FFI_ICHECK_GE(2 * x.size(1), hidden) << "FP4 x must be [num_tokens, >= hidden / 2]";
   }
 
   const PrepArgs shape = prep_shape(tokens, top_k, num_experts, local_expert_offset,
@@ -627,6 +627,12 @@ void fp4_moe_sm90_run(
   prep.x = x.data_ptr();
   prep.x_sf = x_sf.has_value() ? static_cast<const uint8_t*>(x_sf.value().data_ptr()) : nullptr;
   prep.x_ld = x.stride(0);
+  // GEMM1 reads the first `hidden` columns of a wider x (valid_hidden_size); its scale rows keep
+  // the full width
+  prep.x_sf_cols =
+      x_sf.has_value()
+          ? static_cast<int>(2 * x.size(1) / (x_fmt == int64_t(XFmt::kMxfp4Swz128x4) ? 32 : 16))
+          : 0;
   prep.x_global =
       x_global.has_value() ? static_cast<const float*>(x_global.value().data_ptr()) : nullptr;
   prep.expert_offset = reinterpret_cast<int32_t*>(at(l.expert_offset));
@@ -753,8 +759,8 @@ void fp4_moe_sm90_run(
     CHECK_DEVICE(o, x);
     TVM_FFI_ICHECK(o.dtype() == dl_bfloat16 || o.dtype() == dl_float16)
         << "out must be BF16 or FP16";
-    TVM_FFI_ICHECK(o.size(0) == tokens && o.size(1) == hidden && o.stride(1) == 1)
-        << "out must be [num_tokens, hidden] with unit column stride";
+    TVM_FFI_ICHECK(o.size(0) == tokens && o.size(1) >= 1 && o.size(1) <= hidden && o.stride(1) == 1)
+        << "out must be [num_tokens, <= hidden] with unit column stride";
     FinalizeArgs fin{};
     fin.y = y.data_ptr();
     fin.y_ld = y.stride(0);
@@ -777,7 +783,7 @@ void fp4_moe_sm90_run(
     fin.out_f16 = o.dtype() == dl_float16;
     fin.tokens = tokens;
     fin.top_k = top_k;
-    fin.hidden = hidden;
+    fin.hidden = static_cast<int>(o.size(1));  // the first out columns of y
     launch_fp4_sm90_finalize(fin, stream);
   }
 }

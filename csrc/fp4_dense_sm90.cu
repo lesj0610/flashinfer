@@ -299,6 +299,8 @@ void fp4_dense_sm90_run(TensorView x, Optional<TensorView> x_sf, int64_t x_fmt, 
     prep.x = x.data_ptr();
     prep.x_sf = static_cast<const uint8_t*>(x_sf.value().data_ptr());
     prep.x_ld = x.stride(0);  // bytes of an FP4 row
+    prep.x_sf_cols =
+        static_cast<int>(2 * x.size(1) / (x_fmt == int64_t(XFmt::kMxfp4Swz128x4) ? 32 : 16));
     prep.k = k;
     prep.x_fmt = static_cast<XFmt>(x_fmt);
     prep.f16 = kModuleF16;

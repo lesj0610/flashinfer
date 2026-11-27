@@ -227,6 +227,7 @@ struct PrepArgs {
   // activation input
   const void* x;        // [tokens, k] in x_fmt (FP4: packed codes [tokens, k / 2])
   const uint8_t* x_sf;  // FP4 x_fmt only
+  int x_sf_cols;        // FP4 x_fmt only: scale columns of an x row (pitch, >= k / block)
   int64_t x_ld;         // elements (BF16/FP16) or bytes (FP4) between rows
   int k;
   XFmt x_fmt;
