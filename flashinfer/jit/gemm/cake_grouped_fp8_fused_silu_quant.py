@@ -222,7 +222,14 @@ ROUTE_GEOMETRY: dict[str, dict[str, int]] = {
 }
 
 ARCH_NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
-SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+# SM8x plans the sm_100a routes on its own SM count and runs every planned stage with the
+# SM8x GEMM (flashinfer.gemm.sm8x_fp8_grouped); it never loads a generated program
+SM8X_COMPUTE_CAPABILITIES = frozenset({(8, 0), (8, 6), (8, 7), (8, 9)})
+SUPPORTED_COMPUTE_CAPABILITIES = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    **dict.fromkeys(sorted(SM8X_COMPUTE_CAPABILITIES), "sm_100a"),
+}
 # Launch order of the generated kernel stages (records without a stage are single-kernel routes).
 STAGE_ORDER = {"main": 0, "pair": 0, "tail": 1}
 
@@ -322,6 +329,7 @@ __all__ = [
     "PROGRAMS",
     "ROUTES",
     "ROUTE_GEOMETRY",
+    "SM8X_COMPUTE_CAPABILITIES",
     "STAGE_ORDER",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "device_arch",

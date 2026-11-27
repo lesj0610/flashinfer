@@ -111,6 +111,7 @@ from ..jit.gemm.cake_grouped_fp8_fused_silu_quant import (
     MODULES,
     PROGRAMS,
     ROUTE_GEOMETRY,
+    SM8X_COMPUTE_CAPABILITIES,
     SUPPORTED_COMPUTE_CAPABILITIES,
     device_arch,
     generated_program_available,
@@ -118,6 +119,12 @@ from ..jit.gemm.cake_grouped_fp8_fused_silu_quant import (
     select_stage_module,
 )
 from .cake_grouped_fp8_gemm import prepare_group_gemm_fp8_nt_groupwise_contiguous
+from .sm8x_fp8_grouped import (
+    Sm8xContiguousGroupGemm,
+    Sm8xSiluQuant,
+    Sm8xSiluQuantStage,
+    sm8x_tail_stage,
+)
 
 GROUP_SIZE = 128
 K_BLOCK = 128
@@ -1115,7 +1122,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
     arch = device_arch(device_index)
     if arch is None:
         raise NotImplementedError(
-            "prepared fused grouped FP8 gate_up+SwiGLU+quant requires an SM100a or SM103a device "
+            "prepared fused grouped FP8 gate_up+SwiGLU+quant requires an SM100a, SM103a or SM8x device "
             f"(compute capability {sorted(SUPPORTED_COMPUTE_CAPABILITIES)}); "
             f"got {torch.cuda.get_device_capability(device_index)}"
         )
@@ -1203,6 +1210,14 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
     }
     module_name = stage_module_names[ROUTE_STAGES[route][0]]
 
+    # SM8x runs every stage with the SM8x grouped GEMM and activation (no generated program)
+    on_sm8x = (
+        torch.cuda.get_device_capability(device_index) in SM8X_COMPUTE_CAPABILITIES
+    )
+    sm8x_act = Sm8xSiluQuant(m, h, device) if on_sm8x else None
+    sm8x_gemm: Optional[Sm8xContiguousGroupGemm] = None
+    if on_sm8x:
+        sm8x_gemm = Sm8xContiguousGroupGemm(m, k, a.dtype, b, b_scale)
     gemm_backend: Optional[str] = None
     gemm: Optional[Callable[[], Any]] = None
     gemm_out: Optional[torch.Tensor] = None
@@ -1230,7 +1245,24 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         gemm_out = _require_tensor(
             workspace, "workspace", shape=(m, n2), dtype=torch.bfloat16, device=device
         )
-        if gemm_backend == GEMM_BACKEND_CAKE:
+        if sm8x_gemm is not None:
+            run_sm8x = sm8x_gemm
+
+            def gemm(
+                a: Optional[torch.Tensor] = None,
+                a_scale: Optional[torch.Tensor] = None,
+                m_indices: Optional[torch.Tensor] = None,
+                bound: tuple[torch.Tensor, ...] = (a, a_scale, kernel_indices),
+                y: torch.Tensor = gemm_out,
+            ) -> None:
+                run_sm8x(
+                    bound[0] if a is None else a,
+                    bound[1] if a_scale is None else a_scale,
+                    bound[2] if m_indices is None else m_indices,
+                    y,
+                )
+
+        elif gemm_backend == GEMM_BACKEND_CAKE:
             prepared_gemm = prepare_group_gemm_fp8_nt_groupwise_contiguous(
                 a, b, a_scale, b_scale, kernel_indices, out=gemm_out
             )
@@ -1296,9 +1328,23 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
     for stage in ROUTE_STAGES[route]:
         stage_module_name = stage_module_names[stage]
         program = PROGRAMS[MODULES[stage_module_name]["program"]]
-        module = load_cake_grouped_fp8_fused_silu_quant_module(stage_module_name)
-        entry = getattr(module, program["ffi_entry"])
         arg_plan = ARG_PLANS[program["arg_plan"]]
+        entry: Callable[..., Any]
+        if sm8x_act is None:
+            module = load_cake_grouped_fp8_fused_silu_quant_module(stage_module_name)
+            entry = getattr(module, program["ffi_entry"])
+        elif stage == FUSED_TAIL_STAGE:
+            entry = sm8x_tail_stage
+        elif route in FUSED_ROUTES:
+            # the pair or mixed-schedule stage: the GEMM into a private intermediate
+            entry = Sm8xSiluQuantStage(
+                arg_plan,
+                sm8x_act,
+                sm8x_gemm,
+                torch.empty((m, n2), dtype=torch.bfloat16, device=device),
+            )
+        else:
+            entry = Sm8xSiluQuantStage(arg_plan, sm8x_act)
         arguments = bind_arguments(
             arg_plan,
             bindings,
