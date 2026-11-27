@@ -777,7 +777,7 @@ def trtllm_fp4_sm90_moe(
         _round_up,
     )
 
-    vh, vi = a["valid_hidden_size"], a["valid_intermediate_size"]
+    vh, vi = a.get("valid_hidden_size"), a.get("valid_intermediate_size")
     finalize, out = a["do_finalize"], a["output"]
     rh = _infer_trtllm_moe_output_hidden_size(hidden, vh)
     _check_valid_hidden_size_supports_finalize(vh, finalize, hidden)
