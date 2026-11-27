@@ -11,8 +11,9 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+from torch.cuda import is_current_stream_capturing as capturing
 
-from ...gemm.sm8x_fp4_dense import _flat_bytes, _ones, _run_fp4
+from ...gemm.sm8x_fp4_dense import _flat_bytes, _ones, _ones_cache, _run_fp4
 from ...gemm.sm8x_fp8_dense import _run_fp8
 from .config import PrimsTsGemmConfig
 
@@ -103,16 +104,21 @@ def run(
     m, n, _ = mnk
     if m == 0:
         return
-    one = _ones(a.device)
+    if (a.device.type, a.device.index) in _ones_cache or not capturing():
+        one = _ones(a.device)
+    else:  # a capture's own 1 belongs to the graph, so it is not cached
+        one = torch.ones(1, dtype=torch.float32, device=a.device)
     fp8 = config.operand_format == "fp8_e4m3"
     acc = torch.empty(
         (1, m, n) if fp8 else (m, n), dtype=torch.float32, device=a.device
     )
     if fp8:
         _run_fp8(a[None], b.t()[None], one, one, acc, 64, False)
-        v = acc[0] * x_scale[:, None] * weight_scale
-        if bias is not None:
-            v += bias.float()
+        v = acc[0] * x_scale[:, None]
+        if bias is None:
+            v = v * weight_scale
+        else:  # one fma, as in the kernel
+            v = torch.addcmul(bias.float(), v, weight_scale)
     else:
         _run_fp4(a, b.t(), sfa, sfb, one, acc, 64)
         v = acc if bias is None else acc + bias.float()
