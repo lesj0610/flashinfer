@@ -13308,7 +13308,7 @@ def _cake_batch_deepgemm_fp8() -> Any:
     return cake_batch_deepgemm_fp8
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _check_batch_deepgemm_fp8_nt_groupwise_cake(
     a: torch.Tensor,
     b: torch.Tensor,

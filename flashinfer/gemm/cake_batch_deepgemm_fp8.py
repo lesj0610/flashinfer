@@ -55,6 +55,7 @@ from ..jit.gemm.cake_batch_deepgemm_fp8 import (
     DOMAIN_SERVING_PROGRAMS,
     PROGRAMS,
     SERVING_PROGRAMS,
+    SM8X_COMPUTE_CAPABILITIES,
     SUPPORTED_COMPUTE_CAPABILITIES,
     RoutePlan,
     StagePlan,
@@ -579,7 +580,7 @@ def _resolve(
     arch, sm_count = _device_info(index)
     if arch is None:
         raise ValueError(
-            "the Cake batch DeepGEMM FP8 backend requires an SM100a, SM103a or SM107a device "
+            "the Cake batch DeepGEMM FP8 backend requires an SM100a, SM103a, SM107a or SM8x device "
             f"(compute capability {sorted(SUPPORTED_COMPUTE_CAPABILITIES)}); "
             f"got {torch.cuda.get_device_capability(index)}"
         )
@@ -1468,6 +1469,17 @@ def _bind_launches(
 ) -> list[tuple[Callable[..., Any], tuple[Any, ...]]]:
     """``(FFI entry, arguments)`` of each kernel of the problem's route."""
     plan = problem.plan
+    if torch.cuda.get_device_capability(problem.device) in SM8X_COMPUTE_CAPABILITIES:
+        from .sm8x_fp8_grouped import Sm8xBatchDeepGemm
+
+        # the route's FP32 epilogue applies the FP32 scales in full; the others their
+        # UE8M0 exponents
+        groupwise = any(
+            PROGRAMS[stage.program]["arg_plan"] == "plan7" for stage in plan.stages
+        )
+        return [
+            (Sm8xBatchDeepGemm(a, b, a_scale, b_scale, masked_m, out, groupwise), ())
+        ]
     launches = []
     if problem.packed_scales:
         launches.append(
@@ -1673,14 +1685,18 @@ def _run(
     out: torch.Tensor,
 ) -> torch.Tensor:
     """Submit the launches of the resolved ``problem`` into ``out``."""
-    if problem.packed_scales:
+    if torch.cuda.get_device_capability(problem.device) in SM8X_COMPUTE_CAPABILITIES:
+        launches: Any = _bind_launches(
+            problem, a, b, a_scale, b_scale, masked_m, out, {}
+        )
+    elif problem.packed_scales:
         # One serving launch; the twin takes its stream's reused counter pair.
         counters: tuple[Any, Any] = (None, None)
         if problem.plan.route == DOMAIN_SERVING_ROUTE:
             counters = cake_locality.launch_counters(
                 PAIR_COUNTER_WORDS, _device_index(problem.device)
             )
-        launches: Any = (
+        launches = (
             _serving_arguments(
                 problem, a, b, a_scale, b_scale, masked_m, out, *counters
             ),

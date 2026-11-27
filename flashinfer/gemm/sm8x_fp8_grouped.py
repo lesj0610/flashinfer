@@ -238,3 +238,167 @@ class Sm8xSiluQuantStage:
 
 def sm8x_tail_stage(*arguments: Any) -> None:
     """The pair + tail route's tail stage: the SM8x pair stage covers every row."""
+
+
+class Sm8xBatchDeepGemm:
+    """The prepared masked batch FP8 GEMM on SM8x: ``out[g, r] = sum_q (a[g, r, q] . b[g, :,
+    q]) sa[g, r, q] sb[g, :, q]`` over the 128-element K blocks ``q`` for the first
+    ``masked_m[g]`` rows of each group ``g`` (the rest stay unwritten), on the SM8x FP8 GEMM
+    routed in row tiles that each lie in one group. ``groupwise``: the route's FP32 epilogue,
+    the FP32 scales in full; otherwise the UE8M0 exponents the route applies (FP32 ``bits >>
+    23``, or the bytes of the packed MN-major words) as the GEMM's block scales (``e = 255``
+    NaN). The operands are bound here with the buffers; each call repacks the scales and
+    routes the row tiles on the device (no host sync) and allocates nothing."""
+
+    def __init__(self, a, b, a_scale, b_scale, masked_m, out, groupwise: bool) -> None:
+        from ..fused_moe.core import _w4a16_moe_sm80_module
+        from .sm8x_fp8_dense import _E4M3, _FMT, _I32_MAX, GW_E4M3_ALPHA, _weight
+
+        groups, m, k = (int(v) for v in a.shape)
+        n, nka = int(b.shape[1]), k // 128
+        device = a.device
+        i32 = dict(dtype=torch.int32, device=device)
+        self.module = _w4a16_moe_sm80_module(None, False, None, False)
+        self.fmt = (_FMT[a.dtype], _FMT[b.dtype])
+        self.k, self.n, self.groupwise = k, n, groupwise
+        self.masked_m = masked_m
+        # the GEMM's activation offsets are 32-bit: calls of whole groups, or of one group's
+        # 128-row chunks
+        if m * k <= _I32_MAX:
+            per = _I32_MAX // (m * k)
+            spans = [(g, min(g + per, groups), 0, m) for g in range(0, groups, per)]
+        else:
+            step = _I32_MAX // k // 128 * 128
+            spans = [
+                (g, g + 1, r, min(r + step, m)) for g in range(groups) for r in range(0, m, step)
+            ]  # fmt: skip
+        most = max((g1 - g0) * (r1 - r0) for g0, g1, r0, r1 in spans)
+        self.act = torch.empty((most, k), dtype=torch.bfloat16, device=device)
+        ints = (1 + 2 * most // _ROWS, most)
+        self.meta, self.rowmap = torch.empty(sum(ints), **i32).split(ints)
+        self.j = torch.arange(_ROWS, **i32)
+        self.alpha = torch.full(
+            (1,), GW_E4M3_ALPHA if groupwise and b.dtype == _E4M3 else 1.0,
+            dtype=torch.float32, device=device,
+        )  # fmt: skip
+        x = a.view(torch.uint8)
+        if groupwise:
+            # E4M3 weights: their scales over 2^8 per call, alpha 2^8 (gw_e4m3_weight_scales)
+            self.gsb = torch.empty_like(b_scale) if b.dtype == _E4M3 else b_scale
+            self.b_scale = b_scale
+        else:
+            # A's block scales of the stacked rows and B's of each group (both 128-row
+            # atoms, _mx_rows' order), written from the scales per call
+            self.asf = torch.empty(
+                groups * m * nka * 4, dtype=torch.uint8, device=device
+            )
+            self.sf = torch.empty(
+                groups * n * nka * 4, dtype=torch.uint8, device=device
+            )
+            if (
+                a_scale.dtype == torch.int32
+            ):  # [G][K / 512][MN] words, K block 4c + j byte j
+                cols = nka // 4
+
+                def words(s, mn, dst):
+                    src = s.as_strided((groups, cols, mn), (mn * cols, mn, 1))
+                    src = src.view(torch.uint8).view(groups, cols, mn // 128, 4, 32, 4)
+                    src = src.permute(0, 2, 1, 5, 4, 3)[..., None]
+                    src = src.expand(-1, -1, -1, -1, -1, -1, 4)
+                    dst = dst.view(groups, mn // 128, cols, 4, 32, 4, 4)
+                    return src, dst
+
+                self.shift: tuple = ()
+                self.repack = (words(a_scale, m, self.asf), words(b_scale, n, self.sf))
+            else:  # FP32, A's per row and B's per 128 rows: bits >> 23 in int32 (a CUDA
+                # shift into a uint8 output shifts the low byte), then the bytes
+                ea = torch.empty((groups * m // 128, 4, 32, nka), **i32)
+                eb = torch.empty((groups, n // 128, nka), **i32)
+                self.shift = (
+                    (a_scale.view(torch.int32).view(ea.shape), ea),
+                    (b_scale.view(torch.int32), eb),
+                )
+                self.repack = (
+                    (
+                        ea.permute(0, 3, 2, 1)[..., None].expand(-1, -1, -1, -1, 4),
+                        self.asf.view(groups * m // 128, nka, 32, 4, 4),
+                    ),
+                    (
+                        eb[..., None].expand(groups, n // 128, nka, 512),
+                        self.sf.view(groups, n // 128, nka, 512),
+                    ),
+                )
+        self.spans = []
+        for g0, g1, r0, r1 in spans:
+            cb, mr = g1 - g0, r1 - r0
+            blocks = cb * mr // _ROWS
+            nbg = torch.zeros((2, cb), **i32)  # row 1 zero: a 2-D scan, not CUB's
+            scratch = (
+                nbg, torch.empty_like(nbg), torch.empty(cb, **i32),
+                torch.arange(blocks, **i32), torch.empty(blocks, **i32),
+                torch.empty(blocks, **i32),
+                torch.empty((blocks, _ROWS), dtype=torch.bool, device=device),
+            )  # fmt: skip
+            if groupwise:
+                scales = (
+                    None, None, 0, a_scale[g0:g1, r0:r1].reshape(cb * mr, nka),
+                    self.gsb[g0:g1],
+                )  # fmt: skip
+            else:
+                scales = (
+                    self.sf[g0 * n * nka * 4 :], self.asf[(g0 * m + r0) * nka * 4 :],
+                    n * nka * 4 if cb > 1 else 0, None, None,
+                )  # fmt: skip
+            self.spans.append(
+                (
+                    g0, g1, r0, mr, blocks, x[g0:g1, r0:r1].reshape(-1),
+                    out[g0:g1, r0:r1].reshape(cb * mr, n),
+                    _weight(b[g0:g1].transpose(1, 2), k, n, False), scales, scratch,
+                )
+            )  # fmt: skip
+
+    def __call__(self) -> None:
+        from .sm8x_fp8_dense import gw_e4m3_weight_scales
+
+        if not self.groupwise:
+            for src, dst in self.shift:
+                torch.bitwise_right_shift(src, 23, out=dst)
+            for src, dst in self.repack:
+                dst.copy_(src)
+        elif self.gsb is not self.b_scale:
+            gw_e4m3_weight_scales(self.b_scale, out=self.gsb)
+        for g0, g1, r0, mr, blocks, x, target, weight, scales, scratch in self.spans:
+            w, rs, ks, bs = weight
+            sf, asf, sf_bstride, gsa, gsb = scales
+            nbg, end, size, blk, first, local, past = scratch
+            cb = g1 - g0
+            act = self.act[: cb * mr]
+            meta = self.meta[: 1 + 2 * blocks]
+            rowmap = self.rowmap[: blocks * _ROWS].view(blocks, _ROWS)
+            # prep_f8 converts every row; the tiles of each group's first masked_m rows
+            # are routed below
+            self.module.prep_f8(
+                x, act, meta, rowmap, cb, self.k, _ROWS, blocks, self.fmt[0]
+            )
+            expert, rows = meta[1 : 1 + blocks], meta[1 + blocks :]
+            torch.sub(self.masked_m[g0:g1], r0, out=size).clamp_(0, mr)
+            torch.add(size, _ROWS - 1, out=nbg[0]).div_(_ROWS, rounding_mode="floor")
+            torch.cumsum(nbg, 1, dtype=torch.int32, out=end)
+            meta[:1].copy_(end[0, -1:])
+            torch.searchsorted(end[0], blk, right=True, out_int32=True, out=expert)
+            expert.clamp_(max=cb - 1)
+            torch.index_select(end[0], 0, expert, out=first)
+            torch.index_select(nbg[0], 0, expert, out=local)
+            first.sub_(local)  # the group's first tile
+            torch.sub(blk, first, out=local)  # the tile within its group
+            torch.index_select(size, 0, expert, out=rows)
+            rows.sub_(local, alpha=_ROWS).clamp_(0, _ROWS)
+            local.mul_(_ROWS).add_(expert, alpha=mr)  # the tile's first row
+            torch.add(local[:, None], self.j, out=rowmap)
+            torch.ge(self.j, rows[:, None], out=past)
+            rowmap.masked_fill_(past, -1)
+            self.module.gemm_f8(
+                w, self.alpha, None, act, meta, rowmap.view(-1), target, _ROWS, self.n,
+                self.k, blocks, cb, rs, ks, bs, self.fmt[1], False, sf, asf, False,
+                sf_bstride, gsa, gsb, 1, None,
+            )  # fmt: skip

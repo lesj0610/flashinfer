@@ -1747,10 +1747,16 @@ ARCH_NVCC_FLAGS = {
     "sm_103a": sm103a_nvcc_flags,
     "sm_107a": sm107a_nvcc_flags,
 }
+# SM8x plans the sm_100a routes of its 148-SM table and runs each planned route with the
+# SM8x masked batch FP8 GEMM (flashinfer.gemm.sm8x_fp8_grouped); it never loads a generated
+# program
+SM8X_COMPUTE_CAPABILITIES = frozenset({(8, 0), (8, 6), (8, 7), (8, 9)})
+SM8X_SM_COUNT = 148
 SUPPORTED_COMPUTE_CAPABILITIES = {
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
     (10, 7): "sm_107a",
+    **dict.fromkeys(sorted(SM8X_COMPUTE_CAPABILITIES), "sm_100a"),
 }
 
 
@@ -1800,9 +1806,12 @@ def device_arch(device_index: int) -> str | None:
 
 @functools.cache
 def device_sm_count(device_index: int) -> int:
-    """Streaming-multiprocessor count of CUDA device ``device_index`` (queried once)."""
+    """Streaming-multiprocessor count of CUDA device ``device_index`` (queried once;
+    ``SM8X_SM_COUNT`` on SM8x, whose routes come from that sm_100a table)."""
     import torch
 
+    if torch.cuda.get_device_capability(device_index) in SM8X_COMPUTE_CAPABILITIES:
+        return SM8X_SM_COUNT
     return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
 
 
@@ -2899,6 +2908,7 @@ __all__ = [
     "RouteChain",
     "RoutePlan",
     "SERVING_PROGRAMS",
+    "SM8X_COMPUTE_CAPABILITIES",
     "StagePlan",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "device_arch",
