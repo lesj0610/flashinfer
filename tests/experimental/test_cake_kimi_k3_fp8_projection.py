@@ -2921,7 +2921,10 @@ def test_shared_launcher_sources_keep_distinct_namespaces():
 def _gpu_arch():
     if not torch.cuda.is_available():
         return None
-    return SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(0))
+    capability = torch.cuda.get_device_capability(0)
+    if capability in cb.SM8X_COMPUTE_CAPABILITIES:
+        return "sm_100a"
+    return SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
 
 
 def _require_program():

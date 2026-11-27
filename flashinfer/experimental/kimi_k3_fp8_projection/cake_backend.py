@@ -265,6 +265,8 @@ DEC_QUANT_WARPS = (
 )
 DEC_RES_SLOTS = 4  # work items per CTA the resident decode instance can hold
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+# SM8x keeps the SM100 route, plan and launch sequence; sm8x.py runs each launch
+SM8X_COMPUTE_CAPABILITIES = frozenset({(8, 0), (8, 6), (8, 7), (8, 9)})
 
 
 class DeviceFacts(NamedTuple):
@@ -282,7 +284,10 @@ def _device_index(device: torch.device) -> int:
 def _device_facts(device_index: int) -> DeviceFacts:
     """Architecture and SM count of ``cuda:device_index`` from one property query, cached per device."""
     props = torch.cuda.get_device_properties(device_index)
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get((int(props.major), int(props.minor)))
+    capability = (int(props.major), int(props.minor))
+    if capability in SM8X_COMPUTE_CAPABILITIES:
+        return DeviceFacts("sm_100a", 148)
+    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
     if arch is None:
         raise ValueError(
             "the Kimi-K3 FP8 projection requires compute capability 10.0 or 10.3 "
@@ -293,6 +298,11 @@ def _device_facts(device_index: int) -> DeviceFacts:
 
 def device_facts(device: torch.device) -> DeviceFacts:
     return _device_facts(_device_index(device))
+
+
+@functools.cache
+def _on_sm8x(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in SM8X_COMPUTE_CAPABILITIES
 
 
 # Contract families (n_valid, K) of the Kimi-K3 FP8_PB_WO projections: TP8 first, then TP1.
@@ -4267,9 +4277,17 @@ def prepare_kimi_k3_fp8_projection(
     bound.update(_output_bindings(plan, prepared, M, ldo, x, out, device_index))
     launches: list[tuple[Callable[..., Any], tuple]] = []
     with torch.cuda.device(device_index):
-        for program, fixed in _stage_kwargs(
-            plan, prepared, facts, M, ldo, out.data_ptr()
+        for index, (program, fixed) in enumerate(
+            _stage_kwargs(plan, prepared, facts, M, ldo, out.data_ptr())
         ):
+            if _on_sm8x(device_index):
+                from . import sm8x
+
+                stage = sm8x.Sm8xStage(
+                    prepared, plan, index, *workspace, M, ldo, out.data_ptr()
+                )
+                launches.append((stage, (x, out)))
+                continue
             kwargs = dict(fixed)
             kwargs.update(bound)
             launches.append(_bind(program, facts.arch, kwargs))
@@ -4461,8 +4479,10 @@ class KimiK3Fp8ProjectionLauncher:
             plan, _ldo = _resolve_plan(self.prepared, M, out, self._facts)
             stages = []
             with torch.cuda.device(self._device_index):
-                for program, fixed in _stage_kwargs(
-                    plan, self.prepared, self._facts, M, ldo, out.data_ptr()
+                for index, (program, fixed) in enumerate(
+                    _stage_kwargs(
+                        plan, self.prepared, self._facts, M, ldo, out.data_ptr()
+                    )
                 ):
                     name, defines = program
                     record = MODULES[name]
@@ -4483,9 +4503,22 @@ class KimiK3Fp8ProjectionLauncher:
                                 f"generated program {name!r} expects argument {argument!r} ({kind}); "
                                 f"host binding provides {sorted(fixed) + sorted(_CALL_ARGS)}"
                             )
-                    module = load_cake_kimi_k3_fp8_projection_module(
-                        name, self._facts.arch, defines
-                    )
+                    if _on_sm8x(self._device_index):
+                        from . import sm8x
+
+                        module = sm8x.Sm8xProgram(
+                            self.prepared,
+                            plan,
+                            index,
+                            [argument for _kind, argument in arg_plan],
+                            M,
+                            ldo,
+                            out.data_ptr(),
+                        )
+                    else:
+                        module = load_cake_kimi_k3_fp8_projection_module(
+                            name, self._facts.arch, defines
+                        )
                     # The register-epilogue GEMM programs take ``OUT`` as the per-device placeholder descriptor
                     # (see ``_output_bindings``); re-encoding it from the caller's view would fail for row strides
                     # that are not multiples of 16 bytes, so only the TMA-store programs re-bind ``OUT``.
