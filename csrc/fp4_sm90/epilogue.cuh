@@ -345,8 +345,9 @@ struct StagingN<C, std::void_t<decltype(C::kStagingN)>> {
 //   (token) p = n0 + column, valid for p < n0 + n_valid. Gated GEMM1: rows lane / 4 and
 //   lane / 4 + 8 of a 16-row group b are gate[i] and up[i], i = 8 b + lane / 4.
 // Output column: gated i (m0 / 2 based), else the kernel row; rows past ASrc::rows are not
-// written. out_tiled: GEMM2 B tile `tile` (K = the output columns), padding written as 0; the last
-// m-tile also zeroes the K range past its columns. Otherwise row-major [p, column] (out_ld).
+// written. out_tiled: GEMM2 B tile `tile` of out_ld K values (the output columns, or a localized
+// GEMM1's full K with out at its first K tile), padding written as 0; the last m-tile also zeroes
+// the K range past its columns. Otherwise row-major [p, column] (out_ld).
 // Synchronization: named barrier 1 + wg (128 threads) only, for the NVFP4 staging.
 template <class Cfg>
 struct Epilogue {
@@ -395,8 +396,8 @@ struct Epilogue {
     // tok_scale is null there. No __trap() in the consumer: it caps its registers at 168.
     const int rows = args.a.rows;
     const int ncols = kGated ? rows / 2 : rows;
-    const int k_tiles = (ncols + 127) / 128;
-    const int kp = k_tiles * 128;
+    const int k_tiles = (static_cast<int>(ep.out_ld) + 127) / 128;  // out_tiled
+    const int kp = (ncols + 127) / 128 * 128;
     const float alpha = ep.alpha != nullptr ? ep.alpha[expert] : 1.f;
     const float a = alpha * kAccScale;
     const bool pt = ep.tok_scale != nullptr;

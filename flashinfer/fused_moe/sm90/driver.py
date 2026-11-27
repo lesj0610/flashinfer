@@ -94,6 +94,87 @@ def _not_on_sm90(what: str) -> NotImplementedError:
     return NotImplementedError(f"SM90 FP4 MoE: {what} is not implemented on SM90 yet.")
 
 
+def _check_localized(
+    a: Dict[str, Any], x: torch.Tensor
+) -> Optional[Tuple[List[torch.Tensor], List[int], int]]:
+    """SM100's checks of a localized TRT-LLM launch (``localized_weights``), in its order; its
+    shards (per locality domain FC1's and FC2's rows of the domain and their scales, FC1's a
+    gated weight of its own), domain streams and SM count, or None without localization."""
+    from ..core import _flatten_localized_moe_args
+
+    shards, streams, sm_count = _flatten_localized_moe_args(
+        a.get("localized_weights"),
+        a.get("localized_streams"),
+        a.get("localized_sm_count"),
+        x.device,
+    )
+    if not shards:
+        return None
+    for ok, what in (
+        (
+            x.dtype == a["gemm1_weights"].dtype == torch.uint8,
+            "supports NVFP4 activations and weights only.",
+        ),
+        (ActivationType(a["activation_type"]).is_gated, "requires a gated activation."),
+        (
+            a["per_token_scale"] is None
+            and all(
+                a.get(n) is None
+                for n in ("gemm1_lora_delta", "gemm1_bias", "gemm2_bias")
+            ),
+            "supports neither per-token scales, LoRA deltas nor GEMM biases.",
+        ),
+        (not a.get("_nfse"), "does not support fused shared experts."),
+        (
+            a.get("valid_hidden_size") is None
+            and a.get("valid_intermediate_size") is None,
+            "does not support padded (valid) dimensions.",
+        ),
+        (a.get("workspace_buffer") is None, "does not support workspace_buffer."),
+        (a.get("routing_metadata") is None, "does not support routing metadata."),
+    ):
+        if not ok:
+            raise RuntimeError(f"Localized MoE {what}")
+    experts, hidden, inter = (
+        a["local_num_experts"],
+        x.shape[1] * 2,
+        a["intermediate_size"],
+    )
+    for d in range(
+        2
+    ):  # FC1 [E, I, H / 2] and FC2 [E, H / 2, I / 2] rows, and their scales
+        for i, (n, rows, k, per) in enumerate(
+            (
+                ("gemm1_weights", inter, hidden, 2),
+                ("gemm1_weights_scale", inter, hidden, 16),
+                ("gemm2_weights", hidden // 2, inter, 2),
+                ("gemm2_weights_scale", hidden // 2, inter, 16),
+            )
+        ):
+            t = shards[4 * d + i]
+            s, numel = (*t.shape, 0, 0), experts * rows * k // per
+            for bad, what in (
+                (
+                    t.dtype != (torch.uint8 if per == 2 else torch.float8_e4m3fn),
+                    "has the wrong dtype.",
+                ),
+                (not t.is_contiguous(), "must be contiguous."),
+                (t.device != x.device, "must be on the device of hidden_states."),
+                (t.dim() != 3, "must be 3D."),
+                (s[0] != experts, "dim 0 must be local_num_experts."),
+                (s[1] != rows, f"dim 1 must be {rows} (half of the full-width rows)."),
+                (t.numel() != numel, f"must have {numel} elements."),
+            ):
+                if bad:
+                    raise RuntimeError(f"{n} shard {d} {what}")
+    if hidden % 256 or inter % 256:
+        raise RuntimeError(
+            "Localized MoE needs hidden and intermediate sizes that are multiples of 256, "
+            f"got hidden={hidden}, intermediate={inter}"
+        )
+    return shards, list(streams), sm_count
+
+
 def default_sm90_fp4_tactic(
     num_tokens: int, top_k: int, num_local_experts: int
 ) -> SM90_TACTIC:
@@ -289,8 +370,10 @@ class Sm90Fp4MoeRunner(TunableRunner):
         x_sf_swizzled: bool = False,
         do_finalize: bool = True,
         a_path: int = 0,
+        localized: Optional[Tuple[List[Sm90WeightView], List[int], int]] = None,
     ):
         self.w1, self.w2, self.epi1, self.epi2 = w1, w2, epi1, epi2
+        self.localized = localized
         self.num_experts, self.num_local_experts = num_experts, num_local_experts
         self.local_expert_offset = local_expert_offset
         self.recipe, self.exact, self.x_global = recipe, exact, x_global
@@ -315,6 +398,9 @@ class Sm90Fp4MoeRunner(TunableRunner):
             do_finalize,
             a_path,
             epi2.out_dtype,
+            None
+            if localized is None
+            else (tuple(tuple(_geometry(v)) for v in localized[0]), localized[2]),
         )
 
     def __hash__(self) -> int:
@@ -334,6 +420,19 @@ class Sm90Fp4MoeRunner(TunableRunner):
                 self.w2.a_fmt,
                 self.a_path,
             )
+        )
+
+    def _localized_args(self) -> tuple:
+        """The module's localization arguments: per domain its shards' codes and scales (w1's,
+        then w2's) and geometries, the domain streams, the SMs of each domain (0: off)."""
+        if self.localized is None:
+            return [], [], [], 0
+        views, streams, sm_count = self.localized
+        return (
+            [_bytes(t) for v in views for t in (v.codes, v.sf)],
+            [g for v in views for g in _geometry(v)],
+            streams,
+            sm_count,
         )
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
@@ -403,6 +502,7 @@ class Sm90Fp4MoeRunner(TunableRunner):
             n,
             stages,
             self.a_path,
+            *self._localized_args(),
         )
         if self.do_finalize:
             return [out]
@@ -428,6 +528,7 @@ def sm90_fp4_moe(
     do_finalize: bool = True,
     tune_max_num_tokens: int = 8192,
     a_path: int = 0,
+    localized: Optional[Tuple[List[Sm90WeightView], List[int], int]] = None,
 ) -> List[torch.Tensor]:
     """SM90 FP4 MoE: prep, GEMM1, row quantization (token-wise), GEMM2, finalize.
 
@@ -472,6 +573,11 @@ def sm90_fp4_moe(
         Largest token bucket profiled.
     a_path : int
         Weight staging path of the GEMM kernels: 0 (n1) or 1 (n2).
+    localized : Optional[tuple]
+        SM100's ``localized_*``: per locality domain the views of its ``w1`` and ``w2`` shards
+        (the domain's rows), the domain streams (``cudaStream_t`` handles) and the SMs of each
+        domain's GEMMs. Each GEMM then runs per domain on its stream, forked from and joined
+        back to the current stream (also under CUDA graph capture).
 
     Returns
     -------
@@ -525,6 +631,7 @@ def sm90_fp4_moe(
         x_sf_swizzled=x_sf_swizzled,
         do_finalize=do_finalize,
         a_path=a_path,
+        localized=localized,
     )
     inputs = [x, ids, weights, x_sf, token_scale, out if do_finalize else None]
     if isinstance(tactic, int) and tactic == -1:
@@ -584,6 +691,7 @@ def trtllm_fp4_sm90_moe(
         a.get("gemm1_alpha") is not None or a.get("gemm1_beta") is not None
     ):  # as SM100's launcher
         raise ValueError("SwigluStep takes no gemm1_alpha or gemm1_beta.")
+    loc = _check_localized(a, x)
     unsupported = [
         n
         for n in (
@@ -598,7 +706,6 @@ def trtllm_fp4_sm90_moe(
             "routing_metadata",
             "valid_hidden_size",
             "valid_intermediate_size",
-            "localized_weights",
         )
         if a.get(n) is not None and (pt is not None or n not in params + biases)
     ]
@@ -678,6 +785,27 @@ def trtllm_fp4_sm90_moe(
         gated=False,
         scale_kind="nvfp4",
     )
+    # The full-width weights are checked; a localized launch computes on its shards, as SM100
+    localized = None
+    if loc is not None:
+        shards = loc[0]
+        localized = (
+            [
+                sm90_weight_view(
+                    "trtllm",
+                    shards[4 * d + 2 * j],
+                    shards[4 * d + 2 * j + 1],
+                    rows=(inter, hidden // 2)[j],
+                    k=(hidden, inter)[j],
+                    gated=j == 0,
+                    scale_kind="nvfp4",
+                )
+                for d in range(len(shards) // 4)
+                for j in range(2)
+            ],
+            loc[1],
+            loc[2],
+        )
     # As SM100: GEMM1 under the gate scalar, GEMM2 input under output1_scale_scalar (gated but
     # SiTU over the gate scalar, SiTU's inside the activation). Per token the rows are
     # requantized per token, so it folds into GEMM2's alpha; per tensor it is GEMM1's NVFP4
@@ -743,6 +871,7 @@ def trtllm_fp4_sm90_moe(
         token_scale=pt,
         do_finalize=finalize,
         tune_max_num_tokens=a["tune_max_num_tokens"],
+        localized=localized,
     )
 
 

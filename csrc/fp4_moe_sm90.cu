@@ -312,6 +312,64 @@ ASrc weight_of(TensorView codes, TensorView sf, const Array<int64_t>& geom, cons
   return a;
 }
 
+// A localized launch's locality domains (SM100's LocalizedMoE::kNumDomains).
+constexpr int kNumDomains = 2;
+
+// SM100's DomainForkJoin (trtllm_fused_moe_runner.cu): fork makes the domain streams wait for the
+// caller's stream, join makes it wait for them. Per-call events; under graph capture each record
+// and wait is a graph edge, so the domain streams join the capture and merge back before it ends.
+class DomainForkJoin {
+ public:
+  DomainForkJoin(cudaStream_t main, const cudaStream_t (&streams)[kNumDomains]) : main_(main) {
+    for (int d = 0; d < kNumDomains; ++d) streams_[d] = streams[d];
+    // A throwing constructor skips the destructor, so a failed create frees the events made so far.
+    cudaError_t err = cudaEventCreateWithFlags(&ready_, cudaEventDisableTiming);
+    for (int d = 0; d < kNumDomains && err == cudaSuccess; ++d) {
+      err = cudaEventCreateWithFlags(&done_[d], cudaEventDisableTiming);
+    }
+    if (err != cudaSuccess) destroy();
+    TVM_FFI_ICHECK_EQ(err, cudaSuccess) << "cudaEventCreate";
+  }
+  ~DomainForkJoin() { destroy(); }
+  DomainForkJoin(const DomainForkJoin&) = delete;
+  DomainForkJoin& operator=(const DomainForkJoin&) = delete;
+
+  void fork() {
+    TVM_FFI_ICHECK_EQ(cudaEventRecord(ready_, main_), cudaSuccess) << "cudaEventRecord";
+    for (cudaStream_t s : streams_) {
+      TVM_FFI_ICHECK_EQ(cudaStreamWaitEvent(s, ready_, 0), cudaSuccess) << "cudaStreamWaitEvent";
+    }
+  }
+  void join() {
+    for (int d = 0; d < kNumDomains; ++d) {
+      TVM_FFI_ICHECK_EQ(cudaEventRecord(done_[d], streams_[d]), cudaSuccess) << "cudaEventRecord";
+      TVM_FFI_ICHECK_EQ(cudaStreamWaitEvent(main_, done_[d], 0), cudaSuccess)
+          << "cudaStreamWaitEvent";
+    }
+  }
+  // join() for error paths: never throws, so the original error propagates.
+  void join_no_throw() noexcept {
+    for (int d = 0; d < kNumDomains; ++d) {
+      if (cudaEventRecord(done_[d], streams_[d]) == cudaSuccess) {
+        cudaStreamWaitEvent(main_, done_[d], 0);
+      }
+    }
+  }
+
+ private:
+  cudaStream_t main_;
+  cudaStream_t streams_[kNumDomains];
+  cudaEvent_t ready_{};
+  cudaEvent_t done_[kNumDomains]{};
+
+  void destroy() noexcept {
+    if (ready_ != nullptr) cudaEventDestroy(ready_);
+    for (cudaEvent_t done : done_) {
+      if (done != nullptr) cudaEventDestroy(done);
+    }
+  }
+};
+
 }  // namespace moe
 }  // namespace fp4_sm90
 }  // namespace flashinfer
@@ -364,7 +422,12 @@ void fp4_moe_sm90_run(
     // scratch and outputs
     TensorView workspace, TensorView src_permuted, TensorView y, Optional<TensorView> out,
     // tactic
-    int64_t cta_m, int64_t n, int64_t stages, int64_t a_path) {
+    int64_t cta_m, int64_t n, int64_t stages, int64_t a_path,
+    // localization (SM100's localized_*): per domain its shards' w1 codes, w1 scales, w2 codes and
+    // w2 scales (uint8 views) and their geometries (w1's, then w2's), the domain streams and the
+    // SM count of each (0: off)
+    Array<Tensor> loc_weights, Array<int64_t> loc_geom, Array<int64_t> loc_streams,
+    int64_t loc_sm_count) {
   CHECK_CUDA(x);
   CHECK_CONTIGUOUS(x);
   CHECK_INPUT_AND_TYPE(topk_ids, dl_int32);
@@ -452,6 +515,43 @@ void fp4_moe_sm90_run(
         << "biases must be [num_local_experts, GEMM rows]";
   }
 
+  // A localized launch (SM100's runLocalized) runs each GEMM per domain on its stream with
+  // loc_sm_count SMs: GEMM1 domain d writes the intermediate columns [d I / 2, (d + 1) I / 2) from
+  // its w1 shard (rows [d I / 2, (d + 1) I / 2) of each half), GEMM2 the hidden columns
+  // [d H / 2, (d + 1) H / 2) from its w2 shard, after both GEMM1s.
+  const bool localized = loc_sm_count > 0;
+  ASrc loc1[kNumDomains] = {}, loc2[kNumDomains] = {};
+  cudaStream_t loc_stream[kNumDomains] = {};
+  if (localized) {
+    TVM_FFI_ICHECK(kModuleGated && !per_token && !bias1.has_value() && !bias2.has_value())
+        << "a localized launch is gated and per tensor, without biases";
+    TVM_FFI_ICHECK(loc_weights.size() == 4 * kNumDomains && loc_geom.size() == 22 * kNumDomains &&
+                   loc_streams.size() == kNumDomains)
+        << "a localized launch takes two domains' shards, geometries and streams";
+    TVM_FFI_ICHECK(hidden % 256 == 0 && inter % 256 == 0)
+        << "a localized launch needs hidden and intermediate sizes that are multiples of 256";
+    for (int d = 0; d < kNumDomains; ++d) {
+      const Tensor w[4] = {loc_weights[4 * d], loc_weights[4 * d + 1], loc_weights[4 * d + 2],
+                           loc_weights[4 * d + 3]};
+      for (const Tensor& t : w) {
+        CHECK_DEVICE(TensorView(t), x);
+      }
+      auto geom = [&](int i) {
+        const auto g = loc_geom.begin() + 22 * d + 11 * i;
+        return Array<int64_t>(std::vector<int64_t>(g, g + 11));
+      };
+      loc1[d] = weight_of(w[0], w[1], geom(0), "w1 shard");
+      loc2[d] = weight_of(w[2], w[3], geom(1), "w2 shard");
+      TVM_FFI_ICHECK(loc1[d].fmt == a1.fmt && loc1[d].pair == a1.pair && loc1[d].rows == inter &&
+                     loc1[d].k == hidden && loc2[d].fmt == a2.fmt && 2 * loc2[d].rows == hidden &&
+                     loc2[d].k == inter && loc2[d].pair == Pair::kNone &&
+                     loc1[d].num_experts == num_local_experts &&
+                     loc2[d].num_experts == num_local_experts)
+          << "domain " << d << "'s shards must be w1's and w2's rows of the domain";
+      loc_stream[d] = reinterpret_cast<cudaStream_t>(loc_streams[d]);
+    }
+  }
+
   CHECK_DIM(2, x);
   TVM_FFI_ICHECK_EQ(x.size(0), tokens) << "x must be [num_tokens, ...]";
   TVM_FFI_ICHECK(x_fmt >= int64_t(XFmt::kBf16) && x_fmt <= int64_t(XFmt::kMxfp4Swz128x4))
@@ -495,6 +595,31 @@ void fp4_moe_sm90_run(
       cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, x.device().device_id),
       cudaSuccess)
       << "cudaDeviceGetAttribute(SM count)";
+  TVM_FFI_ICHECK(!localized || (loc_stream[0] != loc_stream[1] && loc_stream[0] != stream &&
+                                loc_stream[1] != stream))
+      << "localized streams must be distinct and differ from the current stream";
+  // One GEMM: plain, or localized with part(d, args) narrowing it to domain d.
+  auto gemm = [&](int variant, const GemmArgs& g, const char* name, auto part) {
+    auto launch = [&](const GemmArgs& args, int sms, cudaStream_t s) {
+      TVM_FFI_ICHECK_GE(
+          dispatch_gemm(variant, ap, args, static_cast<int>(cta_m), static_cast<int>(n), sms, s), 2)
+          << name << " tactic (" << cta_m << ", " << n << ") has no kernel (fewer than 2 stages)";
+    };
+    if (!localized) return launch(g, num_sms, stream);
+    DomainForkJoin fork_join(stream, loc_stream);
+    try {
+      fork_join.fork();
+      for (int d = 0; d < kNumDomains; ++d) {
+        GemmArgs gd = g;
+        part(d, gd);
+        launch(gd, static_cast<int>(loc_sm_count), loc_stream[d]);
+      }
+      fork_join.join();
+    } catch (...) {
+      fork_join.join_no_throw();
+      throw;
+    }
+  };
 
   // prep: routing sort, n-tile list, activation (de)quantization into GEMM1 B tiles
   PrepArgs prep = shape;
@@ -567,9 +692,11 @@ void fp4_moe_sm90_run(
   g1.epi.out_f16 = per_token ? 0 : kModuleF16;
   g1.epi.out_tiled = per_token ? 0 : 1;
   g1.sched = sched;
-  TVM_FFI_ICHECK_GE(
-      dispatch_gemm(v1, ap, g1, static_cast<int>(cta_m), static_cast<int>(n), num_sms, stream), 2)
-      << "GEMM1 tactic (" << cta_m << ", " << n << ") has no kernel (fewer than 2 stages)";
+  gemm(v1, g1, "GEMM1", [&](int d, GemmArgs& g) {
+    g.a = loc1[d];
+    // GEMM2's B tiles from K tile d I / 256 (out_ld keeps their K)
+    g.epi.out = at(l.act) + int64_t(d) * (inter / 256) * 2 * n * 128;
+  });
 
   // token-wise recipes: quantize GEMM1's rows into GEMM2 B tiles with per-row scales
   if (per_token) {
@@ -615,9 +742,10 @@ void fp4_moe_sm90_run(
   g2.epi.out_f16 = y.dtype() == dl_float16;
   g2.epi.out_tiled = 0;
   g2.sched = sched;
-  TVM_FFI_ICHECK_GE(
-      dispatch_gemm(v2, ap, g2, static_cast<int>(cta_m), static_cast<int>(n), num_sms, stream), 2)
-      << "GEMM2 tactic (" << cta_m << ", " << n << ") has no kernel (fewer than 2 stages)";
+  gemm(v2, g2, "GEMM2", [&](int d, GemmArgs& g) {
+    g.a = loc2[d];
+    g.epi.out = static_cast<char*>(y.data_ptr()) + int64_t(d) * (hidden / 2) * 2;  // 16-bit y
+  });
 
   if (out.has_value()) {
     TensorView o = out.value();
