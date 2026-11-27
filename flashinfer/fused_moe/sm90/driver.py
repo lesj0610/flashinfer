@@ -478,6 +478,12 @@ class Sm90Fp4MoeRunner(TunableRunner):
                 fc2_input_out[2],
             ]
         )
+        lora, act_out = kwargs.get("gemm1_lora_delta"), None
+        if lora is not None:  # the activation by expanded row, zero past GEMM2's K
+            width = lora.shape[2] // 2
+            act_out = (torch.zeros if width > inter else torch.empty)(
+                tokens * top_k, width, dtype=torch.bfloat16, device=x.device
+            )
         module.fp4_moe_sm90_run(
             x,
             None if x_sf is None else _bytes(x_sf),
@@ -510,15 +516,18 @@ class Sm90Fp4MoeRunner(TunableRunner):
             y,
             out if self.do_finalize else None,
             *fc2,
+            lora,
+            act_out,
             cta_m,
             n,
             stages,
             self.a_path,
             *self._localized_args(),
         )
+        rows = src_permuted.view(tokens, top_k)
         if self.do_finalize:
-            return [out]
-        return [y, weights, src_permuted.view(tokens, top_k)]
+            return [out] if lora is None else [out, rows, act_out]
+        return [y, weights, rows] + ([] if lora is None else [act_out])
 
 
 def sm90_fp4_moe(
@@ -542,6 +551,7 @@ def sm90_fp4_moe(
     a_path: int = 0,
     localized: Optional[Tuple[List[Sm90WeightView], List[int], int]] = None,
     fc2_input_out: Optional[Sequence[torch.Tensor]] = None,
+    gemm1_lora_delta: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """SM90 FP4 MoE: prep, GEMM1, row quantization (token-wise), GEMM2, finalize.
 
@@ -599,11 +609,19 @@ def sm90_fp4_moe(
         2]``, E4M3 (or uint8) block scales ``[>= num_tokens, top_k, codes' width / 8]`` and
         FP32 token scales ``[>= num_tokens, top_k]``; other ranks' slots and the columns past
         ``inter`` are zero. Not passed to autotuning.
+    gemm1_lora_delta : Optional[torch.Tensor]
+        Gated per tensor only: BF16 ``[num_tokens, top_k, 2 * I]`` (``I >= inter``) added to
+        GEMM1's rows before the activation in output units (after ``alpha``), ``[up; gate]``
+        halves by (token, slot).
+        The calls also return the activation (before GEMM2's input quantization), BF16
+        ``[num_tokens * top_k, I]`` by row of ``y``, as TRT-LLM's ``gemm1_output``. Not passed
+        to autotuning.
 
     Returns
     -------
     List[torch.Tensor]
-        See ``do_finalize``.
+        See ``do_finalize``; with ``gemm1_lora_delta`` ``[out, src_permuted, activation]`` or
+        ``[y, topk_weights, src_permuted, activation]``.
     """
     act = ActivationType(epi1.act)
     per_token = epi1.fq == Fq.NONE
@@ -629,6 +647,8 @@ def sm90_fp4_moe(
         raise _not_on_sm90("the token-wise recipe without NVFP4 per-token activations")
     if fc2_input_out is not None and not per_token:
         raise _not_on_sm90("fc2_input_out without the token-wise recipe")
+    if gemm1_lora_delta is not None and (per_token or not w1.gated):
+        raise _not_on_sm90("gemm1_lora_delta other than gated per tensor")
     if x.dtype != torch.uint8 and not _scalar(x_global):
         raise _not_on_sm90("16-bit input quantization without one global scale")
     if min(w1.num_experts, w2.num_experts) < num_local or epi1.alpha is None:
@@ -667,9 +687,12 @@ def sm90_fp4_moe(
         _, tactic = AutoTuner.get().choose_one(
             "flashinfer::fp4_moe_sm90", [runner], tuning, inputs
         )
-    if fc2_input_out is None:
-        return runner(inputs, tactic=tactic)
-    return runner(inputs, tactic=tactic, fc2_input_out=fc2_input_out)
+    extra: Dict[str, Any] = {}
+    if fc2_input_out is not None:
+        extra.update(fc2_input_out=fc2_input_out)
+    if gemm1_lora_delta is not None:
+        extra.update(gemm1_lora_delta=gemm1_lora_delta)
+    return runner(inputs, tactic=tactic, **extra)
 
 
 def _exact() -> bool:
@@ -715,6 +738,8 @@ def trtllm_fp4_sm90_moe(
         ActivationType.SwigluStep: ("gemm1_clamp_limit",),
     }.get(act, ())
     biases = ("gemm1_bias", "gemm2_bias")
+    # SM100 has no SiTU GEMM1 kernel with a BiasType::Mn delta
+    lora_ok = () if act == ActivationType.Situ else ("gemm1_lora_delta",)
     if act == ActivationType.SwigluStep and (
         a.get("gemm1_alpha") is not None or a.get("gemm1_beta") is not None
     ):  # as SM100's launcher
@@ -748,7 +773,8 @@ def trtllm_fp4_sm90_moe(
             "workspace_buffer",
             "routing_metadata",
         )
-        if a.get(n) is not None and (pt is not None or n not in params + biases)
+        if a.get(n) is not None
+        and (pt is not None or n not in params + biases + lora_ok)
     ]
     if (
         x.dtype != torch.uint8
@@ -823,8 +849,22 @@ def trtllm_fp4_sm90_moe(
                 f"{n} must be FP32 [local_num_experts] on the input's device."
             )
     gated = act.is_gated
+    lora = a.get("gemm1_lora_delta")
+    # records' check. SM100's FP4 entry passes the delta in gemm1_bias's place, so a per-expert
+    # gemm1_bias beside it is neither read nor checked
+    if lora is not None:
+        if not gated or lora.dtype != torch.bfloat16 or lora.shape != (
+            tokens, top_k, 2 * inter
+        ) or lora.device != x.device:  # fmt: skip
+            raise ValueError(
+                "gemm1_lora_delta takes a gated activation, BF16 [num_tokens, top_k, 2 * "
+                "intermediate_size]."
+            )
+        lora = lora.contiguous()
     # TRT-LLM's biases: FP32 on the weights' (shuffled) rows, in accumulator units
-    bias = [a.get(n) for n in biases]
+    bias = [
+        None if lora is not None and n == "gemm1_bias" else a.get(n) for n in biases
+    ]
     for n, t, rows in zip(biases, bias, (inter * (2 if gated else 1), rh), strict=True):
         if t is not None and (
             t.dtype != torch.float32
@@ -946,6 +986,7 @@ def trtllm_fp4_sm90_moe(
         tune_max_num_tokens=a["tune_max_num_tokens"],
         localized=localized,
         fc2_input_out=fo,
+        gemm1_lora_delta=lora,
     )
 
 

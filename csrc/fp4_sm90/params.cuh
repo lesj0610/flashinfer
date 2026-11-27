@@ -174,14 +174,24 @@ struct EpiArgs {
                            // FC1 rows carry output1_scale_scalar, as SM100); null = 1
   const float* fq_global;  // device fp32 scalar or per expert (fq_per_expert): global scale of
                            // the epilogue quantization (Fq != kNone); null = 1
-  uint8_t act;             // flashinfer.tllm_enums.ActivationType value
-  uint8_t fq;              // Fq (same as epi_fq(Cfg::kEpi); kept for runtime checks)
-  uint8_t recipe;          // kRecipe* bits (same as epi_recipe(Cfg::kEpi))
-  uint8_t out_f16;         // 1: FP16 output, 0: BF16 output
-  uint8_t out_tiled;       // 1: write GEMM2 input tiles (expert order, SW128); 0: row-major
-  uint8_t bias_f16;        // 1: FP16 bias, 0: BF16 bias
-  uint8_t bias_trtllm;     // 1: TRT-LLM's FP32 bias on the weight's rows, accumulator units
-  uint8_t fq_per_expert;   // 1: fq_global is [E_local] (TRT-LLM's per-expert scalars)
+  // TRT-LLM's gemm1_lora_delta, read by the gated GEMM1 with the NVFP4 quantization only: BF16
+  // rows of lora_ld values by token * top_k + slot (lora_row[output row]), [up; gate] lora_half
+  // apart, added to the activation's inputs; null = none. act_out: the activation (before the
+  // quantization) as rows of act_out_ld values by output row; null = none.
+  const void* lora;
+  const int32_t* lora_row;
+  int64_t lora_ld;
+  int64_t lora_half;
+  void* act_out;
+  int64_t act_out_ld;
+  uint8_t act;            // flashinfer.tllm_enums.ActivationType value
+  uint8_t fq;             // Fq (same as epi_fq(Cfg::kEpi); kept for runtime checks)
+  uint8_t recipe;         // kRecipe* bits (same as epi_recipe(Cfg::kEpi))
+  uint8_t out_f16;        // 1: FP16 output, 0: BF16 output
+  uint8_t out_tiled;      // 1: write GEMM2 input tiles (expert order, SW128); 0: row-major
+  uint8_t bias_f16;       // 1: FP16 bias, 0: BF16 bias
+  uint8_t bias_trtllm;    // 1: TRT-LLM's FP32 bias on the weight's rows, accumulator units
+  uint8_t fq_per_expert;  // 1: fq_global is [E_local] (TRT-LLM's per-expert scalars)
 };
 
 // Persistent schedule written by prep. Expanded rows p are sorted by local expert; expert e owns

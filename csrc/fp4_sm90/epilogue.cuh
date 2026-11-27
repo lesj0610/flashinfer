@@ -405,6 +405,9 @@ struct Epilogue {
     const epi::ActQ q = kGemm2 ? epi::ActQ{1.f, 0.f, 0.f}
                                : epi::act_params(act, ep.act_x, ep.act_y, ep.act_z, expert);
     const void* const bias = ep.bias;
+    // gemm1_lora_delta: compiled into the gated GEMM1 with the NVFP4 quantization only
+    constexpr bool kLora = kGated && kFqNvfp4;
+    const __nv_bfloat16* const lora = kLora ? static_cast<const __nv_bfloat16*>(ep.lora) : nullptr;
     const int64_t bias0 = static_cast<int64_t>(expert) * rows;
     const int lr = lane >> 2, lc = (lane & 3) * 2;
     const int p_end = n0 + n_valid;
@@ -446,9 +449,17 @@ struct Epilogue {
       }
     };
     auto add_bias = [&](float x, float b) { return bias != nullptr ? x + b : x; };
-    auto gated_value = [&](float gv, float uv, float rs, int mi) {
-      return epi::act_gated<epi::kActFixed>(act, add_bias(pre(gv, rs), bb[mi][0]),
-                                            add_bias(pre(uv, rs), bb[mi][1]), q);
+    // (n-tile row r, output column c)
+    auto gated_value = [&](float gv, float uv, float rs, int mi, int r, int c) {
+      float g = add_bias(pre(gv, rs), bb[mi][0]), u = add_bias(pre(uv, rs), bb[mi][1]);
+      // The [up; gate] row of the output row's (token, slot), in output units as the
+      // reference and the SM8x path add it.
+      if (lora != nullptr) {
+        const __nv_bfloat16* d = lora + __ldg(ep.lora_row + n0 + r) * ep.lora_ld + c;
+        u += epi::to_f<__nv_bfloat16>(d[0]);
+        g += epi::to_f<__nv_bfloat16>(d[ep.lora_half]);
+      }
+      return epi::act_gated<epi::kActFixed>(act, g, u, q);
     };
     auto plain_value = [&](float v, float rs, int mi, int h) {
       const float x = add_bias(pre(v, rs), bb[mi][h]);
@@ -482,7 +493,7 @@ struct Epilogue {
               const int c = col0 + 32 * mi;
               const bool ok = pv && c < ncols;
               const float y = ok ? gated_value(acc[(mi * kJ + j) * 4 + h],
-                                               acc[(mi * kJ + j) * 4 + 2 + h], rs, mi)
+                                               acc[(mi * kJ + j) * 4 + 2 + h], rs, mi, r, c)
                                  : 0.f;
               put(c, r, ok, y);
             } else {
@@ -502,6 +513,22 @@ struct Epilogue {
       const int wcol0 = kGated ? (m0 >> 1) + wg * (kCtaM / 4) : m0 + wg * (kCtaM / 2);
       const uint32_t st = staging_smem + wg * (kUnits * 16 * kNc);
       const int tid = warp * 32 + lane;
+      // 16 values from column c0 into row n0 + r of a row-major T matrix, cut at ncols.
+      auto store16 = [&](T* base, int64_t ld, int c0, int r, const uint4(&o)[2]) {
+        T* dst = base + static_cast<int64_t>(n0 + r) * ld + c0;
+        if (c0 + 16 <= ncols && (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
+          reinterpret_cast<uint4*>(dst)[0] = o[0];
+          reinterpret_cast<uint4*>(dst)[1] = o[1];
+        } else {
+          const uint32_t w[8] = {o[0].x, o[0].y, o[0].z, o[0].w, o[1].x, o[1].y, o[1].z, o[1].w};
+#pragma unroll
+          for (int i = 0; i < 16; ++i)
+            if (c0 + i < ncols) {
+              const uint16_t b = static_cast<uint16_t>(w[i / 2] >> (16 * (i % 2)));
+              reinterpret_cast<uint16_t*>(dst)[i] = b;
+            }
+        }
+      };
       auto put16 = [&](int c0, int r, bool ok, const uint4(&o)[2]) {
         if (ep.out_tiled) {
           if (c0 < kp) {
@@ -513,21 +540,10 @@ struct Epilogue {
             }
           }
         } else if (ok) {
-          T* dst = static_cast<T*>(ep.out) + static_cast<int64_t>(n0 + r) * ep.out_ld + c0;
-          if (c0 + 16 <= ncols && (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
-            reinterpret_cast<uint4*>(dst)[0] = o[0];
-            reinterpret_cast<uint4*>(dst)[1] = o[1];
-          } else {
-            const uint32_t w[8] = {o[0].x, o[0].y, o[0].z, o[0].w, o[1].x, o[1].y, o[1].z, o[1].w};
-#pragma unroll
-            for (int i = 0; i < 16; ++i)
-              if (c0 + i < ncols) {
-                const uint16_t b = static_cast<uint16_t>(w[i / 2] >> (16 * (i % 2)));
-                reinterpret_cast<uint16_t*>(dst)[i] = b;
-              }
-          }
+          store16(static_cast<T*>(ep.out), ep.out_ld, c0, r, o);
         }
       };
+      T* const act_out = kLora ? static_cast<T*>(ep.act_out) : nullptr;
       // T(y) of every output this thread owns, tokens h = 0 / 1 packed in one register: made
       // before the chunk loop, so the fp32 accumulators are dead when the first chunk quantizes
       // and the staged values hold half their registers.
@@ -539,10 +555,11 @@ struct Epilogue {
         for (int mi = 0; mi < kM64; ++mi) {
           const int a = (mi * kJ + j) * 4;
           if constexpr (kGated) {
-            const bool ok = wcol0 + 32 * mi + 8 * warp + lr < ncols;
-            yp[mi * kJ + j] =
-                epi::bits2<T>(ok && pv0 ? gated_value(acc[a], acc[a + 2], 0.f, mi) : 0.f,
-                              ok && pv1 ? gated_value(acc[a + 1], acc[a + 3], 0.f, mi) : 0.f);
+            const int c = wcol0 + 32 * mi + 8 * warp + lr, r = 8 * j + lc;
+            const bool ok = c < ncols;
+            yp[mi * kJ + j] = epi::bits2<T>(
+                ok && pv0 ? gated_value(acc[a], acc[a + 2], 0.f, mi, r, c) : 0.f,
+                ok && pv1 ? gated_value(acc[a + 1], acc[a + 3], 0.f, mi, r + 1, c) : 0.f);
           } else {
 #pragma unroll
             for (int hh = 0; hh < 2; ++hh) {
@@ -588,8 +605,10 @@ struct Epilogue {
           if (ok) {
             const uint32_t row = st + tl * (kUnits * 16);
             const int x = tl % kUnits;
-            auto v = epi::packed16<T>(epi::lds128(row + (((2 * blk) ^ x) << 4)),
-                                      epi::lds128(row + (((2 * blk + 1) ^ x) << 4)));
+            const uint4 t[2] = {epi::lds128(row + (((2 * blk) ^ x) << 4)),
+                                epi::lds128(row + (((2 * blk + 1) ^ x) << 4))};
+            if (act_out != nullptr) store16(act_out, ep.act_out_ld, c0, r, t);
+            auto v = epi::packed16<T>(t[0], t[1]);
             uint8_t sf;
             epi::nvfp4_block<kRecipe, epi::kExact, T, T>(v, fq_global, 0.f, o, sf);
           }

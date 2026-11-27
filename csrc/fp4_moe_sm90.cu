@@ -427,6 +427,11 @@ void fp4_moe_sm90_run(
     // [>= T, top_k, I / 2], linear E4M3 scales [>= T, top_k, I / 16] and token scales
     // [>= T, top_k]
     Optional<TensorView> fc2_codes, Optional<TensorView> fc2_sf, Optional<TensorView> fc2_tok,
+    // gemm1_lora_delta (gated, per tensor): BF16 [T, top_k, 2 * I] by (token, slot), [up; gate]
+    // with I >= the GEMM2 K, added before the activation in output units; act_out receives
+    // the activation by
+    // expanded row, GEMM1's output dtype [>= T * top_k, >= the GEMM2 K]
+    Optional<TensorView> lora, Optional<TensorView> act_out,
     // tactic
     int64_t cta_m, int64_t n, int64_t stages, int64_t a_path,
     // localization (SM100's localized_*): per domain its shards' w1 codes, w1 scales, w2 codes and
@@ -528,6 +533,25 @@ void fp4_moe_sm90_run(
                    tk.size(1) == top_k)
         << "fc2_input_out tensors must be [>= num_tokens, top_k, ...] of the codes' width";
   }
+  TVM_FFI_ICHECK_EQ(lora.has_value(), act_out.has_value())
+      << "gemm1_lora_delta and its activation output go together";
+  if (lora.has_value()) {
+    TVM_FFI_ICHECK(kModuleGated && !per_token) << "gemm1_lora_delta needs a gated activation "
+                                                  "per tensor";
+    const TensorView d = lora.value(), o = act_out.value();
+    CHECK_INPUT_AND_TYPE(d, dl_bfloat16);
+    CHECK_INPUT_AND_TYPE(o, kModuleF16 ? dl_float16 : dl_bfloat16);
+    for (const TensorView& t : {d, o}) {
+      CHECK_DEVICE(t, x);
+    }
+    CHECK_DIM(3, d);
+    CHECK_DIM(2, o);
+    TVM_FFI_ICHECK(d.size(0) == tokens && d.size(1) == top_k && d.size(2) % 2 == 0 &&
+                   d.size(2) >= 2 * inter)
+        << "gemm1_lora_delta must be [num_tokens, top_k, 2 * I] with I >= the GEMM2 K";
+    TVM_FFI_ICHECK(o.size(0) >= rows && o.size(1) >= inter)
+        << "the activation output must be [>= num_tokens * top_k, >= the GEMM2 K]";
+  }
   // GEMM1 activation parameters (cutlass_fused_moe's ActivationParams)
   for (const Optional<TensorView>* p : {&act_x, &act_y, &act_z}) {
     if (!p->has_value()) continue;
@@ -561,8 +585,9 @@ void fp4_moe_sm90_run(
   ASrc loc1[kNumDomains] = {}, loc2[kNumDomains] = {};
   cudaStream_t loc_stream[kNumDomains] = {};
   if (localized) {
-    TVM_FFI_ICHECK(kModuleGated && !per_token && !bias1.has_value() && !bias2.has_value())
-        << "a localized launch is gated and per tensor, without biases";
+    TVM_FFI_ICHECK(kModuleGated && !per_token && !bias1.has_value() && !bias2.has_value() &&
+                   !lora.has_value())
+        << "a localized launch is gated and per tensor, without biases or LoRA deltas";
     TVM_FFI_ICHECK(loc_weights.size() == 4 * kNumDomains && loc_geom.size() == 22 * kNumDomains &&
                    loc_streams.size() == kNumDomains)
         << "a localized launch takes two domains' shards, geometries and streams";
@@ -725,6 +750,12 @@ void fp4_moe_sm90_run(
   g1.epi.out = at(l.act);
   g1.epi.out_ld = inter;
   g1.epi.out_scale = static_cast<const float*>(ptr(out_scale1));
+  g1.epi.lora = ptr(lora);
+  g1.epi.lora_row = lora.has_value() ? prep.permuted_src : nullptr;
+  g1.epi.lora_ld = lora.has_value() ? lora.value().size(2) : 0;
+  g1.epi.lora_half = g1.epi.lora_ld / 2;
+  g1.epi.act_out = ptr(act_out);
+  g1.epi.act_out_ld = act_out.has_value() ? act_out.value().size(1) : 0;
   // fq_global: per tensor GEMM1's output global scale, per token the row quantization's inverse
   // global scale (null: the recipe's)
   const float* const fq_g =
