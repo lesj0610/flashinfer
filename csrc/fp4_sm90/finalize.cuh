@@ -17,7 +17,7 @@
 //   out[t, c] = OT(sum over slots k = 0 .. top_k - 1 in order of w[t, k] y[src_permuted[t, k], c])
 // in FP32 from 0, one FMA per slot; slots without a local row (src_permuted -1) are skipped and
 // a null topk_weights is weight 1. Deterministic: the order depends on neither the routing nor
-// the launch.
+// the launch. keep_unrouted: a token without a local row keeps its out row (all-to-all).
 #pragma once
 
 #include <cuda_bf16.h>
@@ -77,9 +77,11 @@ __global__ void __launch_bounds__(kThreads) finalize_kernel(FinalizeArgs a) {
     float acc[V];
 #pragma unroll
     for (int v = 0; v < V; ++v) acc[v] = 0.f;
+    bool routed = false;
     for (int k = 0; k < a.top_k; ++k) {
       const int row = a.src_permuted[slot0 + k];
       if (row < 0) continue;
+      routed = true;
       const float wk = w != nullptr ? ld1(w + slot0 + k) : 1.f;
       const YT* src = y + static_cast<int64_t>(row) * a.y_ld + c0;
       float f[V];
@@ -91,6 +93,7 @@ __global__ void __launch_bounds__(kThreads) finalize_kernel(FinalizeArgs a) {
 #pragma unroll
       for (int v = 0; v < V; ++v) acc[v] = fmaf(wk, f[v], acc[v]);
     }
+    if (!routed && a.keep_unrouted) continue;
     OT* dst = out + static_cast<int64_t>(t) * a.out_ld + c0;
     if constexpr (V == 8) {
       st8(dst, acc);

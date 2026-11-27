@@ -243,13 +243,14 @@ struct PrepArgs {
   int64_t x_ld;         // elements (BF16/FP16) or bytes (FP4) between rows
   int k;
   XFmt x_fmt;
-  const float* x_global;  // per-tensor input global scale used by in-prep quantization; null = none
+  const float* x_global;  // input global scale used by in-prep quantization; null = none
   uint8_t quantize;       // 1: quantize BF16/FP16 x with `recipe`, keep the dequantized value
   uint8_t per_token;      // 1: per-token global scale (written to tok_scale)
   uint8_t recipe;         // kRecipe* bits
   uint8_t f16;            // B element type FP16 (else BF16)
   int n;                  // kN of the GEMMs (n-tile size)
   int max_tiles;
+  uint8_t x_global_per_expert;  // 1: x_global per local expert (per tensor, MoE only)
   // outputs
   int32_t* expert_offset;     // [num_local_experts + 1]
   int32_t* expert_tile_base;  // [num_local_experts + 1]
@@ -306,6 +307,7 @@ struct FinalizeArgs {
   int tokens;
   int top_k;
   int hidden;
+  uint8_t keep_unrouted;  // 1: tokens without a local row keep their out row
 };
 
 // ---------------------------------------------------------------------------------------------

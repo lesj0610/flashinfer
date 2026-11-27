@@ -438,7 +438,9 @@ void fp4_moe_sm90_run(
     // w2 scales (uint8 views) and their geometries (w1's, then w2's), the domain streams and the
     // SM count of each (0: off)
     Array<Tensor> loc_weights, Array<int64_t> loc_geom, Array<int64_t> loc_streams,
-    int64_t loc_sm_count) {
+    int64_t loc_sm_count,
+    // all-to-all: tokens without a local expert keep their out row
+    bool keep_unrouted) {
   CHECK_CUDA(x);
   CHECK_CONTIGUOUS(x);
   CHECK_INPUT_AND_TYPE(topk_ids, dl_int32);
@@ -491,7 +493,9 @@ void fp4_moe_sm90_run(
   if (x_global.has_value()) {
     CHECK_INPUT_AND_TYPE(x_global.value(), dl_float32);
     CHECK_DEVICE(x_global.value(), x);
-    TVM_FFI_ICHECK_EQ(x_global.value().numel(), 1) << "input global scale must be a scalar";
+    TVM_FFI_ICHECK(x_global.value().numel() == 1 ||
+                   (!per_token && x_global.value().numel() == num_local_experts))
+        << "input global scale must be a scalar (per tensor also [num_local_experts])";
   }
   TVM_FFI_ICHECK(!quantize || x_global.has_value()) << "input quantization needs a global scale";
   if (fq_global.has_value()) {
@@ -697,6 +701,7 @@ void fp4_moe_sm90_run(
           : 0;
   prep.x_global =
       x_global.has_value() ? static_cast<const float*>(x_global.value().data_ptr()) : nullptr;
+  prep.x_global_per_expert = x_global.has_value() && x_global.value().numel() > 1;
   prep.expert_offset = reinterpret_cast<int32_t*>(at(l.expert_offset));
   prep.expert_tile_base = reinterpret_cast<int32_t*>(at(l.expert_tile_base));
   prep.permuted_src = reinterpret_cast<int32_t*>(at(l.permuted_src));
@@ -861,6 +866,7 @@ void fp4_moe_sm90_run(
     fin.tokens = tokens;
     fin.top_k = top_k;
     fin.hidden = static_cast<int>(o.size(1));  // the first out columns of y
+    fin.keep_unrouted = keep_unrouted;
     launch_fp4_sm90_finalize(fin, stream);
   }
 }

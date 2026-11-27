@@ -25,7 +25,8 @@
 // fp4_quantize / nvfp4_quantize(per_token_activation=True) of the same recipe.
 //
 // x_global:
-//   per_token = 0, quantize = 1: the global (encode) scale of fp4_quantize; null = 1.
+//   per_token = 0, quantize = 1: the global (encode) scale of fp4_quantize, one or one per
+//                                local expert (x_global_per_expert); null = 1.
 //   per_token = 1, quantize = 1: the inverse global scale of the per-token recipe
 //                                (a_global_sf of nvfp4_quantize); null = 1 / (E4M3_MAX * 6).
 // An FP4 input keeps its per-token scale outside prep (per_token needs quantize).
@@ -395,7 +396,7 @@ __global__ void __launch_bounds__(kTileThreads) prep_tiles(PrepArgs a, TileParam
                                      pts);
         if (threadIdx.x == 0) a.tok_scale[p] = pts;
       } else {
-        enc = a.x_global ? *a.x_global : 1.0f;
+        enc = a.x_global ? a.x_global[a.x_global_per_expert ? e : 0] : 1.0f;
       }
       for (int j = threadIdx.x; j < chunks; j += kTileThreads) {
         uint4 lo = zero, hi = zero;

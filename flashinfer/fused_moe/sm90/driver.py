@@ -260,15 +260,28 @@ def sm90_fp4_valid_tactics(
     )
 
 
-def _scalar(t: Optional[torch.Tensor]) -> bool:
-    return t is not None and t.numel() == 1
+def _device_fp32(t: torch.Tensor, what: str) -> torch.Tensor:
+    """``t`` as the device FP32 vector the kernel reads (no host read, graph-capture safe)."""
+    if not t.is_cuda or t.dtype != torch.float32:
+        raise TypeError(f"SM90 FP4 MoE: {what} must be a CUDA FP32 tensor")
+    return t.reshape(-1).contiguous()
 
 
-def _device_scalar(t: torch.Tensor, what: str) -> torch.Tensor:
-    """``t`` as the device FP32 scalar the kernel reads (no host read, graph-capture safe)."""
-    if not t.is_cuda or t.dtype != torch.float32 or t.numel() != 1:
-        raise TypeError(f"SM90 FP4 MoE: {what} must be a CUDA FP32 scalar tensor")
-    return t.reshape(1)
+def _check_act_globals(fc1: torch.Tensor, fc2: torch.Tensor, experts: int) -> None:
+    """SM100's NVFP4 checks of the activation global scales (``quant_scales[0]`` and
+    ``[3]``), in its order: a scalar or one per local expert."""
+    given = ((fc1, "fc1"), (fc2, "fc2"))
+    for t, n in given:
+        if t.dtype != torch.float32:
+            raise RuntimeError(f"Inconsistency of Tensor type: {n}_act_global")
+    for t, n in given:
+        if t.dim() > 1:
+            raise RuntimeError(f"{n} act global must be a scalar or 1-D tensor")
+    for t, n in given:
+        if t.dim() == 1 and t.shape[0] != experts:
+            raise RuntimeError(
+                f"{n} act global must be scalar or (num_experts_on_rank,)"
+            )
 
 
 def _geometry(w: Sm90WeightView) -> List[int]:
@@ -375,9 +388,11 @@ class Sm90Fp4MoeRunner(TunableRunner):
         do_finalize: bool = True,
         a_path: int = 0,
         localized: Optional[Tuple[List[Sm90WeightView], List[int], int]] = None,
+        keep_unrouted: bool = False,
     ):
         self.w1, self.w2, self.epi1, self.epi2 = w1, w2, epi1, epi2
         self.localized = localized
+        self.keep_unrouted = keep_unrouted
         self.num_experts, self.num_local_experts = num_experts, num_local_experts
         self.local_expert_offset = local_expert_offset
         self.recipe, self.exact, self.x_global = recipe, exact, x_global
@@ -527,6 +542,7 @@ class Sm90Fp4MoeRunner(TunableRunner):
             stages,
             self.a_path,
             *self._localized_args(),
+            self.keep_unrouted,
         )
         rows = src_permuted.view(tokens, top_k)
         if self.do_finalize:
@@ -556,6 +572,7 @@ def sm90_fp4_moe(
     localized: Optional[Tuple[List[Sm90WeightView], List[int], int]] = None,
     fc2_input_out: Optional[Sequence[torch.Tensor]] = None,
     gemm1_lora_delta: Optional[torch.Tensor] = None,
+    keep_unrouted: bool = False,
 ) -> List[torch.Tensor]:
     """SM90 FP4 MoE: prep, GEMM1, row quantization (token-wise), GEMM2, finalize.
 
@@ -589,7 +606,8 @@ def sm90_fp4_moe(
     exact : bool
         Quantizers without fast math (``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH``).
     x_global : Optional[torch.Tensor]
-        FP32 scalar global scale of the in-prep input quantization (16-bit ``x``).
+        FP32 global scale of the in-prep input quantization (16-bit ``x``): a scalar, or
+        ``[num_local_experts]`` per tensor (each expanded row quantized with its expert's).
     token_scale : Optional[torch.Tensor]
         FP32 ``[num_tokens]`` per-token scales of NVFP4 ``x`` (token-wise recipe).
     x_sf_swizzled : bool
@@ -620,6 +638,9 @@ def sm90_fp4_moe(
         The calls also return the activation (before GEMM2's input quantization), BF16
         ``[num_tokens * top_k, I]`` by row of ``y``, as TRT-LLM's ``gemm1_output``. Not passed
         to autotuning.
+    keep_unrouted : bool
+        Finalize leaves the ``out`` rows of tokens without a local expert as they are (the
+        all-to-all behavior of SM100's unfused finalize) instead of writing zeros.
 
     Returns
     -------
@@ -653,8 +674,12 @@ def sm90_fp4_moe(
         raise _not_on_sm90("fc2_input_out without the token-wise recipe")
     if gemm1_lora_delta is not None and not w1.gated:
         raise _not_on_sm90("gemm1_lora_delta without a gated activation")
-    if x.dtype != torch.uint8 and not _scalar(x_global):
-        raise _not_on_sm90("16-bit input quantization without one global scale")
+    if x.dtype != torch.uint8 and (
+        x_global is None or x_global.numel() not in (1, num_local)
+    ):
+        raise _not_on_sm90(
+            "16-bit input quantization without a global scale per tensor or per local expert"
+        )
     if min(w1.num_experts, w2.num_experts) < num_local or epi1.alpha is None:
         raise ValueError("SM90 FP4 MoE: weights and alphas of every local expert")
     ids = routing.topk_ids
@@ -677,11 +702,14 @@ def sm90_fp4_moe(
         num_local_experts=num_local,
         recipe=recipe,
         exact=exact,
-        x_global=None if x.dtype == torch.uint8 else x_global.float().reshape(1),
+        x_global=None
+        if x.dtype == torch.uint8
+        else x_global.float().reshape(-1).contiguous(),
         x_sf_swizzled=x_sf_swizzled,
         do_finalize=do_finalize,
         a_path=a_path,
         localized=localized,
+        keep_unrouted=keep_unrouted,
     )
     inputs = [x, ids, weights, x_sf, token_scale, out if do_finalize else None]
     if isinstance(tactic, int) and tactic == -1:
@@ -999,8 +1027,22 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
     their defaults, ``tactic`` an SM90 tactic or -1) on SM90 with the resolved ``recipe``:
     NVFP4 x NVFP4 per tensor, BF16/FP16 or NVFP4 input."""
     qs, act = a["quant_scales"], ActivationType(a["activation_type"])
+    # As SM100's argument conversion (quant_scales is an optional list of tensors), then its
+    # runMoe: the cluster first, the quant scales' count, the activation global scales.
+    for i, t in enumerate(qs or ()):
+        if not isinstance(t, torch.Tensor):
+            raise TypeError(
+                f"quant_scales[{i}] must be a tensor, not {type(t).__name__}"
+            )
+    if a.get("cluster_size", 1) != 1 or a.get("cluster_rank", 0) != 0:
+        raise RuntimeError("smart_router is supported in min_latency mode")
+    if qs is None:
+        raise RuntimeError("Expecting quant scales for nvfp4 quantization")
+    if len(qs) != 6:
+        raise RuntimeError("Expecting 6 quant scales for nvfp4 quantization")
     x, x_sf, out = a["input"], a.get("input_sf"), a["output"]
     fc1, fc2 = a["fc1_expert_weights"], a["fc2_expert_weights"]
+    _check_act_globals(qs[0], qs[3], fc2.shape[0])
     profile_ids = a.get("profile_ids")
     if profile_ids is not None and len(profile_ids) != 2:
         raise ValueError("profile_ids must contain [gemm1_profile, gemm2_profile]")
@@ -1023,23 +1065,16 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
     codes = x.dtype == torch.uint8
     ep_size, ep_rank = a.get("ep_size", 1), a.get("ep_rank", 0)
     if (
-        len(qs) != 6
-        or act not in SM90_FP4_ACTIVATIONS
+        act not in SM90_FP4_ACTIVATIONS
         or unsupported
-        or a.get("cluster_size", 1) != 1
-        or a.get("use_packed_weights", False)
-        or (a.get("enable_alltoall", False) and ep_size > 1)
         or a["output_dtype"] not in (torch.bfloat16, torch.float16)
         or codes != (x_sf is not None)
         or (not codes and x.dtype not in (torch.bfloat16, torch.float16))
-        or (not codes and not _scalar(qs[0]))
-        or not _scalar(qs[3])
         or qs[2].numel() != fc1.shape[0]
         or qs[5].numel() != fc1.shape[0]
     ):
         raise _not_on_sm90(
-            "CUTLASS FP4 MoE outside NVFP4 x NVFP4 per tensor with one global input scale "
-            f"per tensor (set: {unsupported})"
+            f"CUTLASS FP4 MoE outside NVFP4 x NVFP4 per tensor (set: {unsupported})"
         )
     if (biases[0] is None) != (biases[1] is None):
         raise ValueError("fc1_expert_biases and fc2_expert_biases go together")
@@ -1115,7 +1150,7 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
             alpha=qs[2],
             act_params=act_params,
             bias=biases[0],
-            fq_global=_device_scalar(qs[3], "the GEMM2 input global scale"),
+            fq_global=_device_fp32(qs[3], "the GEMM2 input global scale"),
         ),
         Sm90EpilogueSpec(
             int(ActivationType.Identity),
@@ -1128,9 +1163,11 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
         tactic=None if profile_ids is not None else a.get("tactic", -1),
         recipe=recipe,
         exact=_exact(),
-        x_global=None if codes else qs[0],
+        x_global=None if codes else _device_fp32(qs[0], "the input global scale"),
         x_sf_swizzled=codes and a.get("swizzled_input_sf", False),
         tune_max_num_tokens=a.get("tune_max_num_tokens", 8192),
+        # As SM100's unfused finalize: under all-to-all the rows without a local expert stay
+        keep_unrouted=a.get("enable_alltoall", False) and ep_size > 1,
     )
     return out
 
