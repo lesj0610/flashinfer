@@ -30,6 +30,7 @@ import cuda.tile as ct
 import torch
 
 from ...cutile.cutile_common import cached_replace_hints
+from ...utils import get_compute_capability
 from ..api import ActivationConfig
 from .activation import (
     _activation_kernel_args,
@@ -276,6 +277,19 @@ def _quantize_i64(
 def quantize(
     x, q, scale, partials, *, block_scaled, valid_rows=None, scale_ready=False
 ):
+    if get_compute_capability(x.device)[0] == 8:
+        # cuda-tile has no FP8 target on SM8x.
+        from ..sm8x_fp8_moe import cutile_fp8_quantize
+
+        cutile_fp8_quantize(
+            x,
+            q,
+            scale,
+            block_scaled=block_scaled,
+            valid_rows=valid_rows,
+            scale_ready=scale_ready,
+        )
+        return
     stream = torch.cuda.current_stream(x.device)
     if not block_scaled and not scale_ready:
         _quantize_scale(x, scale, partials, valid_rows)

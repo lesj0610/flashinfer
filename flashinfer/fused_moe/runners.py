@@ -3390,6 +3390,10 @@ class CuTileBf16Runner(MoERunner):
         with torch.cuda.device(self.device):
             return torch.cuda.is_current_stream_capturing()
 
+    def _uses_cuda_tile(self) -> bool:
+        """Whether this runner launches cuTile kernels on its device."""
+        return True
+
     def _check_support(self) -> None:
         super()._check_support()
         if not self.config.finalize.do_finalize:
@@ -3405,6 +3409,8 @@ class CuTileBf16Runner(MoERunner):
                 f"{type(self).__name__} does not support SM{self._device_arch}; "
                 f"supported architectures are {self._supported_archs}."
             )
+        if not self._uses_cuda_tile():
+            return
         from ..cutile import is_cuda_tile_available
 
         with torch.cuda.device(self.device):
@@ -4010,13 +4016,53 @@ class _CuTileFp8Runner(CuTileBf16Runner):
             return (2, 2) if self._block_scaled else (4, 4)
         return (2, 1) if self.config.activation.is_gated else (1, 2)
 
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__(config, device)
+        self._sm8x: Any = None  # set by check_support
+
+    @classmethod
+    def _sm8x_body_class(cls) -> Any:
+        """The ``sm8x_fp8_moe`` pipeline that runs this mode where cuda-tile has
+        no FP8 target (its ``_supported_archs``), or None."""
+        if not cls._activation_fp8:
+            return None
+        from .sm8x_fp8_moe import (
+            Sm8xCuTileFp8PerTensorMoE,
+            Sm8xCuTileMxfp4Mxfp8MoE,
+            Sm8xCuTileMxfp8MoE,
+        )
+
+        if cls._weight_fp4:
+            return Sm8xCuTileMxfp4Mxfp8MoE
+        if cls._block_scaled:
+            return Sm8xCuTileMxfp8MoE
+        return Sm8xCuTileFp8PerTensorMoE
+
+    def _uses_cuda_tile(self) -> bool:
+        return self._sm8x is None
+
     def _check_support(self) -> None:
+        body = self._sm8x_body_class()
+        if body is not None and self._device_arch in body._supported_archs:
+            self._sm8x = body(self.config, self.device)
         super()._check_support()
+        if self._sm8x is not None:
+            self._sm8x.check_support()
 
     def _build(self) -> None:
+        if self._sm8x is not None:
+            self._sm8x.build()
+            return
         from .cutile import fp8
 
         self._kernel_module = fp8
+
+    def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
+        if self._sm8x is not None:
+            self._require_built()
+            self._sm8x._ensure_workspace(num_tokens, hidden_size)
+            return
+        super()._ensure_workspace(num_tokens, hidden_size)
 
     def _workspace_kwargs(self, max_num_assignments: int) -> dict[str, Any]:
         del max_num_assignments
@@ -4025,6 +4071,8 @@ class _CuTileFp8Runner(CuTileBf16Runner):
         )
 
     def _factorized_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
+        if self._sm8x is not None:
+            return (self._sm8x._segment_alignment,)
         rows_per_expert = (
             num_assignments + self.config.routing.num_experts - 1
         ) // self.config.routing.num_experts
@@ -4214,6 +4262,9 @@ class _CuTileFp8Runner(CuTileBf16Runner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
         self._require_built()
+        if self._sm8x is not None:
+            # The SM8x pipeline has one schedule; forward validates and ignores it.
+            return [(1, *self._fallback_tactic(inputs))]
         gather = (
             [(0, *tactic) for tactic in self._factorized_tactics(inputs)]
             if self._include_gather_tactics(inputs[2].numel())
@@ -4269,8 +4320,11 @@ class _CuTileFp8Runner(CuTileBf16Runner):
             if w.dtype != dtype:
                 raise TypeError(f"{name} must use {dtype}.")
             scale_shape: tuple[int, ...]
-            if self._weight_fp4:
+            if self._weight_fp4 and self._device_arch >= 100:
                 scale_shape = (experts, (n + 127) // 128, (k // 32 + 3) // 4, 32, 16)
+            elif self._weight_fp4:
+                # Prepare keeps the logical layout below SM100 (the SM8x body).
+                scale_shape = (experts, n, k // 32)
             else:
                 scale_shape = (
                     (experts, n, k // 32) if self._block_scaled else (experts,)
@@ -4342,6 +4396,8 @@ class _CuTileFp8Runner(CuTileBf16Runner):
                 raise NotImplementedError(
                     f"{type(self).__name__} GEMM{stage}: {reason}."
                 )
+        if self._sm8x is not None:
+            return self._sm8x.run(inputs)
         self._ensure_workspace(*inputs[1].shape)
         return self._kernel_module.run_moe(
             *inputs[1:4],
