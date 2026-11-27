@@ -118,6 +118,7 @@ def expand_csf_scales(
     layout: SfLayout = SfLayout.layout_linear,
     swap_row_halves: bool = False,
     local_expert_offset: int = 0,
+    transpose: bool = False,
 ) -> torch.Tensor:
     r"""Expand CSF block scales into a scale buffer, one matrix per expert.
 
@@ -129,13 +130,18 @@ def expand_csf_scales(
     csf : CsfScales
         Scales from :func:`encode_csf_scales`, one matrix per expert. Expansion takes about
         192 bytes of shared memory per column, so ``cols`` can be at most 864 on SM80, 1200
-        on SM90 and SM100, and 518 on SM86, SM89 and SM120.
+        on SM90 and SM100, and 518 on SM86, SM89 and SM120. A transposed ``bfloat16`` ``out``
+        takes 512 bytes more, which lowers the limit to 862 on SM80 and 512 on SM86, SM89 and
+        SM120.
     out : torch.Tensor
-        Contiguous destination in a one-byte dtype on the scales' device, written in place:
+        Contiguous destination on the scales' device, written in place:
 
-        - ``layout_128x4``: ``[num_experts, round_up(rows, 128), round_up(cols, 4)]`` in the
-          128x4 swizzled layout of the fused MoE kernels, the padding written as zeros.
-        - ``layout_linear``: ``[num_experts, rows, cols]``.
+        - ``layout_128x4``: one-byte ``[num_experts, round_up(rows, 128), round_up(cols, 4)]``
+          in the 128x4 swizzled layout of the fused MoE kernels, the padding written as zeros.
+        - ``layout_linear``: ``[num_experts, rows, cols]``, or with ``transpose``
+          ``[num_experts, padded_cols, rows]`` with ``padded_cols >= cols`` and the columns
+          past ``cols`` written as zeros. A one-byte ``out`` takes the scale bytes and a
+          ``bfloat16`` one their E4M3 values.
     token_selected_experts : Optional[torch.Tensor]
         Contiguous int32 expert ids of any shape, such as the ``[num_tokens, top_k]`` routing
         of a fused MoE call. Only these experts are expanded and the rest of ``out`` keeps its
@@ -154,22 +160,29 @@ def expand_csf_scales(
         The id in ``token_selected_experts`` of ``csf``'s first expert. Under expert
         parallelism the routing holds global ids while ``csf`` holds this rank's experts, so
         pass the global id of this rank's first expert.
+    transpose : bool
+        Write each ``layout_linear`` matrix column by column.
 
     Returns
     -------
     torch.Tensor
         ``out``.
     """
-    if out.element_size() != 1:
-        raise ValueError(f"out must have a one-byte dtype, got {out.dtype}")
+    if out.dtype == torch.bfloat16:
+        dest = out
+    elif out.element_size() == 1:
+        dest = out.view(torch.uint8)
+    else:
+        raise ValueError(f"out must be bfloat16 or one-byte, got {out.dtype}")
     with torch.cuda.device(out.device):
         get_quantization_module().csf_expand(
             csf.fixed,
             csf.exceptions,
             csf.exc_offsets,
             token_selected_experts,
-            out.view(torch.uint8),
+            dest,
             int(layout),
+            transpose,
             swap_row_halves,
             local_expert_offset,
         )
