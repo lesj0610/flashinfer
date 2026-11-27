@@ -1,9 +1,11 @@
-"""Prepared per-head FP8 projections with BF16 or dynamic FP8 output on SM100a/SM103a.
+"""Prepared per-head FP8 projections with BF16 or dynamic FP8 output on SM100a/SM103a
+and SM8x.
 
 The schedule a projection runs on is selected here (``route_config`` / ``schedule_key``,
 the dispatcher's own heuristic); the selected program, its launch grid and its
 loaded library come from the package registry :mod:`.cake_jit` (``ROUTES``,
-``MODULES``, ``launch_grid``, ``load``).
+``MODULES``, ``launch_grid``, ``load``). On SM8x the selected program's contract
+and epilogue run on the SM8x FP8 GEMM (:mod:`.sm8x`).
 """
 
 from __future__ import annotations
@@ -14,6 +16,9 @@ from . import cake_jit
 # devices route BF16 output to the general schedule, which is not exported.
 PINNED_NUM_SMS = (148, 152)
 
+# Capabilities that run the selected program on the SM8x FP8 GEMM (:mod:`.sm8x`).
+SM8X_CAPABILITIES = ((8, 0), (8, 6), (8, 7), (8, 9))
+
 
 def device_arch(device):
     """Generated-program architecture for ``device`` (raises when none is exported)."""
@@ -23,6 +28,8 @@ def device_arch(device):
     if device.type != "cuda":
         raise RuntimeError("Batched FP8 projection requires a CUDA device")
     capability = tuple(torch.cuda.get_device_capability(device))
+    if capability in SM8X_CAPABILITIES:
+        return f"sm_{capability[0]}{capability[1]}"
     arch = cake_jit.arch_for_capability(capability)
     if arch is None:
         raise RuntimeError(
@@ -339,9 +346,17 @@ class BatchedGemmPlan:
             grid_y=grid[1],
             grid_z=grid[2],
         )
-        module = cake_jit.load(program, arch)
-        args = cake_jit.launch_args(record, self.bindings, grid)
-        self._submission = (getattr(module, record["ffi_entry"]), args)
+        if arch.startswith("sm_8"):
+            from .sm8x import Sm8xProjection
+
+            module = Sm8xProjection(
+                aq, asf, bq, bsf, out, output_scales, epilogue, self.bindings["alpha"]
+            )
+            self._submission = (module, ())
+        else:
+            module = cake_jit.load(program, arch)
+            args = cake_jit.launch_args(record, self.bindings, grid)
+            self._submission = (getattr(module, record["ffi_entry"]), args)
         self._retained = (module, a, b, out, output_scales, sf_storage, self.bindings)
         self.values, self.scales = out, output_scales
         self.output = (out, output_scales) if output_fp8 else out
