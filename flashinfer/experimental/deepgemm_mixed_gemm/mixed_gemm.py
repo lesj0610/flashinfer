@@ -1,4 +1,5 @@
-"""Prepared mixed FP8 E4M3 x packed FP4 E2M1 GEMM with BF16 output on SM100a/SM103a.
+"""Prepared mixed FP8 E4M3 x packed FP4 E2M1 GEMM with BF16 output on SM100a/SM103a
+and SM8x.
 
 Eight generated programs, each one source compiled for both architectures:
 four normal schedules (BM128 with the N tile 128/160/224/256), three swap-AB
@@ -8,7 +9,8 @@ BM16 schedule in three K slices with a fixed-order fp32 combine, SM100a only)
 selected for exactly the problems of ``_SPLIT_K_ADOPTED``. Tile counts and the
 SM count are runtime arguments; the route is chosen from the problem shape by
 ``select_route``. ``PROGRAMS`` and ``ROUTES`` are populated by the
-generated-program export; do not edit them by hand.
+generated-program export; do not edit them by hand. On SM8x the selected route's problem
+runs on the SM8x FP4 GEMM (:mod:`.sm8x`).
 """
 
 from __future__ import annotations
@@ -744,6 +746,8 @@ ROUTES = {
 }
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+# Capabilities that run the selected route's problem on the SM8x FP4 GEMM (:mod:`.sm8x`).
+_SM8X_CAPABILITIES = ((8, 0), (8, 6), (8, 7), (8, 9))
 BLOCK_K = 128
 GROUP_M, GROUP_N = 16, 8  # persistent raster groups of the normal / swap-AB schedules
 # route name -> (family, block_m, block_n, store_n)
@@ -898,6 +902,8 @@ def device_facts(device_index: int) -> tuple[str, int]:
 
     device = torch.device("cuda", device_index)
     capability = get_compute_capability(device)
+    if capability in _SM8X_CAPABILITIES:
+        return f"sm_{capability[0]}{capability[1]}", get_device_sm_count(device)
     arch = _ARCHES.get(capability)
     if arch is None:
         raise RuntimeError(
@@ -1024,10 +1030,18 @@ class MixedGemmPlan:
             )
             bindings.update(WS=workspace, CNT=counters)
             retained = tensors + (workspace, counters)
-        self._entry = load_program(arch, self.program)
-        self._args = tuple(
-            bindings[name] for _kind, name in PROGRAMS[self.program]["arg_plan"]
-        )
+        if arch.startswith("sm_8"):
+            from .sm8x import Sm8xMixedGemm
+
+            self._entry = Sm8xMixedGemm(
+                a, b, a_scales, b_scales, out, m, n, k, gran_k_a
+            )
+            self._args = ()
+        else:
+            self._entry = load_program(arch, self.program)
+            self._args = tuple(
+                bindings[name] for _kind, name in PROGRAMS[self.program]["arg_plan"]
+            )
         self._retained = retained
 
     def run(self):
