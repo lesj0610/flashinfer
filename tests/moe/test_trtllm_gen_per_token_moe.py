@@ -67,14 +67,11 @@ def _skip_unless_sm10x(device: torch.device) -> None:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
 
 
-def _skip_unless_runs(
-    device: torch.device, *, use_4over6: bool, activation_type: ActivationType
-) -> None:
+def _skip_unless_runs(device: torch.device, *, activation_type: ActivationType) -> None:
     """SM100 and SM103 run every case; SM90 the tuples FlashInfer reports it runs."""
     if moe_utils.sm90_fp4_moe_runs(
         "trtllm",
         per_token=True,
-        nvfp4_4over6=NVFP44Over6Config() if use_4over6 else None,
         activation_type=activation_type,
     ):
         return
@@ -409,7 +406,7 @@ def test_routed_fused_moe(
     zero_rows: bool,
 ):
     device = torch.device("cuda:0")
-    _skip_unless_runs(device, use_4over6=use_4over6, activation_type=activation_type)
+    _skip_unless_runs(device, activation_type=activation_type)
     kwargs, reference, _ = _per_token_routed_case(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
@@ -458,7 +455,7 @@ def test_pinned_recipe_matches_env(recipe: NVFP44Over6Config, use_4over6: bool):
     (``globalScaleInv``) from ``1/(448*6)`` to ``1/(256*6)``.
     """
     device = torch.device("cuda:0")
-    _skip_unless_runs(device, use_4over6=True, activation_type=ActivationType.Swiglu)
+    _skip_unless_runs(device, activation_type=ActivationType.Swiglu)
     kwargs, _reference, _ = _per_token_routed_case(
         num_tokens=64,
         hidden_size=1024,

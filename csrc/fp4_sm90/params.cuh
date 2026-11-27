@@ -252,7 +252,8 @@ struct RowQuantArgs {
   uint8_t in_f16;
   uint8_t recipe;  // kRecipe* bits
   uint8_t out_f16;
-  int n;  // kN (tile size of the GEMM2 B tiles)
+  int n;             // kN (tile size of the GEMM2 B tiles)
+  const float* gsi;  // inverse global scale (device scalar); null = the recipe's 1 / (6 e4m3Max)
   const int32_t* expert_offset;
   const int32_t* expert_tile_base;
   const int32_t* num_tiles;

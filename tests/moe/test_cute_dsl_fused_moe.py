@@ -185,7 +185,6 @@ sm100_or_sm90_w4a4_4over6_required = pytest.mark.skipif(
     and not sm90_fp4_moe_runs(
         "cute_dsl",
         per_token=True,
-        nvfp4_4over6=NVFP44Over6Config(),
         activation_type=ActivationType.Swiglu,
     ),
     reason="Requires CuteDSL MoE target SM100, SM103, SM107 or SM90",
@@ -6017,8 +6016,11 @@ def test_cute_dsl_pinned_recipe_matches_env(
                 nvfp4_4over6_config=effective_recipe,
                 disable_fp4_quant_fast_math=disable_fp4_quant_fast_math,
             )
-            assert_cute_dsl_moe_bits(functional, expected)
-            assert_cute_dsl_moe_bits(wrapped, expected)
+            for out in (functional, wrapped):
+                if is_sm100_family():  # the reference models SM100's accumulation
+                    assert_cute_dsl_moe_bits(out, expected)
+                else:  # SM90 (wgmma) accumulates in another order
+                    assert check_accuracy(out, expected)[0]
         return functional.clone(), wrapped.clone()
 
     with (

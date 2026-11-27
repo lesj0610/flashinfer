@@ -125,7 +125,9 @@ class Sm90EpilogueSpec:
     tok_scale: Optional[torch.Tensor] = None
     act_params: Optional[torch.Tensor] = None
     bias: Optional[torch.Tensor] = None
-    fq_global: Optional[torch.Tensor] = None  # device FP32 scalar; None = 1
+    # device FP32 scalar: Fq.NVFP4's global scale (None = 1); with Fq.NONE on a token-wise GEMM1,
+    # the inverse global scale of the GEMM2 input rows (None = the recipe's)
+    fq_global: Optional[torch.Tensor] = None
 
     @property
     def out_f16(self) -> bool:

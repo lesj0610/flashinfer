@@ -16,20 +16,18 @@ limitations under the License.
 SM90 (wgmma) FP4 MoE driver (``csrc/fp4_moe_sm90.cu``).
 
 The SM100+ MoE entry points (``trtllm_fp4_block_scale_moe`` and its routed variant,
-``cutlass_fused_moe``, ``cute_dsl_fused_moe``) run their NVFP4 4over6 tuples here on SM90,
+``cutlass_fused_moe``, ``cute_dsl_fused_moe``) run their NVFP4 tuples here on SM90,
 on the weights in each entry point's own SM100+ layout. Other tuples raise on SM90.
 """
 
 from __future__ import annotations
 
 import functools
-import weakref
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from ...api_logging import _is_current_stream_capturing
 from ...autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -40,10 +38,8 @@ from ...autotuner import (
 )
 from ...jit.fused_moe import fp4_sm90_recipe_bits, gen_fp4_moe_sm90_module
 from ...quantization.nvfp4_quantization_utils import (
-    NVFP4_PER_TOKEN_SCALE_RTOL,
     env_flag_enabled,
     nvfp4_4over6_cache_key,
-    nvfp4_per_token_scale_inv,
     resolve_nvfp4_4over6,
 )
 from ...tllm_enums import (
@@ -145,17 +141,13 @@ _ENTRY_ACTIVATIONS = {
 }
 
 
-def sm90_fp4_moe_supports(
-    entry: str, *, per_token: bool, nvfp4_4over6, activation_type: int
-) -> bool:
+def sm90_fp4_moe_supports(entry: str, *, per_token: bool, activation_type: int) -> bool:
     """Whether SM90 runs this NVFP4 x NVFP4 tuple of ``entry`` (``"trtllm"``, ``"cutlass"`` or
     ``"cute_dsl"``): per-token activation scales for TRT-LLM and CuTe DSL, per-tensor for
-    CUTLASS, a 4over6 recipe (``nvfp4_4over6`` as the entry point takes it, unset reading the
-    environment) and an activation the entry runs on SM90. The entry points reject the rest
-    on SM90 with ``NotImplementedError``."""
+    CUTLASS, and an activation the entry runs on SM90. The entry points reject the rest on
+    SM90 with ``NotImplementedError``."""
     return (
         per_token == (entry != "cutlass")
-        and resolve_nvfp4_4over6(nvfp4_4over6) is not None
         and ActivationType(activation_type) in _ENTRY_ACTIVATIONS[entry]
     )
 
@@ -169,30 +161,6 @@ def sm90_fp4_valid_tactics(
     return list(
         _module_tactics(recipe, _exact(), int(act), False, per_token, fmt, fmt, a_path)
     )
-
-
-#: Device scalars already read, by (data_ptr, device, _version): their host value.
-_host_scalars: Dict[Tuple[int, int, int], float] = {}
-
-
-def _host_scalar(t: torch.Tensor, what: str) -> float:
-    """``t``'s single value on the host, read once per tensor version (a weight-pack constant,
-    like ``_check_gemm2_input_scale``'s). Not readable for the first time in a graph capture."""
-    if not t.is_cuda:
-        return float(t.reshape(-1)[0])
-    key = (t.data_ptr(), t.device.index, t._version)
-    value = _host_scalars.get(key)
-    if value is not None:
-        return value
-    if _is_current_stream_capturing():
-        raise RuntimeError(
-            f"SM90 FP4 MoE reads {what} on the host once per tensor; run the call once "
-            "before capturing it in a CUDA graph."
-        )
-    value = float(t.reshape(-1)[0])
-    _host_scalars[key] = value
-    weakref.finalize(t, _host_scalars.pop, key, None)
-    return value
 
 
 def _scalar(t: Optional[torch.Tensor]) -> bool:
@@ -508,7 +476,6 @@ def sm90_fp4_moe(
         or epi2.fq != Fq.NONE
         or not epi2.gemm2
         or epi2.out_dtype not in (torch.bfloat16, torch.float16)
-        or recipe is None
         or (not per_token and epi1.recipe != fp4_sm90_recipe_bits(recipe))
         or w1.gated != act.is_gated
         or {w1.a_fmt, w2.a_fmt} - {AFmt.NVFP4_TRTLLM_SHUFFLED, AFmt.NVFP4_SWZ128X4}
@@ -516,7 +483,7 @@ def sm90_fp4_moe(
     ):
         raise _not_on_sm90(
             f"activation {act.name}, epilogues {epi1.fq.name}/{epi2.fq.name} or weights "
-            f"{w1.a_fmt.name}/{w2.a_fmt.name} (NVFP4 4over6 only)"
+            f"{w1.a_fmt.name}/{w2.a_fmt.name} (NVFP4 only)"
         )
     if per_token and (token_scale is None or x.dtype != torch.uint8):
         raise _not_on_sm90("the token-wise recipe without NVFP4 per-token activations")
@@ -585,7 +552,7 @@ def trtllm_fp4_sm90_moe(
 ) -> List[torch.Tensor]:
     """``trtllm_fp4_block_scale_moe`` / ``_routed_moe`` (their arguments ``a``; ``tactic`` an SM90
     tactic or -1) on SM90 with the global expert ``ids`` and BF16 ``weights``: NVFP4 x NVFP4
-    per token, 4over6."""
+    per token."""
     x, x_scale, pt = a["hidden_states"], a["hidden_states_scale"], a["per_token_scale"]
     act = ActivationType(a["activation_type"])
     s1, s_gate, s2 = (
@@ -614,7 +581,6 @@ def trtllm_fp4_sm90_moe(
         x.dtype != torch.uint8
         or x_scale is None
         or pt is None
-        or recipe is None
         or act not in (ActivationType.Swiglu, ActivationType.Relu2)
         or unsupported
         or a.get("_nfse")
@@ -623,7 +589,7 @@ def trtllm_fp4_sm90_moe(
         or a["gemm1_weights"].dtype != torch.uint8
     ):
         raise _not_on_sm90(
-            "TRT-LLM FP4 MoE outside NVFP4 x NVFP4 per-token 4over6 with Swiglu or Relu2 "
+            "TRT-LLM FP4 MoE outside NVFP4 x NVFP4 per-token with Swiglu or Relu2 "
             f"(set: {unsupported})"
         )
     if "hidden_states_scale_layout" in a:  # SM100's: linear only
@@ -696,7 +662,7 @@ def trtllm_fp4_sm90_moe(
 def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
     """``cutlass_fused_moe`` (its arguments ``a``, ``output`` allocated; unset optional ones at
     their defaults, ``tactic`` an SM90 tactic or -1) on SM90 with the resolved ``recipe``:
-    NVFP4 x NVFP4 per tensor, 4over6, BF16/FP16 or NVFP4 input."""
+    NVFP4 x NVFP4 per tensor, BF16/FP16 or NVFP4 input."""
     qs, act = a["quant_scales"], ActivationType(a["activation_type"])
     x, x_sf, out = a["input"], a.get("input_sf"), a["output"]
     fc1, fc2 = a["fc1_expert_weights"], a["fc2_expert_weights"]
@@ -719,7 +685,6 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
     ep_size, ep_rank = a.get("ep_size", 1), a.get("ep_rank", 0)
     if (
         len(qs) != 6
-        or recipe is None
         or act not in SM90_FP4_ACTIVATIONS
         or unsupported
         or a.get("cluster_size", 1) != 1
@@ -734,7 +699,7 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
         or qs[5].numel() != fc1.shape[0]
     ):
         raise _not_on_sm90(
-            "CUTLASS FP4 MoE outside NVFP4 x NVFP4 per-tensor 4over6 with Swiglu, SwigluStep "
+            "CUTLASS FP4 MoE outside NVFP4 x NVFP4 per-tensor with Swiglu, SwigluStep "
             "or Relu2, one global input scale per tensor and no biases or activation "
             f"parameters (set: {unsupported})"
         )
@@ -802,22 +767,10 @@ def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
     return out
 
 
-def _check_fc2_input_scale(fc2_input_scale: torch.Tensor, recipe) -> None:
-    """The SM90 row quantization uses the recipe's GEMM2-input scale, 1 / (6 * e4m3_max), not
-    the tensor, so the tensor must hold that value. A tensor (or version) not read before a
-    graph capture raises in ``_host_scalar`` instead of passing unchecked."""
-    value = _host_scalar(fc2_input_scale, "fc2_input_scale")
-    expected = nvfp4_per_token_scale_inv(recipe)
-    if not abs(value - expected) <= NVFP4_PER_TOKEN_SCALE_RTOL * expected:  # NaN fails
-        raise _not_on_sm90(
-            f"a per-token fc2_input_scale ({value!r}) other than the recipe's ({expected!r})"
-        )
-
-
 def cute_dsl_fp4_sm90_moe(
     a: Dict[str, Any], activation: ActivationType, swap_ab: bool
 ) -> torch.Tensor:
-    """``cute_dsl_fused_moe`` (its arguments ``a``) on SM90: W4A4 per token, 4over6, weights in
+    """``cute_dsl_fused_moe`` (its arguments ``a``) on SM90: W4A4 per token, weights in
     the CuTe DSL layout (group interleave 64, or 16 with ``swap_ab``)."""
     x, x_sf, pt = a["x"], a["x_sf"], a["per_token_scale"]
     recipe = resolve_nvfp4_4over6(a["nvfp4_4over6"]) if pt is not None else None
@@ -827,7 +780,6 @@ def cute_dsl_fp4_sm90_moe(
     if (
         a["quant_mode"] != "w4a4"
         or pt is None
-        or recipe is None
         or activation not in (ActivationType.Swiglu, ActivationType.Relu2)
         or swiglu != defaults
         or a["situ_beta"] is not None
@@ -840,17 +792,22 @@ def cute_dsl_fp4_sm90_moe(
         or a["fc2_input_scale"] is None
     ):
         raise _not_on_sm90(
-            "CuTe DSL FP4 MoE outside W4A4 per-token 4over6 with Swiglu or Relu2 at the "
+            "CuTe DSL FP4 MoE outside W4A4 per-token with Swiglu or Relu2 at the "
             "default activation parameters"
         )
     tokens, hidden = x.shape[0], x.shape[1] * 2
     if pt.dtype != torch.float32 or pt.numel() != tokens or not pt.is_contiguous():
         raise ValueError("per_token_scale must be FP32 [num_tokens], contiguous.")
+    # As SM100's per-token quantizer: the GEMM2 input rows under this inverse global scale.
+    gsi = a["fc2_input_scale"]
+    if isinstance(gsi, torch.Tensor):
+        gsi = gsi.float().reshape(1).contiguous().to(x.device)
+    else:
+        gsi = torch.tensor([float(gsi)], dtype=torch.float32, device=x.device)
     if x_sf.dtype not in (torch.uint8, torch.float8_e4m3fn):  # as _routed_nvfp4
         raise TypeError("x_sf must have dtype uint8 or float8_e4m3fn")
     if x_sf.numel() != tokens * (hidden // 16):
         raise ValueError("x_sf must be linear: [num_tokens, hidden / 16] E4M3 scales.")
-    _check_fc2_input_scale(a["fc2_input_scale"], recipe)
     w1w, w2w = a["w1_weight"], a["w2_weight"]
     inter = w2w.shape[2] * 2
     gated = activation.is_gated
@@ -892,7 +849,7 @@ def cute_dsl_fp4_sm90_moe(
             a["local_expert_offset"],
             local,
         ),
-        Sm90EpilogueSpec(int(activation), alpha=a["w1_alpha"]),
+        Sm90EpilogueSpec(int(activation), alpha=a["w1_alpha"], fq_global=gsi),
         Sm90EpilogueSpec(
             int(ActivationType.Identity),
             gemm2=True,

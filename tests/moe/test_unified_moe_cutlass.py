@@ -2587,7 +2587,6 @@ def _is_sm90_cutlass_nvfp4_4over6_supported() -> bool:
         and sm90_fp4_moe_runs(
             "cutlass",
             per_token=False,
-            nvfp4_4over6=NVFP44Over6Config(),
             activation_type=SwiGLU().type,
         )
     )

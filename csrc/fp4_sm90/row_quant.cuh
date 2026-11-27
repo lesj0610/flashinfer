@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 // Token-wise NVFP4 quantization of the GEMM2 input (per-token recipes): one CTA per expanded row,
-// the SM100+ nvfp4_quant_and_per_token_scale numerics with the recipe's global scale
-// 1 / (e4m3Max x 6):
+// the SM100+ nvfp4_quant_and_per_token_scale numerics with the inverse global scale gsi (the
+// caller's, else the recipe's 1 / (e4m3Max x 6)):
 //   fast:  s = amax x gsi (FTZ), encode = rcp.approx.ftz(s) (0 for s = 0)
 //   exact (DISABLE_FP4_QUANT_FAST_MATH): encode = min(gs / amax, FLT_MAX) with 1 for an
 //          underflow, amax = 0 -> 0 (4over6) or FLT_MAX; s = 1 / encode (gs = 1 / gsi)
@@ -122,7 +122,7 @@ __global__ void __launch_bounds__(kThreads) row_quant_kernel(RowQuantArgs a) {
   for (int w = 1; w < kThreads / 32; ++w) m = fmaxf(m, s_red[w]);
 
   constexpr bool k4over6 = (R & kRecipe4over6) != 0;
-  constexpr float gsi = 1.f / (epi::recipe_e4m3_max(R) * 6.f);
+  const float gsi = a.gsi != nullptr ? *a.gsi : 1.f / (epi::recipe_e4m3_max(R) * 6.f);
   float s, enc;
   if constexpr (EXACT) {
     const float gs = div_rn_ftz(1.f, gsi);

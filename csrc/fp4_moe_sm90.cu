@@ -379,8 +379,6 @@ void fp4_moe_sm90_run(
   TVM_FFI_ICHECK(valid_n(n)) << "n must be a power of two in [8, 256]";
   TVM_FFI_ICHECK(cta_m == 128 || cta_m == 256) << "cta_m must be 128 or 256";
   TVM_FFI_ICHECK(a_path == 0 || a_path == 1) << "a_path must be 0 (n1) or 1 (n2)";
-  TVM_FFI_ICHECK(per_token || (kModuleRecipe & kRecipe4over6))
-      << "per-tensor NVFP4 GEMM2 input: this module has no 4over6 recipe";
 
   const int tokens = static_cast<int>(topk_ids.size(0));
   const int top_k = static_cast<int>(topk_ids.size(1));
@@ -418,8 +416,7 @@ void fp4_moe_sm90_run(
   if (fq_global.has_value()) {
     CHECK_INPUT_AND_TYPE(fq_global.value(), dl_float32);
     CHECK_DEVICE(fq_global.value(), x);
-    TVM_FFI_ICHECK_EQ(fq_global.value().numel(), 1)
-        << "the GEMM1 output global scale must be a scalar";
+    TVM_FFI_ICHECK_EQ(fq_global.value().numel(), 1) << "fq_global must be a scalar";
   }
   if (act_params.has_value()) {
     CHECK_INPUT_AND_TYPE(act_params.value(), dl_float32);
@@ -525,8 +522,11 @@ void fp4_moe_sm90_run(
   g1.epi.bias = nullptr;
   g1.epi.out = at(l.act);
   g1.epi.out_ld = inter;
-  g1.epi.fq_global =
+  // fq_global: per tensor GEMM1's output global scale, per token the row quantization's inverse
+  // global scale (null: the recipe's)
+  const float* const fq_g =
       fq_global.has_value() ? static_cast<const float*>(fq_global.value().data_ptr()) : nullptr;
+  g1.epi.fq_global = per_token ? nullptr : fq_g;
   g1.epi.act = static_cast<uint8_t>(act);
   g1.epi.fq = static_cast<uint8_t>(per_token ? Fq::kNone : Fq::kNvfp4);
   g1.epi.recipe = per_token ? 0 : kModuleRecipe;
@@ -548,6 +548,7 @@ void fp4_moe_sm90_run(
     rq.recipe = kModuleRecipe;
     rq.out_f16 = kModuleF16;
     rq.n = static_cast<int>(n);
+    rq.gsi = fq_g;
     rq.expert_offset = prep.expert_offset;
     rq.expert_tile_base = prep.expert_tile_base;
     rq.num_tiles = prep.num_tiles;

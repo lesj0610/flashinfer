@@ -71,12 +71,11 @@ FP8_DTYPE = torch.float8_e4m3fn
 set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
 
 
-def _skip_unless_sm90_runs(use_4over6: bool, activation_type) -> None:
+def _skip_unless_sm90_runs(activation_type) -> None:
     """On SM90, skip the NVFP4 tuples flashinfer.fused_moe.sm90 does not run yet."""
     if torch.cuda.get_device_capability()[0] == 9 and not moe_utils.sm90_fp4_moe_runs(
         "cutlass",
         per_token=False,
-        nvfp4_4over6=NVFP44Over6Config() if use_4over6 else None,
         activation_type=activation_type,
     ):
         pytest.skip("SM90 does not run this NVFP4 MoE tuple yet.")
@@ -1362,7 +1361,7 @@ def test_moe_nvfp4(
     use_4over6,
     use_autotune,
 ):
-    _skip_unless_sm90_runs(use_4over6, activation_type)
+    _skip_unless_sm90_runs(activation_type)
     # Skip invalid configurations
     if top_k > num_experts:
         pytest.skip(
@@ -1597,7 +1596,7 @@ def _nvfp4_recipe_case(device):
 def test_moe_nvfp4_pinned_recipe_matches_env(recipe, use_4over6):
     """``nvfp4_4over6=`` selects, bit for bit, the quantizer the environment
     selects, and ``None`` ignores an environment that turns 4over6 on."""
-    _skip_unless_sm90_runs(use_4over6, ActivationType.Swiglu)
+    _skip_unless_sm90_runs(ActivationType.Swiglu)
     device = torch.device("cuda:0")
     kwargs = _nvfp4_recipe_case(device)
 
@@ -3101,7 +3100,7 @@ def test_moe_nvfp4_unaligned_hidden_size(
     pads the scale columns, inflating numel(). This caused weight_scale_vec_size
     to be computed incorrectly (e.g. 31 instead of 32). See issue #2847.
     """
-    _skip_unless_sm90_runs(use_4over6, activation_type)
+    _skip_unless_sm90_runs(activation_type)
     if top_k > num_experts:
         pytest.skip(
             f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"

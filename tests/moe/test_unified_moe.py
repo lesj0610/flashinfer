@@ -2684,7 +2684,6 @@ sm100_or_sm90_trtllm_4over6_required = pytest.mark.skipif(
     and not sm90_fp4_moe_runs(
         "trtllm",
         per_token=True,
-        nvfp4_4over6=NVFP44Over6Config(),
         activation_type=ActivationType.Swiglu,
     ),
     reason="Unified NVFP4 per-token 4over6 MoE requires SM100, SM103, SM107 or SM90",

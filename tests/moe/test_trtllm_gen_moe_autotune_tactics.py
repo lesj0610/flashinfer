@@ -419,7 +419,6 @@ def test_nvfp4_per_token_all_tactics_are_correct(
         if not sm90_fp4_moe_supports(
             "trtllm",
             per_token=True,
-            nvfp4_4over6=recipe,
             activation_type=activation_type,
         ):
             pytest.skip(f"SM90 does not run per-token {activation_type.name} yet.")

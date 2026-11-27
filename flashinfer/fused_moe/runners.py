@@ -608,8 +608,8 @@ def _check_sm90_fp4_moe(
     activations: tuple[type[ActivationConfig], ...],
 ) -> None:
     """Reject on SM90 what ``flashinfer.fused_moe.sm90`` does not run yet: anything but NVFP4 x
-    NVFP4 4over6, ``per_token`` (else per tensor), with ``activations`` at their default
-    parameters and no fused shared experts."""
+    NVFP4, ``per_token`` (else per tensor), with ``activations`` at their default parameters
+    and no fused shared experts."""
     config = runner.config
     quant, activation = config.quant, config.activation
     if (
@@ -618,12 +618,11 @@ def _check_sm90_fp4_moe(
         or type(activation) not in activations
         or activation != type(activation)()
         or config.experts.num_fused_shared_experts
-        or resolve_nvfp4_4over6(quant.nvfp4_4over6) is None
     ):
         names = ", ".join(cls.__name__ for cls in activations)
         mode = "per-token" if per_token else "per-tensor"
         raise NotImplementedError(
-            f"SM90 FP4 MoE: {type(runner).__name__} outside NVFP4 x NVFP4 {mode} 4over6 "
+            f"SM90 FP4 MoE: {type(runner).__name__} outside NVFP4 x NVFP4 {mode} "
             f"with {names} at default parameters is not implemented on SM90 yet."
         )
 
