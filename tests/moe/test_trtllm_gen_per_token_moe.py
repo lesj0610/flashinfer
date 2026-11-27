@@ -498,7 +498,7 @@ def test_fc2_input_out(num_tokens: int, expert_parallel: bool):
     (128x4). Expert parallelism leaves the slots of non-local experts zeroed.
     """
     device = torch.device("cuda:0")
-    _skip_unless_sm10x(device)
+    _skip_unless_runs(device, activation_type=ActivationType.Swiglu)
     hidden_size, intermediate_size, num_experts, top_k = 1024, 2048, 32, 4
     kwargs, _reference, parts = _per_token_routed_case(
         num_tokens=num_tokens,
@@ -632,7 +632,7 @@ def test_fc2_input_out_from_logits(num_tokens: int):
     writes for the expert IDs the routing kernel selected.
     """
     device = torch.device("cuda:0")
-    _skip_unless_sm10x(device)
+    _skip_unless_runs(device, activation_type=ActivationType.Swiglu)
     hidden_size, intermediate_size, num_experts, top_k = 1024, 2048, 32, 4
     kwargs, _reference, _parts = _per_token_routed_case(
         num_tokens=num_tokens,
@@ -697,7 +697,7 @@ def test_fc2_input_out_valid_intermediate_size():
     """With ``valid_intermediate_size`` the buffers keep the padded width and
     the leading valid columns hold the GEMM2 input."""
     device = torch.device("cuda:0")
-    _skip_unless_sm10x(device)
+    _skip_unless_runs(device, activation_type=ActivationType.Swiglu)
     num_tokens, hidden_size, intermediate_size, num_experts, top_k = (
         64,
         1024,
@@ -768,7 +768,7 @@ def test_fc2_input_out_valid_intermediate_size():
 
 def test_fc2_input_out_requires_per_token_scale():
     device = torch.device("cuda:0")
-    _skip_unless_sm10x(device)
+    _skip_unless_runs(device, activation_type=ActivationType.Swiglu)
     kwargs, _reference, _ = _per_token_routed_case(
         num_tokens=8,
         hidden_size=1024,
@@ -805,7 +805,7 @@ def test_fc2_input_out_bypasses_trace_apply():
     )
 
     device = torch.device("cuda:0")
-    _skip_unless_sm10x(device)
+    _skip_unless_runs(device, activation_type=ActivationType.Swiglu)
     num_tokens, hidden_size, intermediate_size, top_k = 8, 1024, 2048, 4
     kwargs, _reference, _ = _per_token_routed_case(
         num_tokens=num_tokens,

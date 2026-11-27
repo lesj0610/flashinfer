@@ -468,6 +468,16 @@ class Sm90Fp4MoeRunner(TunableRunner):
         y = torch.empty(tokens * top_k, hidden, dtype=out_dtype, device=x.device)
         if self.do_finalize and out is None:
             out = torch.empty(tokens, hidden, dtype=out_dtype, device=x.device)
+        fc2_input_out = kwargs.get("fc2_input_out")
+        fc2 = (
+            [None] * 3
+            if fc2_input_out is None
+            else [
+                fc2_input_out[0].view(torch.uint8),
+                fc2_input_out[1].view(torch.uint8),
+                fc2_input_out[2],
+            ]
+        )
         module.fp4_moe_sm90_run(
             x,
             None if x_sf is None else _bytes(x_sf),
@@ -494,10 +504,12 @@ class Sm90Fp4MoeRunner(TunableRunner):
             self.epi1.fq_global,
             self.epi1.bias,
             self.epi2.bias,
+            self.epi1.out_scale,
             workspace,
             src_permuted,
             y,
             out if self.do_finalize else None,
+            *fc2,
             cta_m,
             n,
             stages,
@@ -529,6 +541,7 @@ def sm90_fp4_moe(
     tune_max_num_tokens: int = 8192,
     a_path: int = 0,
     localized: Optional[Tuple[List[Sm90WeightView], List[int], int]] = None,
+    fc2_input_out: Optional[Sequence[torch.Tensor]] = None,
 ) -> List[torch.Tensor]:
     """SM90 FP4 MoE: prep, GEMM1, row quantization (token-wise), GEMM2, finalize.
 
@@ -547,9 +560,9 @@ def sm90_fp4_moe(
         Global expert ids int32 ``[num_tokens, top_k]`` and their weights.
     epi1 : Sm90EpilogueSpec
         GEMM1: activation, its ``act_params``, ``alpha`` FP32 ``[num_local_experts]``, ``bias``;
-        ``fq`` ``Fq.NONE`` for the token-wise recipe (rows requantized with ``recipe`` per
-        row, ``token_scale`` per token on GEMM1) or ``Fq.NVFP4`` per tensor (under
-        ``fq_global``).
+        ``fq`` ``Fq.NONE`` for the token-wise recipe (rows, times ``out_scale`` if given,
+        requantized with ``recipe`` per row, ``token_scale`` per token on GEMM1) or
+        ``Fq.NVFP4`` per tensor (under ``fq_global``).
     epi2 : Sm90EpilogueSpec
         GEMM2: ``alpha`` FP32 ``[num_local_experts]``, ``bias``, ``out_dtype`` BF16 or FP16.
     out : Optional[torch.Tensor]
@@ -580,6 +593,12 @@ def sm90_fp4_moe(
         (the domain's rows), the domain streams (``cudaStream_t`` handles) and the SMs of each
         domain's GEMMs. Each GEMM then runs per domain on its stream, forked from and joined
         back to the current stream (also under CUDA graph capture).
+    fc2_input_out : Optional[Sequence[torch.Tensor]]
+        Token-wise recipe only: ``[codes, block_scales, token_scales]`` that also receive
+        GEMM2's NVFP4 input in caller order, codes uint8 ``[>= num_tokens, top_k, >= inter /
+        2]``, E4M3 (or uint8) block scales ``[>= num_tokens, top_k, codes' width / 8]`` and
+        FP32 token scales ``[>= num_tokens, top_k]``; other ranks' slots and the columns past
+        ``inter`` are zero. Not passed to autotuning.
 
     Returns
     -------
@@ -608,6 +627,8 @@ def sm90_fp4_moe(
         )
     if per_token and (token_scale is None or x.dtype != torch.uint8):
         raise _not_on_sm90("the token-wise recipe without NVFP4 per-token activations")
+    if fc2_input_out is not None and not per_token:
+        raise _not_on_sm90("fc2_input_out without the token-wise recipe")
     if x.dtype != torch.uint8 and not _scalar(x_global):
         raise _not_on_sm90("16-bit input quantization without one global scale")
     if min(w1.num_experts, w2.num_experts) < num_local or epi1.alpha is None:
@@ -619,10 +640,13 @@ def sm90_fp4_moe(
     if weights is not None and not weights.is_contiguous():
         weights = weights.contiguous()
     alpha = [e.alpha.float().reshape(-1)[:num_local].contiguous() for e in (epi1, epi2)]
+    os1 = epi1.out_scale
+    if os1 is not None:
+        os1 = os1.float().reshape(-1)[:num_local].contiguous()
     runner = Sm90Fp4MoeRunner(
         w1,
         w2,
-        replace(epi1, alpha=alpha[0]),
+        replace(epi1, alpha=alpha[0], out_scale=os1),
         replace(epi2, alpha=alpha[1]),
         num_experts=routing.num_experts,
         local_expert_offset=routing.local_expert_offset,
@@ -643,7 +667,9 @@ def sm90_fp4_moe(
         _, tactic = AutoTuner.get().choose_one(
             "flashinfer::fp4_moe_sm90", [runner], tuning, inputs
         )
-    return runner(inputs, tactic=tactic)
+    if fc2_input_out is None:
+        return runner(inputs, tactic=tactic)
+    return runner(inputs, tactic=tactic, fc2_input_out=fc2_input_out)
 
 
 def _exact() -> bool:
@@ -694,6 +720,22 @@ def trtllm_fp4_sm90_moe(
     ):  # as SM100's launcher
         raise ValueError("SwigluStep takes no gemm1_alpha or gemm1_beta.")
     loc = _check_localized(a, x)
+    fo, inter, top_k = a.get("fc2_input_out"), a["intermediate_size"], ids.shape[1]
+    if fo is not None and (  # SM100's checks
+        not isinstance(fo, (tuple, list)) or len(fo) != 3
+        or pt is None or a.get("_nfse") or inter % 16
+        or any(not t.is_contiguous() or t.dim() < 2 or t.shape[0] < x.shape[0]
+               or t.shape[1] != top_k or t.device != x.device for t in fo)
+        or (fo[0].dtype, fo[0].shape[2:]) != (torch.uint8, (inter // 2,)) or fo[0].data_ptr() % 8
+        or fo[1].dtype not in (torch.uint8, torch.float8_e4m3fn)
+        or fo[1].shape[2:] != (inter // 16,) or (fo[2].dtype, fo[2].dim()) != (torch.float32, 2)
+    ):  # fmt: skip
+        raise ValueError(
+            "fc2_input_out takes per_token_scale without fused shared experts or routing "
+            "metadata, three tensors on the input's device: uint8 codes [>= num_tokens, "
+            "top_k, intermediate_size / 2] (8 B aligned), E4M3 or uint8 block scales [..., "
+            "intermediate_size / 16], FP32 token scales [>= num_tokens, top_k], contiguous."
+        )
     unsupported = [
         n
         for n in (
@@ -703,7 +745,6 @@ def trtllm_fp4_sm90_moe(
             "gemm1_clamp_limit",
             "gemm2_bias",
             "gemm1_lora_delta",
-            "fc2_input_out",
             "workspace_buffer",
             "routing_metadata",
         )
@@ -840,9 +881,9 @@ def trtllm_fp4_sm90_moe(
             loc[2],
         )
     # As SM100: GEMM1 under the gate scalar, GEMM2 input under output1_scale_scalar (gated but
-    # SiTU over the gate scalar, SiTU's inside the activation). Per token the rows are
-    # requantized per token, so it folds into GEMM2's alpha; per tensor it is GEMM1's NVFP4
-    # output global scale, as SM100's FC1 output. The limits are in accumulator units.
+    # SiTU over the gate scalar, SiTU's inside the activation): GEMM1's NVFP4 output global
+    # scale per tensor, per token the factor of GEMM1's BF16 rows, as SM100's FC1 output. The
+    # limits are in accumulator units.
     alpha1 = _per_expert(s_gate, experts)
     fc2 = _per_expert(s1, experts)
     fc2 = fc2 / alpha1 if gated and act != ActivationType.Situ else fc2
@@ -878,8 +919,7 @@ def trtllm_fp4_sm90_moe(
             fq_global=fc2.contiguous(),
         )
     else:
-        epi1 = Sm90EpilogueSpec(int(act), alpha=alpha1)
-        alpha2 = alpha2 * fc2
+        epi1 = Sm90EpilogueSpec(int(act), alpha=alpha1, out_scale=fc2)
     return sm90_fp4_moe(
         x.view(torch.uint8),
         x_scale.view(torch.uint8).reshape(tokens, hidden // 16),
@@ -905,6 +945,7 @@ def trtllm_fp4_sm90_moe(
         do_finalize=finalize,
         tune_max_num_tokens=a["tune_max_num_tokens"],
         localized=localized,
+        fc2_input_out=fo,
     )
 
 

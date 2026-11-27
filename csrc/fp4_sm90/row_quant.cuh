@@ -22,7 +22,9 @@
 // then cvt_warp_fp16_to_fp4(x, encode, amax) per 16 values. The GEMM2 B tile gets the exact
 // dequantized value code x SF; tok_scale[p] = s goes to GEMM2's epilogue. Rows of the n-tile past
 // the expert's count and K past cols are written as 0. Expanded rows past the local experts get
-// tok_scale 0 and no tile row.
+// tok_scale 0 and no tile row. With fq_codes (fc2_input_out) row p's codes, scales and s also go
+// to the caller's row fq_src[p], (token, slot) order, zero past cols; CTA p zeroes the caller's
+// row p if no local expert takes it (fq_dst[p] < 0).
 #pragma once
 
 #include <cuda_runtime.h>
@@ -58,6 +60,15 @@ __device__ __forceinline__ float vmax_abs(uint4 w, float m) {
     m = fmaxf(m, fmaxf(fabsf(f.x), fabsf(f.y)));
   }
   return m;
+}
+
+// Zeroes blocks [b0, fq_cols / 16) of the caller's row q.
+__device__ __forceinline__ void fq_zero(const RowQuantArgs& a, int64_t q, int b0) {
+  const int fb = a.fq_cols / 16;
+  for (int b = b0 + static_cast<int>(threadIdx.x); b < fb; b += kThreads) {
+    reinterpret_cast<uint64_t*>(a.fq_codes)[q * fb + b] = 0;
+    a.fq_sf[q * fb + b] = 0;
+  }
 }
 
 template <class TI, class TO, uint8_t R, bool EXACT>
@@ -96,16 +107,16 @@ __global__ void __launch_bounds__(kThreads) row_quant_kernel(RowQuantArgs a) {
   }
   __syncthreads();
   const int t = s_loc[0], r = s_loc[1], cnt = s_loc[2];
+  const bool fq = a.fq_codes != nullptr;
+  if (fq && a.fq_dst[p] < 0) {  // the caller's row p belongs to another rank
+    fq_zero(a, p, 0);
+    if (tid == 0) a.fq_tok[p] = 0.f;
+  }
   if (cnt == 0) {
     if (tid == 0) a.tok_scale[p] = 0.f;
-    if (a.fq_codes != nullptr) {
-      for (int b = tid; b < blocks; b += kThreads) {
-        reinterpret_cast<uint64_t*>(a.fq_codes + static_cast<int64_t>(p) * (a.cols / 2))[b] = 0;
-        a.fq_sf[static_cast<int64_t>(p) * blocks + b] = 0;
-      }
-    }
     return;
   }
+  const int64_t q = fq ? a.fq_src[p] : 0, fb = a.fq_cols / 16;
 
   const TI* row = static_cast<const TI*>(a.in) + static_cast<int64_t>(p) * a.in_ld;
   float m = 0.f;
@@ -139,7 +150,10 @@ __global__ void __launch_bounds__(kThreads) row_quant_kernel(RowQuantArgs a) {
     s = epi::mul_ftz(m, gsi);
     enc = s != 0.f ? tk::reciprocal_approximate_ftz(s) : 0.f;
   }
-  if (tid == 0) a.tok_scale[p] = s;
+  if (tid == 0) {
+    a.tok_scale[p] = s;
+    if (fq) a.fq_tok[q] = s;
+  }
 
   char* const tiles = static_cast<char*>(a.out_tiles);
   for (int b = tid; b < kp / 16; b += kThreads) {
@@ -150,9 +164,9 @@ __global__ void __launch_bounds__(kThreads) row_quant_kernel(RowQuantArgs a) {
       auto v = epi::packed16<TI>(src[0], src[1]);
       uint8_t sf;
       const uint64_t codes = epi::nvfp4_block<R, EXACT, TI, TO>(v, enc, m, o, sf);
-      if (a.fq_codes != nullptr) {
-        reinterpret_cast<uint64_t*>(a.fq_codes + static_cast<int64_t>(p) * (a.cols / 2))[b] = codes;
-        a.fq_sf[static_cast<int64_t>(p) * blocks + b] = sf;
+      if (fq) {
+        reinterpret_cast<uint64_t*>(a.fq_codes)[q * fb + b] = codes;
+        a.fq_sf[q * fb + b] = sf;
       }
     }
 #pragma unroll
@@ -162,6 +176,7 @@ __global__ void __launch_bounds__(kThreads) row_quant_kernel(RowQuantArgs a) {
                                 b_tile_byte(t, k_tiles, c >> 7, (c >> 6) & 1, n, r, c & 63)) = o[u];
     }
   }
+  if (fq) fq_zero(a, q, blocks);
 
   // The tile's last row zeroes the rows past the expert's count (whole 128-byte rows).
   if (r == cnt - 1 && cnt < n) {
@@ -241,10 +256,14 @@ inline void launch_fp4_sm90_row_quant(const RowQuantArgs& a, cudaStream_t stream
                        reinterpret_cast<uintptr_t>(a.in) % 16 == 0 &&
                        reinterpret_cast<uintptr_t>(a.out_tiles) % 16 == 0,
                    "row_quant: in and out_tiles must be 16-byte aligned with in_ld % 8 == 0");
-  FLASHINFER_CHECK((a.fq_codes == nullptr) == (a.fq_sf == nullptr),
-                   "row_quant: fq_codes and fq_sf go together");
-  FLASHINFER_CHECK(a.fq_codes == nullptr || reinterpret_cast<uintptr_t>(a.fq_codes) % 8 == 0,
-                   "row_quant: fq_codes must be 8-byte aligned");
+  const bool fq = a.fq_codes != nullptr;
+  FLASHINFER_CHECK(fq == (a.fq_sf != nullptr) && fq == (a.fq_tok != nullptr) &&
+                       fq == (a.fq_src != nullptr) && fq == (a.fq_dst != nullptr),
+                   "row_quant: fq_codes, fq_sf, fq_tok, fq_src and fq_dst go together");
+  FLASHINFER_CHECK(!fq || (a.expert_offset != nullptr && a.fq_cols >= a.cols &&
+                           a.fq_cols % 16 == 0 && reinterpret_cast<uintptr_t>(a.fq_codes) % 8 == 0),
+                   "row_quant: the caller's copy needs the routing, fq_cols >= cols (a multiple of "
+                   "16) and 8-byte aligned codes");
   FLASHINFER_CHECK((a.expert_offset == nullptr) == (a.expert_tile_base == nullptr) &&
                        (a.expert_offset == nullptr) == (a.num_tiles == nullptr),
                    "row_quant: expert_offset, expert_tile_base and num_tiles go together");

@@ -419,8 +419,14 @@ void fp4_moe_sm90_run(
     TensorView alpha1, TensorView alpha2, Optional<TensorView> act_x, Optional<TensorView> act_y,
     Optional<TensorView> act_z, int64_t act, bool per_token, Optional<TensorView> fq_global,
     Optional<TensorView> bias1, Optional<TensorView> bias2,
+    // per token: FP32 [num_local_experts] factor of GEMM1's 16-bit rows (null = 1)
+    Optional<TensorView> out_scale1,
     // scratch and outputs
     TensorView workspace, TensorView src_permuted, TensorView y, Optional<TensorView> out,
+    // fc2_input_out (per token): GEMM2's quantized input in (token, slot) order, codes
+    // [>= T, top_k, I / 2], linear E4M3 scales [>= T, top_k, I / 16] and token scales
+    // [>= T, top_k]
+    Optional<TensorView> fc2_codes, Optional<TensorView> fc2_sf, Optional<TensorView> fc2_tok,
     // tactic
     int64_t cta_m, int64_t n, int64_t stages, int64_t a_path,
     // localization (SM100's localized_*): per domain its shards' w1 codes, w1 scales, w2 codes and
@@ -489,6 +495,38 @@ void fp4_moe_sm90_run(
     TVM_FFI_ICHECK(fq_global.value().numel() == 1 ||
                    (!per_token && fq_global.value().numel() == num_local_experts))
         << "fq_global must be a scalar (per tensor also [num_local_experts])";
+  }
+  if (out_scale1.has_value()) {
+    TVM_FFI_ICHECK(per_token) << "out_scale1 scales GEMM1's per-token rows";
+    CHECK_INPUT_AND_TYPE(out_scale1.value(), dl_float32);
+    CHECK_DEVICE(out_scale1.value(), x);
+    TVM_FFI_ICHECK_EQ(out_scale1.value().numel(), num_local_experts)
+        << "out_scale1 must be [num_local_experts]";
+  }
+  const bool fc2 = fc2_codes.has_value();
+  TVM_FFI_ICHECK(fc2 == fc2_sf.has_value() && fc2 == fc2_tok.has_value())
+      << "fc2_input_out takes codes, block scales and token scales together";
+  int fq_cols = 0;
+  if (fc2) {
+    TVM_FFI_ICHECK(per_token) << "fc2_input_out requires per-token NvFP4";
+    const TensorView c = fc2_codes.value(), sf = fc2_sf.value(), tk = fc2_tok.value();
+    CHECK_INPUT_AND_TYPE(c, dl_uint8);
+    CHECK_INPUT_AND_TYPE(sf, dl_uint8);
+    CHECK_INPUT_AND_TYPE(tk, dl_float32);
+    for (const TensorView& t : {c, sf, tk}) {
+      CHECK_DEVICE(t, x);
+    }
+    CHECK_DIM(3, c);
+    CHECK_DIM(3, sf);
+    CHECK_DIM(2, tk);
+    fq_cols = static_cast<int>(2 * c.size(2));
+    TVM_FFI_ICHECK(fq_cols >= inter && fq_cols % 16 == 0)
+        << "fc2_input_out codes must be [>= num_tokens, top_k, I / 2] with I >= the GEMM2 K "
+           "and I % 16 == 0";
+    TVM_FFI_ICHECK(c.size(0) >= tokens && c.size(1) == top_k && sf.size(0) >= tokens &&
+                   sf.size(1) == top_k && sf.size(2) == fq_cols / 16 && tk.size(0) >= tokens &&
+                   tk.size(1) == top_k)
+        << "fc2_input_out tensors must be [>= num_tokens, top_k, ...] of the codes' width";
   }
   // GEMM1 activation parameters (cutlass_fused_moe's ActivationParams)
   for (const Optional<TensorView>* p : {&act_x, &act_y, &act_z}) {
@@ -686,6 +724,7 @@ void fp4_moe_sm90_run(
   g1.epi.bias_trtllm = bias1.has_value() && bias1.value().dtype() == dl_float32;
   g1.epi.out = at(l.act);
   g1.epi.out_ld = inter;
+  g1.epi.out_scale = static_cast<const float*>(ptr(out_scale1));
   // fq_global: per tensor GEMM1's output global scale, per token the row quantization's inverse
   // global scale (null: the recipe's)
   const float* const fq_g =
@@ -721,8 +760,12 @@ void fp4_moe_sm90_run(
     rq.num_tiles = prep.num_tiles;
     rq.out_tiles = at(l.x2_tiles);
     rq.tok_scale = tok2;
-    rq.fq_codes = nullptr;
-    rq.fq_sf = nullptr;
+    rq.fq_codes = static_cast<uint8_t*>(ptr(fc2_codes));
+    rq.fq_sf = static_cast<uint8_t*>(ptr(fc2_sf));
+    rq.fq_tok = static_cast<float*>(ptr(fc2_tok));
+    rq.fq_src = fc2 ? prep.permuted_src : nullptr;
+    rq.fq_dst = fc2 ? prep.src_permuted : nullptr;
+    rq.fq_cols = fq_cols;
     launch_fp4_sm90_row_quant(rq, stream);
   }
 

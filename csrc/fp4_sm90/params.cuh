@@ -170,6 +170,8 @@ struct EpiArgs {
                            // null = none
   void* out;               // output
   int64_t out_ld;          // elements between output rows
+  const float* out_scale;  // per expert fp32 factor of 16-bit output rows (TRT-LLM's per-token
+                           // FC1 rows carry output1_scale_scalar, as SM100); null = 1
   const float* fq_global;  // device fp32 scalar or per expert (fq_per_expert): global scale of
                            // the epilogue quantization (Fq != kNone); null = 1
   uint8_t act;             // flashinfer.tllm_enums.ActivationType value
@@ -265,10 +267,18 @@ struct RowQuantArgs {
   const int32_t* expert_offset;
   const int32_t* expert_tile_base;
   const int32_t* num_tiles;
-  void* out_tiles;    // GEMM2 B tiles (layout above)
-  float* tok_scale;   // [rows] per expanded row
-  uint8_t* fq_codes;  // optional caller copy of the quantized input (fc2_input_out); null = none
+  void* out_tiles;   // GEMM2 B tiles (layout above)
+  float* tok_scale;  // [rows] per expanded row
+  // Optional caller copy of the quantized input in (token, slot) order (fc2_input_out, MoE only;
+  // null = none): codes [rows, fq_cols / 2], linear E4M3 scales [rows, fq_cols / 16] and token
+  // scales [rows], fq_cols >= cols with the columns past cols zero; rows of other ranks' experts
+  // all zero.
+  uint8_t* fq_codes;
   uint8_t* fq_sf;
+  float* fq_tok;
+  const int32_t* fq_src;  // [rows] expanded row -> token * top_k + slot (PrepArgs::permuted_src)
+  const int32_t* fq_dst;  // [rows] token * top_k + slot -> expanded row, -1: not local
+  int fq_cols;
 };
 
 // Ordered top-k sum (D6): out[token] = sum_{slot = 0..top_k-1} w[token, slot] * y[row(token,

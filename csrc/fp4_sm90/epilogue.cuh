@@ -455,14 +455,16 @@ struct Epilogue {
       if constexpr (kGemm2) return x;
       return epi::act_plain<epi::kActFixed>(act, x, q, pt);
     };
-    // One 16-bit output at (column c, n-tile row r).
+    // One 16-bit output at (column c, n-tile row r), times GEMM1's out_scale of the expert.
+    const float os = !kGemm2 && ep.out_scale != nullptr ? __ldg(ep.out_scale + expert) : 1.f;
     auto put = [&](int c, int r, bool ok, float y) {
       if (ep.out_tiled) {
         if (c < kp)
           *reinterpret_cast<T*>(outb + b_tile_byte(tile, k_tiles, c >> 7, (c >> 6) & 1, kN, r,
-                                                   c & 63)) = epi::from_f<T>(ok ? y : 0.f);
+                                                   c & 63)) = epi::from_f<T>(ok ? y * os : 0.f);
       } else if (ok) {
-        static_cast<T*>(ep.out)[static_cast<int64_t>(n0 + r) * ep.out_ld + c] = epi::from_f<T>(y);
+        static_cast<T*>(ep.out)[static_cast<int64_t>(n0 + r) * ep.out_ld + c] =
+            epi::from_f<T>(y * os);
       }
     };
 

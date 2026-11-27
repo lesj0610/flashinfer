@@ -133,6 +133,8 @@ class Sm90EpilogueSpec:
     # on a token-wise GEMM1, the inverse global scale of the GEMM2 input rows (scalar, None = the
     # recipe's)
     fq_global: Optional[torch.Tensor] = None
+    # token-wise GEMM1: FP32 [num_local_experts] factor of its 16-bit rows (None = 1)
+    out_scale: Optional[torch.Tensor] = None
 
     @property
     def out_f16(self) -> bool:
