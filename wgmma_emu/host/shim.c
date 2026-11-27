@@ -16,6 +16,13 @@
  *   or cuLaunchKernelEx(_ptsz) of a function whose module was translated with WGEMU_COUNT=1, the
  *   shim synchronizes the context, prints one "WGEMU-COUNT kernel=... grid=x,y,z ..." line on
  *   stdout and zeroes the module's counters. WGEMU_COUNT=0 at run time disables it.
+ * - E4 (shadow shared memory, include/wgmma_emu/e4_device.cuh): a function whose module defines
+ *   the marker __wgemu_e4f_<FNV-1a64 of the name> keeps its CTA shared window in a global slot. The
+ *   shim records MAX_DYNAMIC_SHARED_SIZE_BYTES itself (limit 232448), launches with dynamic shared
+ *   memory 0 plus a hidden last parameter (E4_MAGIC << 32 | dyn), fails a launch whose resident CTA
+ *   count exceeds the slot pool (WGEMU_E4_SLOTS), answers occupancy queries with the SM90 shared
+ *   memory model, and under WGEMU_E4_REPORT=1 prints the lease statistics of each launch. Launch,
+ *   cooperative launch, launch-ex and graph kernel-node entry points are covered.
  * - The shim's functions are returned on every path an application reaches the driver by: direct
  *   calls (exports below), cuGetProcAddress(_v2), cudaGetDriverEntryPoint(ByVersion)(_ptsz), and
  *   dlsym on the libcuda handle (static cudart resolves cuGetProcAddress that way).
@@ -43,6 +50,8 @@ enum {
   WG_ERROR_INVALID_VALUE = 1,
   WG_ERROR_OUT_OF_MEMORY = 2, /* CUDA_ERROR_OUT_OF_MEMORY, cudaErrorMemoryAllocation */
   WG_ERROR_NOT_FOUND = 500,   /* CUDA_ERROR_NOT_FOUND, cudaErrorSymbolNotFound */
+  WG_ERROR_LAUNCH_OUT_OF_RESOURCES = 701,
+  WG_ERROR_NOT_SUPPORTED = 801,
   WG_ERROR_INVALID_CLUSTER_SIZE = 912,
 };
 
@@ -66,10 +75,15 @@ enum {
   WG_FUNC_NON_PORTABLE_CLUSTER_SIZE_ALLOWED = 14,
   WG_FUNC_CLUSTER_SCHEDULING_POLICY_PREFERENCE = 15,
 };
+#define WG_FUNC_MAX_DYNAMIC_SHARED_SIZE_BYTES \
+  8 /* CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES */
 
 /* CUdevice_attribute entries. */
 enum {
   WG_DEV_MULTIPROCESSOR_COUNT = 16,
+  WG_DEV_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR = 81,
+  WG_DEV_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97,
+  WG_DEV_RESERVED_SHARED_MEMORY_PER_BLOCK = 111,
   WG_DEV_COMPUTE_CAPABILITY_MAJOR = 75,
   WG_DEV_COMPUTE_CAPABILITY_MINOR = 76,
   WG_DEV_CLUSTER_LAUNCH = 120,
@@ -727,6 +741,430 @@ static void count_after(int ptsz, void* f, unsigned gx, unsigned gy, unsigned gz
   }
 }
 
+/* ---- E4 shadow shared memory (translation with WGEMU_SMEM_GLOBAL=1) ----------------------------
+ */
+/* An E4 entry function carries the marker global __wgemu_e4f_<FNV-1a 64 of its name> and takes a
+ * hidden last .param .u64 (meta = (E4_MAGIC << 32) | dynamic bytes). The device never sees real
+ * dynamic shared memory: every launch of an E4 function passes sharedMemBytes = 0 and appends a
+ * pointer to the meta word. The per-function MAX_DYNAMIC_SHARED_SIZE_BYTES is recorded here (the
+ * SM90 limit 232448 is checked, the SM80 driver is never asked). Non-E4 functions take the code
+ * paths of the plain shim after one cached lookup. Contract: E4_abi.md sections 2, 4 and 7. */
+#define WG_E4_MAGIC 0x57474534ull
+#define WG_E4_STRIDE 0x40000ull     /* bytes per pool slot */
+#define WG_E4_SM90_BLOCK_MAX 232448 /* SM90 opt-in shared bytes per block */
+#define WG_E4_SM90_SM_SHARED 233472 /* SM90 shared bytes per SM */
+#define WG_E4_SM90_RESERVED 1024    /* SM90 reserved shared bytes per block */
+#define WG_E4_DEFAULT_MAX_DYN 49152 /* attribute value when never set */
+#define WG_E4_STACK_PARAMS 64
+#define WG_E4_TABLE 4096u
+#define WG_E4_TABLE_FULL 3800u
+
+typedef wg_result (*func_param_info_fn)(void*, size_t, size_t*, size_t*);
+typedef wg_result (*occ_plain_fn)(int*, void*, int, size_t);
+typedef wg_result (*e4_ctx_dev_fn)(int*);
+typedef wg_result (*e4_dev_attr_fn)(int*, int, int);
+
+static real_sym r_e4_param_info = {"cuFuncGetParamInfo", NULL};
+static real_sym r_e4_ctx_dev = {"cuCtxGetDevice", NULL};
+static real_sym r_e4_dev_attr = {"cuDeviceGetAttribute", NULL};
+static real_sym r_e4_occ = {"cuOccupancyMaxActiveBlocksPerMultiprocessor", NULL};
+
+typedef struct wg_e4_entry {
+  void* f;         /* handle the application uses (CUfunction or CUkernel) */
+  void* func;      /* CUfunction behind it, NULL when it cannot be resolved */
+  int state;       /* 0: not an E4 function, 1: usable E4 function, 2: E4 but unusable */
+  const char* why; /* state 2: reason */
+  int via_kernel;  /* the name came from cuKernelGetName */
+  unsigned long long name_hash;
+  unsigned nparams;         /* parameters of the entry including the hidden meta */
+  unsigned slots;           /* pool size / stride */
+  unsigned long long stats; /* device address of __wgemu_e4_stats_v1 */
+  char* name;
+  int* max_dyn;           /* recorded MAX_DYNAMIC_SHARED_SIZE_BYTES, -1: never set */
+  unsigned long long occ; /* (threads << 32) | blocks per SM at dyn 0; 0: not cached */
+} wg_e4_entry;
+
+typedef struct wg_e4_attr {
+  void* key; /* CUfunction */
+  int max_dyn;
+} wg_e4_attr;
+
+static wg_e4_entry* g_e4_tab[WG_E4_TABLE];
+static unsigned g_e4_count;
+static wg_e4_attr g_e4_attr[WG_E4_TABLE];
+static unsigned g_e4_attr_count;
+static int g_e4_lock;
+
+static void e4_lock(void) {
+  while (__atomic_test_and_set(&g_e4_lock, __ATOMIC_ACQUIRE)) {
+  }
+}
+
+static void e4_unlock(void) { __atomic_clear(&g_e4_lock, __ATOMIC_RELEASE); }
+
+static unsigned e4_hash_ptr(const void* p) {
+  return (unsigned)((((uintptr_t)p >> 4) * 0x9E3779B97F4A7C15ull) >> 52); /* 12 bits */
+}
+
+static unsigned long long fnv1a64(const char* s) {
+  unsigned long long h = 0xcbf29ce484222325ull;
+  for (; *s; ++s) h = (h ^ (unsigned char)*s) * 0x100000001b3ull;
+  return h;
+}
+
+/* Recorded-attribute cell of a CUfunction (created on first use); NULL when the table is full. */
+static int* e4_attr_cell(void* func) {
+  int* r = NULL;
+  e4_lock();
+  unsigned i = e4_hash_ptr(func);
+  for (unsigned n = 0; n < WG_E4_TABLE; ++n, i = (i + 1) & (WG_E4_TABLE - 1)) {
+    if (g_e4_attr[i].key == func) {
+      r = &g_e4_attr[i].max_dyn;
+      break;
+    }
+    if (!g_e4_attr[i].key) {
+      if (g_e4_attr_count < WG_E4_TABLE_FULL) {
+        g_e4_attr[i].key = func;
+        g_e4_attr[i].max_dyn = -1;
+        ++g_e4_attr_count;
+        r = &g_e4_attr[i].max_dyn;
+      }
+      break;
+    }
+  }
+  e4_unlock();
+  return r;
+}
+
+/* Module or library of a handle, and its CUfunction (same resolution as count_lookup). */
+typedef struct wg_scope {
+  void* mod;
+  void* lib;
+  void* func;
+} wg_scope;
+
+static void e4_scope(void* f, wg_scope* s) {
+  func_get_module_fn get_mod = (func_get_module_fn)real_cuda(&r_func_get_module);
+  kernel_get_function_fn kfunc = (kernel_get_function_fn)real_cuda(&r_kernel_get_function);
+  kernel_get_library_fn klib = (kernel_get_library_fn)real_cuda(&r_kernel_get_library);
+  void* mod = NULL;
+  s->mod = s->lib = s->func = NULL;
+  if (get_mod && get_mod(&mod, f) == WG_SUCCESS && mod) {
+    s->mod = mod;
+    s->func = f;
+    return;
+  }
+  void* f2 = NULL;
+  mod = NULL;
+  if (kfunc && kfunc(&f2, f) == WG_SUCCESS && f2) {
+    s->func = f2;
+    if (get_mod && get_mod(&mod, f2) == WG_SUCCESS && mod) s->mod = mod;
+  }
+  if (!s->mod && klib) {
+    void* lib = NULL;
+    if (klib(&lib, f) == WG_SUCCESS) s->lib = lib;
+  }
+}
+
+static int e4_global(const wg_scope* s, const char* name, unsigned long long* dptr, size_t* bytes) {
+  module_get_global_fn mod_global = (module_get_global_fn)real_cuda(&r_module_get_global);
+  module_get_global_fn lib_global = (module_get_global_fn)real_cuda(&r_library_get_global);
+  if (s->mod && mod_global) return mod_global(dptr, bytes, s->mod, name) == WG_SUCCESS;
+  if (s->lib && lib_global) return lib_global(dptr, bytes, s->lib, name) == WG_SUCCESS;
+  return 0;
+}
+
+/* Kernel name of a handle: cuFuncGetName on the function, else cuKernelGetName on the handle. */
+static const char* e4_name(void* f, void* func, int* via_kernel) {
+  get_name_fn func_name = (get_name_fn)real_cuda(&r_func_get_name);
+  get_name_fn kernel_name = (get_name_fn)real_cuda(&r_kernel_get_name);
+  const char* name = NULL;
+  if (func && func_name && func_name(&name, func) == WG_SUCCESS && name) {
+    *via_kernel = 0;
+    return name;
+  }
+  name = NULL;
+  if (kernel_name && kernel_name(&name, f) == WG_SUCCESS && name) {
+    *via_kernel = 1;
+    return name;
+  }
+  return NULL;
+}
+
+static void e4_resolve(void* f, wg_e4_entry* e) {
+  wg_scope s;
+  e->f = f;
+  e->state = 0;
+  e4_scope(f, &s);
+  if (!s.mod && !s.lib) return;
+  e->func = s.func;
+  const char* name = e4_name(f, s.func, &e->via_kernel);
+  if (!name) return; /* cannot identify the function: the device side rejects a missing meta */
+  e->name_hash = fnv1a64(name);
+  char marker[48];
+  snprintf(marker, sizeof(marker), "__wgemu_e4f_%016llx", e->name_hash);
+  unsigned long long dptr = 0;
+  size_t bytes = 0;
+  if (!e4_global(&s, marker, &dptr, &bytes)) return;
+  e->name = strdup(name);
+  e->state = 2;
+  unsigned long long pool = 0;
+  if (!e4_global(&s, "__wgemu_e4_pool_v1", &pool, &bytes) || bytes < WG_E4_STRIDE) {
+    e->why = "pool symbol __wgemu_e4_pool_v1 missing or smaller than one slot";
+    return;
+  }
+  e->slots = (unsigned)(bytes / WG_E4_STRIDE);
+  if (!e4_global(&s, "__wgemu_e4_stats_v1", &e->stats, &bytes) || bytes < 32u) {
+    e->why = "stats symbol __wgemu_e4_stats_v1 missing or smaller than 32 bytes";
+    return;
+  }
+  func_param_info_fn info = (func_param_info_fn)real_cuda(&r_e4_param_info);
+  if (!s.func || !info) {
+    e->why = "cannot resolve the CUfunction / cuFuncGetParamInfo to check the hidden parameter";
+    return;
+  }
+  unsigned n = 0;
+  size_t off = 0, size = 0, last = 0;
+  while (n < 4096u && info(s.func, n, &off, &size) == WG_SUCCESS) {
+    last = size;
+    ++n;
+  }
+  if (n == 0 || last != 8u) {
+    e->why = "last kernel parameter is not the 8-byte hidden __wgemu_e4_meta";
+    return;
+  }
+  e->nparams = n;
+  e->max_dyn = e4_attr_cell(s.func);
+  if (!e->max_dyn) {
+    e->why = "recorded-attribute table full";
+    return;
+  }
+  e->state = 1;
+}
+
+static int e4_name_matches(wg_e4_entry* e) {
+  int via = 0;
+  const char* name = e4_name(e->f, e->func, &via);
+  return name && fnv1a64(name) == e->name_hash;
+}
+
+/* *out: the E4 entry of a handle, NULL for a non-E4 function. revalidate re-reads the function
+ * name and re-resolves when a recycled handle now names another function. */
+static wg_result e4_find(const char* api, void* f, int revalidate, wg_e4_entry** out) {
+  *out = NULL;
+  if (!f) return WG_SUCCESS;
+  wg_e4_entry* hit = NULL;
+  e4_lock();
+  for (unsigned i = e4_hash_ptr(f), n = 0; n < WG_E4_TABLE; ++n, i = (i + 1) & (WG_E4_TABLE - 1)) {
+    if (!g_e4_tab[i]) break;
+    if (g_e4_tab[i]->f == f) {
+      hit = g_e4_tab[i];
+      break;
+    }
+  }
+  e4_unlock();
+  if (hit && (hit->state == 0 || !revalidate || e4_name_matches(hit))) {
+    if (hit->state) *out = hit;
+    return WG_SUCCESS;
+  }
+  wg_e4_entry* n = (wg_e4_entry*)calloc(1, sizeof(*n));
+  if (!n) return fail(WG_ERROR_OUT_OF_MEMORY, api, "out of host memory");
+  e4_resolve(f, n);
+  int placed = 0;
+  e4_lock();
+  for (unsigned i = e4_hash_ptr(f), k = 0; k < WG_E4_TABLE; ++k, i = (i + 1) & (WG_E4_TABLE - 1)) {
+    if (g_e4_tab[i] && g_e4_tab[i]->f != f) continue;
+    if (g_e4_tab[i] || g_e4_count < WG_E4_TABLE_FULL) {
+      if (!g_e4_tab[i]) ++g_e4_count;
+      g_e4_tab[i] = n; /* a replaced stale entry stays allocated: readers may still hold it */
+      placed = 1;
+    }
+    break;
+  }
+  e4_unlock();
+  if (n->state == 0) {
+    if (!placed) free(n);
+    return WG_SUCCESS;
+  }
+  if (!placed) {
+    return fail(WG_ERROR_OUT_OF_MEMORY, api, "E4 function cache full (%u entries)",
+                WG_E4_TABLE_FULL);
+  }
+  *out = n;
+  return WG_SUCCESS;
+}
+
+static wg_result e4_unusable(const char* api, wg_e4_entry* e) {
+  return fail(WG_ERROR_NOT_SUPPORTED, api, "E4 kernel %s cannot be used: %s",
+              e->name ? e->name : "?", e->why ? e->why : "unusable");
+}
+
+/* Recorded MAX_DYNAMIC_SHARED_SIZE_BYTES of an E4 function (SM90 behaviour: above the opt-in limit
+ * fails, nothing reaches the SM80 driver). */
+static wg_result e4_set_max_dyn(const char* api, wg_e4_entry* e, int value) {
+  if (e->state != 1) return e4_unusable(api, e);
+  if (value < 0 || value > WG_E4_SM90_BLOCK_MAX) {
+    return fail(WG_ERROR_INVALID_VALUE, api,
+                "MAX_DYNAMIC_SHARED_SIZE_BYTES %d outside [0, %d] (SM90 opt-in limit)", value,
+                WG_E4_SM90_BLOCK_MAX);
+  }
+  __atomic_store_n(e->max_dyn, value, __ATOMIC_RELEASE);
+  notice_once(
+      47u,
+      "E4 kernel: MAX_DYNAMIC_SHARED_SIZE_BYTES recorded by the shim (shadow shared memory); "
+      "the SM80 driver is not asked");
+  return WG_SUCCESS;
+}
+
+static int e4_get_max_dyn(wg_e4_entry* e) {
+  const int v = e->max_dyn ? __atomic_load_n(e->max_dyn, __ATOMIC_ACQUIRE) : -1;
+  return v >= 0 ? v : WG_E4_DEFAULT_MAX_DYN;
+}
+
+/* SM count of the current device (real driver values, never the spoofed ones). */
+static wg_result e4_sm_count(const char* api, int* sms) {
+  e4_ctx_dev_fn get_dev = (e4_ctx_dev_fn)real_cuda(&r_e4_ctx_dev);
+  e4_dev_attr_fn attr = (e4_dev_attr_fn)real_cuda(&r_e4_dev_attr);
+  int dev = 0;
+  if (!get_dev || !attr) return missing(api);
+  wg_result r = get_dev(&dev);
+  if (r) return r;
+  return attr(sms, WG_DEV_MULTIPROCESSOR_COUNT, dev);
+}
+
+/* Blocks per SM the SM90 shared memory model allows for a dynamic size (dyn only: the virtual
+ * static part of the module is not known host side). */
+static int e4_sm90_blocks(size_t dyn) {
+  const size_t lim = (size_t)WG_E4_SM90_SM_SHARED / (dyn + WG_E4_SM90_RESERVED);
+  return lim > 0x7fffffffu ? 0x7fffffff : (int)lim;
+}
+
+typedef struct wg_e4_launch {
+  int active; /* the launch was rewritten */
+  wg_e4_entry* e;
+  unsigned dyn;
+  unsigned long long meta;
+  void** params;
+  void* stack[WG_E4_STACK_PARAMS];
+  void** heap;
+} wg_e4_launch;
+
+static void e4_done(wg_e4_launch* L) {
+  free(L->heap);
+  L->heap = NULL;
+}
+
+/* Checks an E4 launch and builds the rewritten parameter array. L->active stays 0 for a non-E4
+ * function, whose launch the caller sends unchanged. */
+static wg_result e4_prepare(const char* api, void* f, unsigned gx, unsigned gy, unsigned gz,
+                            unsigned bx, unsigned by, unsigned bz, unsigned dyn, void** params,
+                            void** extra, wg_e4_launch* L) {
+  L->active = 0;
+  L->e = NULL;
+  L->heap = NULL;
+  L->params = params;
+  wg_e4_entry* e = NULL;
+  wg_result r = e4_find(api, f, 1, &e);
+  if (r || !e) return r;
+  if (e->state != 1) return e4_unusable(api, e);
+  if (extra) {
+    return fail(WG_ERROR_NOT_SUPPORTED, api,
+                "E4 kernel %s launched with the `extra` parameter form: not supported (the hidden "
+                "meta parameter cannot be appended); use kernelParams",
+                e->name);
+  }
+  const int limit = e4_get_max_dyn(e);
+  if (dyn > (unsigned)limit) {
+    return fail(WG_ERROR_INVALID_VALUE, api,
+                "E4 kernel %s: dynamic shared memory %u exceeds MAX_DYNAMIC_SHARED_SIZE_BYTES %d",
+                e->name, dyn, limit);
+  }
+  if (e->nparams > 1u && !params) {
+    return fail(WG_ERROR_INVALID_VALUE, api, "E4 kernel %s: kernelParams is NULL for %u parameters",
+                e->name, e->nparams - 1u);
+  }
+  /* Slots: CTAs that can be resident at once (all of them in one wave at most). */
+  const unsigned long long threads = (unsigned long long)bx * by * bz;
+  const unsigned long long grid = (unsigned long long)gx * gy * gz;
+  unsigned long long occ = __atomic_load_n(&e->occ, __ATOMIC_ACQUIRE);
+  int blocks = 0;
+  if ((occ >> 32) == threads && threads != 0) {
+    blocks = (int)(occ & 0xFFFFFFFFull);
+  } else {
+    occ_plain_fn occf = (occ_plain_fn)real_cuda(&r_e4_occ);
+    if (!occf) return missing(api);
+    r = occf(&blocks, e->func, (int)threads, 0);
+    if (r) return r;
+    __atomic_store_n(&e->occ, (threads << 32) | (unsigned)blocks, __ATOMIC_RELEASE);
+  }
+  int sms = 0;
+  r = e4_sm_count(api, &sms);
+  if (r) return r;
+  unsigned long long need = (unsigned long long)(blocks > 0 ? blocks : 0) * (unsigned)sms;
+  if (grid < need) need = grid;
+  if (need > e->slots) {
+    return fail(WG_ERROR_LAUNCH_OUT_OF_RESOURCES, api,
+                "E4 kernel %s needs %llu CTA slots (min(grid %llu, resident %d x %d SMs)) but the "
+                "pool has %u: translate with WGEMU_E4_SLOTS >= %llu",
+                e->name, need, grid, blocks, sms, e->slots, need);
+  }
+  void** out = L->stack;
+  if (e->nparams > WG_E4_STACK_PARAMS) {
+    out = L->heap = (void**)malloc(e->nparams * sizeof(void*));
+    if (!out) return fail(WG_ERROR_OUT_OF_MEMORY, api, "out of host memory");
+  }
+  for (unsigned i = 0; i + 1u < e->nparams; ++i) out[i] = params[i];
+  L->meta = (WG_E4_MAGIC << 32) | dyn;
+  out[e->nparams - 1u] = &L->meta;
+  L->params = out;
+  L->e = e;
+  L->dyn = dyn;
+  L->active = 1;
+  return WG_SUCCESS;
+}
+
+static int e4_report_enabled(void) {
+  static int v = -1;
+  int r = __atomic_load_n(&v, __ATOMIC_RELAXED);
+  if (r < 0) {
+    const char* e = getenv("WGEMU_E4_REPORT");
+    r = (e && strcmp(e, "1") == 0) ? 1 : 0;
+    __atomic_store_n(&v, r, __ATOMIC_RELAXED);
+  }
+  return r;
+}
+
+/* WGEMU_E4_REPORT=1: after a successful, non-captured E4 launch wait for the context, print the
+ * pool statistics of the launch and zero them. */
+static void e4_report(int ptsz, const wg_e4_launch* L, unsigned gx, unsigned gy, unsigned gz,
+                      void* stream) {
+  if (!L->active || !e4_report_enabled()) return;
+  wg_e4_entry* e = L->e;
+  stream_is_capturing_fn cap = (stream_is_capturing_fn)real_cuda(ptsz ? &r_stream_is_capturing_ptsz
+                                                                      : &r_stream_is_capturing);
+  int status = 0;
+  if (cap && cap(stream, &status) == WG_SUCCESS && status != 0) {
+    notice_once(48u, "launch of E4 kernel %s during stream capture not reported", e->name);
+    return;
+  }
+  ctx_sync_fn sync = (ctx_sync_fn)real_cuda(&r_ctx_sync);
+  memcpy_dtoh_fn dtoh = (memcpy_dtoh_fn)real_cuda(&r_memcpy_dtoh);
+  memset_d8_fn zero = (memset_d8_fn)real_cuda(&r_memset_d8);
+  unsigned long long st[4];
+  if (!sync || !dtoh || !zero || sync() != WG_SUCCESS ||
+      dtoh(st, e->stats, sizeof(st)) != WG_SUCCESS) {
+    fprintf(stderr, "wgemu-shim: WGEMU-E4 kernel=%s: reading the statistics failed\n", e->name);
+    return;
+  }
+  fprintf(
+      stderr,
+      "wgemu-shim: WGEMU-E4 kernel=%s grid=%ux%ux%u dyn=%u leases=%llu max_window=%llu slots=%u\n",
+      e->name, gx, gy, gz, L->dyn, st[0], st[1], e->slots);
+  if (zero(e->stats, 0, sizeof(st)) != WG_SUCCESS || sync() != WG_SUCCESS) {
+    fprintf(stderr, "wgemu-shim: WGEMU-E4 kernel=%s: zeroing the statistics failed\n", e->name);
+  }
+}
+
 typedef wg_result (*cu_launch_fn)(void*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                                   unsigned, void*, void**, void**);
 typedef wg_result (*cu_launch_coop_fn)(void*, unsigned, unsigned, unsigned, unsigned, unsigned,
@@ -740,10 +1178,19 @@ static real_sym r_launch_coop_ptsz = {"cuLaunchCooperativeKernel_ptsz", NULL};
 static wg_result launch(int ptsz, void* f, unsigned gx, unsigned gy, unsigned gz, unsigned bx,
                         unsigned by, unsigned bz, unsigned smem, void* stream, void** params,
                         void** extra) {
+  const char* api = ptsz ? "cuLaunchKernel_ptsz" : "cuLaunchKernel";
   cu_launch_fn real = (cu_launch_fn)real_cuda(ptsz ? &r_launch_ptsz : &r_launch);
-  if (!real) return missing(ptsz ? "cuLaunchKernel_ptsz" : "cuLaunchKernel");
-  wg_result r = real(f, gx, gy, gz, bx, by, bz, smem, stream, params, extra);
-  if (r == WG_SUCCESS) count_after(ptsz, f, gx, gy, gz, stream);
+  if (!real) return missing(api);
+  wg_e4_launch e4;
+  wg_result r = e4_prepare(api, f, gx, gy, gz, bx, by, bz, smem, params, extra, &e4);
+  if (r) return r;
+  r = e4.active ? real(f, gx, gy, gz, bx, by, bz, 0u, stream, e4.params, extra)
+                : real(f, gx, gy, gz, bx, by, bz, smem, stream, params, extra);
+  e4_done(&e4);
+  if (r == WG_SUCCESS) {
+    count_after(ptsz, f, gx, gy, gz, stream);
+    e4_report(ptsz, &e4, gx, gy, gz, stream);
+  }
   return r;
 }
 
@@ -761,11 +1208,20 @@ WG_EXPORT wg_result cuLaunchKernel_ptsz(void* f, unsigned gx, unsigned gy, unsig
 
 static wg_result launch_coop(int ptsz, void* f, unsigned gx, unsigned gy, unsigned gz, unsigned bx,
                              unsigned by, unsigned bz, unsigned smem, void* stream, void** params) {
+  const char* api = ptsz ? "cuLaunchCooperativeKernel_ptsz" : "cuLaunchCooperativeKernel";
   cu_launch_coop_fn real =
       (cu_launch_coop_fn)real_cuda(ptsz ? &r_launch_coop_ptsz : &r_launch_coop);
-  if (!real) return missing(ptsz ? "cuLaunchCooperativeKernel_ptsz" : "cuLaunchCooperativeKernel");
-  wg_result r = real(f, gx, gy, gz, bx, by, bz, smem, stream, params);
-  if (r == WG_SUCCESS) count_after(ptsz, f, gx, gy, gz, stream);
+  if (!real) return missing(api);
+  wg_e4_launch e4;
+  wg_result r = e4_prepare(api, f, gx, gy, gz, bx, by, bz, smem, params, NULL, &e4);
+  if (r) return r;
+  r = e4.active ? real(f, gx, gy, gz, bx, by, bz, 0u, stream, e4.params)
+                : real(f, gx, gy, gz, bx, by, bz, smem, stream, params);
+  e4_done(&e4);
+  if (r == WG_SUCCESS) {
+    count_after(ptsz, f, gx, gy, gz, stream);
+    e4_report(ptsz, &e4, gx, gy, gz, stream);
+  }
   return r;
 }
 
@@ -800,22 +1256,47 @@ static wg_result launch_ex(int ptsz, const wg_cu_launch_config* cfg, void* f, vo
   wg_filtered flt;
   wg_result r = filter_attrs(api, cfg->attrs, cfg->num_attrs, &flt);
   if (r) return r;
-  if (!flt.attrs) {
-    r = real(cfg, f, params, extra);
-    if (r == WG_SUCCESS) count_after(ptsz, f, cfg->grid_x, cfg->grid_y, cfg->grid_z, cfg->stream);
+  /* E4 function: sharedMemBytes 0 and the meta pointer appended; everything else as below. */
+  wg_e4_launch e4;
+  wg_cu_launch_config c4;
+  const wg_cu_launch_config* use = cfg;
+  void** use_params = params;
+  r = e4_prepare(api, f, cfg->grid_x, cfg->grid_y, cfg->grid_z, cfg->block_x, cfg->block_y,
+                 cfg->block_z, cfg->shared_mem_bytes, params, extra, &e4);
+  if (r) {
+    free_filtered(&flt);
     return r;
   }
-  wg_cu_launch_config c = *cfg;
+  if (e4.active) {
+    c4 = *cfg;
+    c4.shared_mem_bytes = 0;
+    use = &c4;
+    use_params = e4.params;
+  }
+  if (!flt.attrs) {
+    r = real(use, f, use_params, extra);
+    e4_done(&e4);
+    if (r == WG_SUCCESS) {
+      count_after(ptsz, f, cfg->grid_x, cfg->grid_y, cfg->grid_z, cfg->stream);
+      e4_report(ptsz, &e4, cfg->grid_x, cfg->grid_y, cfg->grid_z, cfg->stream);
+    }
+    return r;
+  }
+  wg_cu_launch_config c = *use;
   c.attrs = flt.attrs;
   c.num_attrs = flt.n;
-  r = real(&c, f, params, extra);
+  r = real(&c, f, use_params, extra);
+  e4_done(&e4);
   free_filtered(&flt);
   if (r == WG_SUCCESS && flt.has_event) {
     event_record_fn rec = (event_record_fn)real_cuda(ptsz ? &r_event_record_ptsz : &r_event_record);
     if (!rec) return missing("cuEventRecordWithFlags");
     r = rec(flt.event, cfg->stream, (unsigned)flt.event_flags);
   }
-  if (r == WG_SUCCESS) count_after(ptsz, f, cfg->grid_x, cfg->grid_y, cfg->grid_z, cfg->stream);
+  if (r == WG_SUCCESS) {
+    count_after(ptsz, f, cfg->grid_x, cfg->grid_y, cfg->grid_z, cfg->stream);
+    e4_report(ptsz, &e4, cfg->grid_x, cfg->grid_y, cfg->grid_z, cfg->stream);
+  }
   return r;
 }
 
@@ -827,6 +1308,229 @@ WG_EXPORT wg_result cuLaunchKernelEx(const wg_cu_launch_config* cfg, void* f, vo
 WG_EXPORT wg_result cuLaunchKernelEx_ptsz(const wg_cu_launch_config* cfg, void* f, void** params,
                                           void** extra) {
   return launch_ex(1, cfg, f, params, extra);
+}
+
+/* ---- E4 launches through graph kernel nodes ------------------------------------------------- */
+/* CUDA_KERNEL_NODE_PARAMS_v1 is the first 56 bytes of _v2 / _v3 (cuda.h 13.0). The driver copies
+ * the parameter values when a node is added or updated, so the rewritten array only lives for the
+ * duration of the call. cuGraphKernelNodeGetParams returns what the driver stores: for an E4 node
+ * that is sharedMemBytes 0 and the appended meta parameter (not reversed by the shim). */
+typedef struct wg_kernel_node_params {
+  void* func;
+  unsigned grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_mem_bytes;
+  void** kernel_params;
+  void** extra;
+  void* kern; /* v2 / v3 only */
+  void* ctx;  /* v2 / v3 only */
+} wg_kernel_node_params;
+
+#define WG_KERNEL_NODE_V1_SIZE 56u
+#define WG_GRAPH_NODE_KERNEL 0
+
+typedef struct wg_graph_node_params { /* CUgraphNodeParams */
+  int type;
+  int reserved0[3];
+  union {
+    long long reserved1[29];
+    wg_kernel_node_params kernel;
+  } u;
+  long long reserved2;
+} wg_graph_node_params;
+
+_Static_assert(offsetof(wg_kernel_node_params, kernel_params) == 40, "CUDA_KERNEL_NODE_PARAMS");
+_Static_assert(offsetof(wg_kernel_node_params, kern) == WG_KERNEL_NODE_V1_SIZE, "v2 kern");
+_Static_assert(sizeof(wg_kernel_node_params) == 72, "CUDA_KERNEL_NODE_PARAMS_v2 is 72 bytes");
+_Static_assert(offsetof(wg_graph_node_params, u) == 16, "CUgraphNodeParams.kernel");
+_Static_assert(sizeof(wg_graph_node_params) == 256, "CUgraphNodeParams is 256 bytes");
+
+typedef wg_result (*graph_add_kernel_fn)(void**, void*, const void*, size_t,
+                                         const wg_kernel_node_params*);
+typedef wg_result (*graph_kernel_set_fn)(void*, const wg_kernel_node_params*);
+typedef wg_result (*graph_exec_kernel_set_fn)(void*, void*, const wg_kernel_node_params*);
+typedef wg_result (*graph_add_node_fn)(void**, void*, const void*, size_t, wg_graph_node_params*);
+typedef wg_result (*graph_add_node_v2_fn)(void**, void*, const void*, const void*, size_t,
+                                          wg_graph_node_params*);
+typedef wg_result (*graph_node_set_fn)(void*, wg_graph_node_params*);
+typedef wg_result (*graph_exec_node_set_fn)(void*, void*, wg_graph_node_params*);
+
+static real_sym r_g_add_kernel = {"cuGraphAddKernelNode", NULL};
+static real_sym r_g_add_kernel_v2 = {"cuGraphAddKernelNode_v2", NULL};
+static real_sym r_g_kernel_set = {"cuGraphKernelNodeSetParams", NULL};
+static real_sym r_g_kernel_set_v2 = {"cuGraphKernelNodeSetParams_v2", NULL};
+static real_sym r_g_exec_kernel_set = {"cuGraphExecKernelNodeSetParams", NULL};
+static real_sym r_g_exec_kernel_set_v2 = {"cuGraphExecKernelNodeSetParams_v2", NULL};
+static real_sym r_g_add_node = {"cuGraphAddNode", NULL};
+static real_sym r_g_add_node_v2 = {"cuGraphAddNode_v2", NULL};
+static real_sym r_g_node_set = {"cuGraphNodeSetParams", NULL};
+static real_sym r_g_exec_node_set = {"cuGraphExecNodeSetParams", NULL};
+
+/* size: bytes of the caller's structure (v1 callers pass only the first 56). *use is `in` for a
+ * non-E4 kernel, else the rewritten copy `out`. */
+static wg_result e4_graph_kernel(const char* api, const wg_kernel_node_params* in, size_t size,
+                                 wg_kernel_node_params* out, const wg_kernel_node_params** use,
+                                 wg_e4_launch* L) {
+  *use = in;
+  L->active = 0;
+  L->heap = NULL;
+  if (!in) return WG_SUCCESS;
+  void* h = in->func;
+  if (!h && size >= sizeof(*in)) h = in->kern;
+  wg_result r = e4_prepare(api, h, in->grid_x, in->grid_y, in->grid_z, in->block_x, in->block_y,
+                           in->block_z, in->shared_mem_bytes, in->kernel_params, in->extra, L);
+  if (r || !L->active) return r;
+  memcpy(out, in, size);
+  out->shared_mem_bytes = 0;
+  out->kernel_params = L->params;
+  *use = out;
+  return WG_SUCCESS;
+}
+
+static wg_result e4_graph_node(const char* api, wg_graph_node_params* in, wg_graph_node_params* out,
+                               wg_graph_node_params** use, wg_e4_launch* L) {
+  *use = in;
+  L->active = 0;
+  L->heap = NULL;
+  if (!in || in->type != WG_GRAPH_NODE_KERNEL) return WG_SUCCESS;
+  const wg_kernel_node_params* k = &in->u.kernel;
+  void* h = k->func ? k->func : k->kern;
+  wg_result r = e4_prepare(api, h, k->grid_x, k->grid_y, k->grid_z, k->block_x, k->block_y,
+                           k->block_z, k->shared_mem_bytes, k->kernel_params, k->extra, L);
+  if (r || !L->active) return r;
+  *out = *in;
+  out->u.kernel.shared_mem_bytes = 0;
+  out->u.kernel.kernel_params = L->params;
+  *use = out;
+  return WG_SUCCESS;
+}
+
+static wg_result graph_add_kernel(int v2, void** node, void* graph, const void* deps, size_t ndeps,
+                                  const wg_kernel_node_params* p) {
+  const char* api = v2 ? "cuGraphAddKernelNode_v2" : "cuGraphAddKernelNode";
+  graph_add_kernel_fn real =
+      (graph_add_kernel_fn)real_cuda(v2 ? &r_g_add_kernel_v2 : &r_g_add_kernel);
+  if (!real) return missing(api);
+  wg_kernel_node_params tmp;
+  const wg_kernel_node_params* use;
+  wg_e4_launch L;
+  wg_result r = e4_graph_kernel(api, p, v2 ? sizeof(tmp) : WG_KERNEL_NODE_V1_SIZE, &tmp, &use, &L);
+  if (r) return r;
+  r = real(node, graph, deps, ndeps, use);
+  e4_done(&L);
+  return r;
+}
+
+WG_EXPORT wg_result cuGraphAddKernelNode(void** node, void* graph, const void* deps, size_t ndeps,
+                                         const wg_kernel_node_params* p) {
+  return graph_add_kernel(0, node, graph, deps, ndeps, p);
+}
+
+WG_EXPORT wg_result cuGraphAddKernelNode_v2(void** node, void* graph, const void* deps,
+                                            size_t ndeps, const wg_kernel_node_params* p) {
+  return graph_add_kernel(1, node, graph, deps, ndeps, p);
+}
+
+static wg_result graph_kernel_set(int v2, void* node, const wg_kernel_node_params* p) {
+  const char* api = v2 ? "cuGraphKernelNodeSetParams_v2" : "cuGraphKernelNodeSetParams";
+  graph_kernel_set_fn real =
+      (graph_kernel_set_fn)real_cuda(v2 ? &r_g_kernel_set_v2 : &r_g_kernel_set);
+  if (!real) return missing(api);
+  wg_kernel_node_params tmp;
+  const wg_kernel_node_params* use;
+  wg_e4_launch L;
+  wg_result r = e4_graph_kernel(api, p, v2 ? sizeof(tmp) : WG_KERNEL_NODE_V1_SIZE, &tmp, &use, &L);
+  if (r) return r;
+  r = real(node, use);
+  e4_done(&L);
+  return r;
+}
+
+WG_EXPORT wg_result cuGraphKernelNodeSetParams(void* node, const wg_kernel_node_params* p) {
+  return graph_kernel_set(0, node, p);
+}
+
+WG_EXPORT wg_result cuGraphKernelNodeSetParams_v2(void* node, const wg_kernel_node_params* p) {
+  return graph_kernel_set(1, node, p);
+}
+
+static wg_result graph_exec_kernel_set(int v2, void* exec, void* node,
+                                       const wg_kernel_node_params* p) {
+  const char* api = v2 ? "cuGraphExecKernelNodeSetParams_v2" : "cuGraphExecKernelNodeSetParams";
+  graph_exec_kernel_set_fn real =
+      (graph_exec_kernel_set_fn)real_cuda(v2 ? &r_g_exec_kernel_set_v2 : &r_g_exec_kernel_set);
+  if (!real) return missing(api);
+  wg_kernel_node_params tmp;
+  const wg_kernel_node_params* use;
+  wg_e4_launch L;
+  wg_result r = e4_graph_kernel(api, p, v2 ? sizeof(tmp) : WG_KERNEL_NODE_V1_SIZE, &tmp, &use, &L);
+  if (r) return r;
+  r = real(exec, node, use);
+  e4_done(&L);
+  return r;
+}
+
+WG_EXPORT wg_result cuGraphExecKernelNodeSetParams(void* exec, void* node,
+                                                   const wg_kernel_node_params* p) {
+  return graph_exec_kernel_set(0, exec, node, p);
+}
+
+WG_EXPORT wg_result cuGraphExecKernelNodeSetParams_v2(void* exec, void* node,
+                                                      const wg_kernel_node_params* p) {
+  return graph_exec_kernel_set(1, exec, node, p);
+}
+
+/* cuGraphAddNode: legacy 5-argument entry (no edge data) and the _v2 entry of CUDA 12.3+. */
+WG_EXPORT wg_result cuGraphAddNode(void** node, void* graph, const void* deps, size_t ndeps,
+                                   wg_graph_node_params* p) {
+  static const char api[] = "cuGraphAddNode";
+  graph_add_node_fn real = (graph_add_node_fn)real_cuda(&r_g_add_node);
+  if (!real) return missing(api);
+  wg_graph_node_params tmp, *use;
+  wg_e4_launch L;
+  wg_result r = e4_graph_node(api, p, &tmp, &use, &L);
+  if (r) return r;
+  r = real(node, graph, deps, ndeps, use);
+  e4_done(&L);
+  return r;
+}
+
+WG_EXPORT wg_result cuGraphAddNode_v2(void** node, void* graph, const void* deps,
+                                      const void* dep_data, size_t ndeps, wg_graph_node_params* p) {
+  static const char api[] = "cuGraphAddNode_v2";
+  graph_add_node_v2_fn real = (graph_add_node_v2_fn)real_cuda(&r_g_add_node_v2);
+  if (!real) return missing(api);
+  wg_graph_node_params tmp, *use;
+  wg_e4_launch L;
+  wg_result r = e4_graph_node(api, p, &tmp, &use, &L);
+  if (r) return r;
+  r = real(node, graph, deps, dep_data, ndeps, use);
+  e4_done(&L);
+  return r;
+}
+
+WG_EXPORT wg_result cuGraphNodeSetParams(void* node, wg_graph_node_params* p) {
+  static const char api[] = "cuGraphNodeSetParams";
+  graph_node_set_fn real = (graph_node_set_fn)real_cuda(&r_g_node_set);
+  if (!real) return missing(api);
+  wg_graph_node_params tmp, *use;
+  wg_e4_launch L;
+  wg_result r = e4_graph_node(api, p, &tmp, &use, &L);
+  if (r) return r;
+  r = real(node, use);
+  e4_done(&L);
+  return r;
+}
+
+WG_EXPORT wg_result cuGraphExecNodeSetParams(void* exec, void* node, wg_graph_node_params* p) {
+  static const char api[] = "cuGraphExecNodeSetParams";
+  graph_exec_node_set_fn real = (graph_exec_node_set_fn)real_cuda(&r_g_exec_node_set);
+  if (!real) return missing(api);
+  wg_graph_node_params tmp, *use;
+  wg_e4_launch L;
+  wg_result r = e4_graph_node(api, p, &tmp, &use, &L);
+  if (r) return r;
+  r = real(exec, node, use);
+  e4_done(&L);
+  return r;
 }
 
 /* ---- function attributes and occupancy --------------------------------------------------- */
@@ -861,8 +1565,21 @@ static real_sym r_func_get = {"cuFuncGetAttribute", NULL};
 static real_sym r_kernel_set = {"cuKernelSetAttribute", NULL};
 static real_sym r_kernel_get = {"cuKernelGetAttribute", NULL};
 
+/* E4 functions keep MAX_DYNAMIC_SHARED_SIZE_BYTES in the shim (the launch passes dynamic shared
+ * memory 0 to the SM80 driver). *e is the E4 entry when the attribute is that one and the handle
+ * is an E4 function, else NULL. */
+static wg_result e4_attr_entry(const char* api, void* f, int attrib, wg_e4_entry** e) {
+  *e = NULL;
+  if (attrib != WG_FUNC_MAX_DYNAMIC_SHARED_SIZE_BYTES) return WG_SUCCESS;
+  return e4_find(api, f, 0, e);
+}
+
 WG_EXPORT wg_result cuFuncSetAttribute(void* hfunc, int attrib, int value) {
   if (is_cluster_func_attr(attrib)) return set_cluster_attr("cuFuncSetAttribute", attrib, value);
+  wg_e4_entry* e4;
+  wg_result r4 = e4_attr_entry("cuFuncSetAttribute", hfunc, attrib, &e4);
+  if (r4) return r4;
+  if (e4) return e4_set_max_dyn("cuFuncSetAttribute", e4, value);
   func_set_fn real = (func_set_fn)real_cuda(&r_func_set);
   return real ? real(hfunc, attrib, value) : missing("cuFuncSetAttribute");
 }
@@ -875,12 +1592,25 @@ WG_EXPORT wg_result cuFuncGetAttribute(int* pi, int attrib, void* hfunc) {
     *pi = 0;
     return WG_SUCCESS;
   }
+  wg_e4_entry* e4;
+  wg_result r4 = e4_attr_entry("cuFuncGetAttribute", hfunc, attrib, &e4);
+  if (r4) return r4;
+  if (e4) {
+    if (!pi) return fail(WG_ERROR_INVALID_VALUE, "cuFuncGetAttribute", "pi is NULL");
+    if (e4->state != 1) return e4_unusable("cuFuncGetAttribute", e4);
+    *pi = e4_get_max_dyn(e4);
+    return WG_SUCCESS;
+  }
   func_get_fn real = (func_get_fn)real_cuda(&r_func_get);
   return real ? real(pi, attrib, hfunc) : missing("cuFuncGetAttribute");
 }
 
 WG_EXPORT wg_result cuKernelSetAttribute(int attrib, int value, void* kernel, int dev) {
   if (is_cluster_func_attr(attrib)) return set_cluster_attr("cuKernelSetAttribute", attrib, value);
+  wg_e4_entry* e4;
+  wg_result r4 = e4_attr_entry("cuKernelSetAttribute", kernel, attrib, &e4);
+  if (r4) return r4;
+  if (e4) return e4_set_max_dyn("cuKernelSetAttribute", e4, value);
   kernel_set_fn real = (kernel_set_fn)real_cuda(&r_kernel_set);
   return real ? real(attrib, value, kernel, dev) : missing("cuKernelSetAttribute");
 }
@@ -889,6 +1619,15 @@ WG_EXPORT wg_result cuKernelGetAttribute(int* pi, int attrib, void* kernel, int 
   if (is_cluster_func_attr(attrib)) {
     if (!pi) return fail(WG_ERROR_INVALID_VALUE, "cuKernelGetAttribute", "pi is NULL");
     *pi = 0;
+    return WG_SUCCESS;
+  }
+  wg_e4_entry* e4;
+  wg_result r4 = e4_attr_entry("cuKernelGetAttribute", kernel, attrib, &e4);
+  if (r4) return r4;
+  if (e4) {
+    if (!pi) return fail(WG_ERROR_INVALID_VALUE, "cuKernelGetAttribute", "pi is NULL");
+    if (e4->state != 1) return e4_unusable("cuKernelGetAttribute", e4);
+    *pi = e4_get_max_dyn(e4);
     return WG_SUCCESS;
   }
   kernel_get_fn real = (kernel_get_fn)real_cuda(&r_kernel_get);
@@ -960,6 +1699,96 @@ WG_EXPORT wg_result cuOccupancyMaxPotentialClusterSize(int* cluster_size, void* 
   return WG_SUCCESS;
 }
 
+/* ---- E4 occupancy -------------------------------------------------------------------------
+ * An E4 function has no shared memory on the SM80 device, so the real query (dynamic 0) is the
+ * thread / register / CTA-count limit. The SM90 shared memory model adds
+ * floor(233472 / (dyn + 1024)) blocks per SM. Non-E4 functions are passed through. */
+typedef size_t (*occ_b2d_fn)(int);
+typedef wg_result (*occ_pot_fn)(int*, int*, void*, occ_b2d_fn, size_t, int);
+typedef wg_result (*occ_pot_flags_fn)(int*, int*, void*, occ_b2d_fn, size_t, int, unsigned);
+
+static real_sym r_occ_pot = {"cuOccupancyMaxPotentialBlockSize", NULL};
+static real_sym r_occ_pot_flags = {"cuOccupancyMaxPotentialBlockSizeWithFlags", NULL};
+
+static wg_result e4_occ_blocks(const char* api, int* n, void* func, int block_size, size_t dyn,
+                               unsigned flags, int with_flags) {
+  wg_e4_entry* e = NULL;
+  wg_result r = e4_find(api, func, 0, &e);
+  if (r) return r;
+  if (e && e->state != 1) return e4_unusable(api, e);
+  const size_t d = e ? 0 : dyn;
+  if (with_flags) {
+    occ_blocks_fn real = (occ_blocks_fn)real_cuda(&r_occ_blocks);
+    if (!real) return missing(api);
+    r = real(n, func, block_size, d, flags);
+  } else {
+    occ_plain_fn real = (occ_plain_fn)real_cuda(&r_e4_occ);
+    if (!real) return missing(api);
+    r = real(n, func, block_size, d);
+  }
+  if (r == WG_SUCCESS && e && n) {
+    const int lim = e4_sm90_blocks(dyn);
+    if (*n > lim) *n = lim;
+  }
+  return r;
+}
+
+WG_EXPORT wg_result cuOccupancyMaxActiveBlocksPerMultiprocessor(int* n, void* func, int block_size,
+                                                                size_t dyn) {
+  return e4_occ_blocks("cuOccupancyMaxActiveBlocksPerMultiprocessor", n, func, block_size, dyn, 0u,
+                       0);
+}
+
+WG_EXPORT wg_result cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* n, void* func,
+                                                                         int block_size, size_t dyn,
+                                                                         unsigned flags) {
+  return e4_occ_blocks("cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags", n, func, block_size,
+                       dyn, flags, 1);
+}
+
+/* For an E4 function the driver sizes the block at dynamic 0 (the callback is not passed), then
+ * the minimum grid is rescaled by the SM90 blocks-per-SM limit of the callback / dynamic size at
+ * that block size. The block size itself is not re-optimized for the SM90 limit. */
+static wg_result e4_occ_potential(const char* api, int* min_grid, int* block_size, void* func,
+                                  occ_b2d_fn cb, size_t dyn, int limit, unsigned flags,
+                                  int with_flags) {
+  wg_e4_entry* e = NULL;
+  wg_result r = e4_find(api, func, 0, &e);
+  if (r) return r;
+  if (e && e->state != 1) return e4_unusable(api, e);
+  if (with_flags) {
+    occ_pot_flags_fn real = (occ_pot_flags_fn)real_cuda(&r_occ_pot_flags);
+    if (!real) return missing(api);
+    r = real(min_grid, block_size, func, e ? NULL : cb, e ? 0 : dyn, limit, flags);
+  } else {
+    occ_pot_fn real = (occ_pot_fn)real_cuda(&r_occ_pot);
+    if (!real) return missing(api);
+    r = real(min_grid, block_size, func, e ? NULL : cb, e ? 0 : dyn, limit);
+  }
+  if (r != WG_SUCCESS || !e || !min_grid || !block_size) return r;
+  int sms = 0;
+  r = e4_sm_count(api, &sms);
+  if (r) return r;
+  const size_t d = cb ? cb(*block_size) : dyn;
+  const int lim = e4_sm90_blocks(d);
+  const int occ = sms > 0 ? *min_grid / sms : 0;
+  *min_grid = (occ < lim ? occ : lim) * sms;
+  return WG_SUCCESS;
+}
+
+WG_EXPORT wg_result cuOccupancyMaxPotentialBlockSize(int* min_grid, int* block_size, void* func,
+                                                     occ_b2d_fn cb, size_t dyn, int limit) {
+  return e4_occ_potential("cuOccupancyMaxPotentialBlockSize", min_grid, block_size, func, cb, dyn,
+                          limit, 0u, 0);
+}
+
+WG_EXPORT wg_result cuOccupancyMaxPotentialBlockSizeWithFlags(int* min_grid, int* block_size,
+                                                              void* func, occ_b2d_fn cb, size_t dyn,
+                                                              int limit, unsigned flags) {
+  return e4_occ_potential("cuOccupancyMaxPotentialBlockSizeWithFlags", min_grid, block_size, func,
+                          cb, dyn, limit, flags, 1);
+}
+
 /* ---- compute capability spoofing ---------------------------------------------------------- */
 static int g_spoof = -1;
 
@@ -989,6 +1818,16 @@ WG_EXPORT wg_result cuDeviceGetAttribute(int* pi, int attrib, int dev) {
     case WG_DEV_CLUSTER_LAUNCH:
     case WG_DEV_TENSOR_MAP_ACCESS_SUPPORTED:
       if (spoof_cc()) *pi = 1;
+      break;
+    /* SM90 shared memory limits (E4 kernels keep their window in global memory). */
+    case WG_DEV_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN:
+      if (spoof_cc()) *pi = WG_E4_SM90_BLOCK_MAX;
+      break;
+    case WG_DEV_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR:
+      if (spoof_cc()) *pi = WG_E4_SM90_SM_SHARED;
+      break;
+    case WG_DEV_RESERVED_SHARED_MEMORY_PER_BLOCK:
+      if (spoof_cc()) *pi = WG_E4_SM90_RESERVED;
       break;
     default:
       break;
@@ -1056,6 +1895,32 @@ static const wg_export k_exports[] = {
      WG_FN(cuOccupancyMaxActiveClusters), &r_occ_clusters},
     {"cuOccupancyMaxPotentialClusterSize", "cuOccupancyMaxPotentialClusterSize", 0,
      WG_FN(cuOccupancyMaxPotentialClusterSize), &r_occ_cluster_size},
+    {"cuGraphAddKernelNode", "cuGraphAddKernelNode", 0, WG_FN(cuGraphAddKernelNode),
+     &r_g_add_kernel},
+    {"cuGraphAddKernelNode_v2", "cuGraphAddKernelNode", 1, WG_FN(cuGraphAddKernelNode_v2),
+     &r_g_add_kernel_v2},
+    {"cuGraphKernelNodeSetParams", "cuGraphKernelNodeSetParams", 0,
+     WG_FN(cuGraphKernelNodeSetParams), &r_g_kernel_set},
+    {"cuGraphKernelNodeSetParams_v2", "cuGraphKernelNodeSetParams", 1,
+     WG_FN(cuGraphKernelNodeSetParams_v2), &r_g_kernel_set_v2},
+    {"cuGraphExecKernelNodeSetParams", "cuGraphExecKernelNodeSetParams", 0,
+     WG_FN(cuGraphExecKernelNodeSetParams), &r_g_exec_kernel_set},
+    {"cuGraphExecKernelNodeSetParams_v2", "cuGraphExecKernelNodeSetParams", 1,
+     WG_FN(cuGraphExecKernelNodeSetParams_v2), &r_g_exec_kernel_set_v2},
+    {"cuGraphAddNode", "cuGraphAddNode", 0, WG_FN(cuGraphAddNode), &r_g_add_node},
+    {"cuGraphAddNode_v2", "cuGraphAddNode", 1, WG_FN(cuGraphAddNode_v2), &r_g_add_node_v2},
+    {"cuGraphNodeSetParams", "cuGraphNodeSetParams", 0, WG_FN(cuGraphNodeSetParams), &r_g_node_set},
+    {"cuGraphExecNodeSetParams", "cuGraphExecNodeSetParams", 0, WG_FN(cuGraphExecNodeSetParams),
+     &r_g_exec_node_set},
+    {"cuOccupancyMaxActiveBlocksPerMultiprocessor", "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+     0, WG_FN(cuOccupancyMaxActiveBlocksPerMultiprocessor), &r_e4_occ},
+    {"cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags",
+     "cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags", 0,
+     WG_FN(cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags), &r_occ_blocks},
+    {"cuOccupancyMaxPotentialBlockSize", "cuOccupancyMaxPotentialBlockSize", 0,
+     WG_FN(cuOccupancyMaxPotentialBlockSize), &r_occ_pot},
+    {"cuOccupancyMaxPotentialBlockSizeWithFlags", "cuOccupancyMaxPotentialBlockSizeWithFlags", 0,
+     WG_FN(cuOccupancyMaxPotentialBlockSizeWithFlags), &r_occ_pot_flags},
     {"cuDeviceGetAttribute", "cuDeviceGetAttribute", 0, WG_FN(cuDeviceGetAttribute), &r_dev_attr},
     {"cuDeviceComputeCapability", "cuDeviceComputeCapability", 0, WG_FN(cuDeviceComputeCapability),
      &r_dev_cc},
@@ -1091,9 +1956,13 @@ static void* substitute_proc(const char* base, void* p, uint64_t flags, int cuda
     if (p == real_cuda(cand[i]->real)) return cand[i]->wrapper;
   }
   if (nc == 1) return cand[0]->wrapper;
-  const int want = strcmp(base, "cuGetProcAddress") == 0
-                       ? (cuda_version >= 12000)
-                       : ((flags & WG_PROC_PER_THREAD_DEFAULT_STREAM) != 0);
+  /* cuGraph*: the _v2 ABI starts with CUDA 12.0 (kernel node params) / 12.3 (cuGraphAddNode). */
+  const int want =
+      strcmp(base, "cuGetProcAddress") == 0
+          ? (cuda_version >= 12000)
+          : (strncmp(base, "cuGraph", 7) == 0
+                 ? (cuda_version >= (strcmp(base, "cuGraphAddNode") == 0 ? 12030 : 12000))
+                 : ((flags & WG_PROC_PER_THREAD_DEFAULT_STREAM) != 0));
   return cand[0]->variant == want ? cand[0]->wrapper : cand[1]->wrapper;
 }
 

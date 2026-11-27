@@ -690,6 +690,8 @@ class _ModuleCtx:
         count: bool = False,
         dl_slots: int = 0,
         dl_records: int = 0,
+        e4: bool = False,
+        e4_slots: int = 0,
     ) -> None:
         self.mode = mode
         self.src_target = src_target
@@ -702,6 +704,9 @@ class _ModuleCtx:
         self.count = count
         self.dl_slots = dl_slots
         self.dl_records = dl_records
+        # E4 shadow shared memory (ptxemu.rules_smem); off: nothing changes.
+        self.e4 = e4
+        self.e4_slots = e4_slots
         self.counters = {"callseq": 0, "label": 0, "skip": 0}
         self.shared: dict[str, list[int]] = {}  # symbol -> [nbytes, align]
         self.globals: dict[str, list[int]] = {}  # symbol -> [nbytes, align]
@@ -1330,7 +1335,18 @@ def _process_cluster(func: Func, ctx: Ctx, finfo: dict) -> None:
 _UNIFIED_ATTR_RE = re.compile(r"\.attribute\s*\(\s*\.unified\s*\([^()]*\)\s*\)\s*")
 
 
-def _translate_func(func: Func, rules: RuleList, mctx: _ModuleCtx) -> dict:
+@dataclass
+class _FuncPass:
+    """A function after its body was rewritten, before declarations / prologue are inserted."""
+
+    func: Func
+    ctx: Ctx
+    finfo: dict
+    body: list[Stmt | str]
+    prologue: list[str]
+
+
+def _translate_body(func: Func, rules: RuleList, mctx: _ModuleCtx) -> _FuncPass:
     ctx = Ctx(mctx.mode, mctx.src_target, func, mctx, trap=mctx.trap)
     finfo: dict[str, Any] = {"name": func.name, "is_entry": func.is_entry}
     _process_cluster(func, ctx, finfo)
@@ -1361,17 +1377,28 @@ def _translate_func(func: Func, rules: RuleList, mctx: _ModuleCtx) -> dict:
         if hasattr(mod, "function_prologue"):
             res = _call_rule(ctx, name, mod.function_prologue, ctx)
             prologue.extend(_check_lines(res, f"{name}.function_prologue"))
-    insert = ctx._decl_lines() + prologue
+    return _FuncPass(func, ctx, finfo, new_body, prologue)
+
+
+def _finish_func(fp: _FuncPass, head: list[str] | None = None) -> dict:
+    """Insert the declarations (``head`` lines first, e.g. the E4 entry prologue) and the rule
+    prologue after the body declarations and fill the function record."""
+    ctx, finfo, new_body = fp.ctx, fp.finfo, fp.body
+    insert = ctx._decl_lines() + (head or []) + fp.prologue
     if insert:
         idx = _decl_end(new_body)
         new_body = new_body[:idx] + insert + new_body[idx:]
-    func.body = new_body
+    fp.func.body = new_body
     finfo["rewrites"] = dict(ctx._rewrites)
     finfo["new_regs"] = dict(ctx._regs)
     finfo["local_bufs"] = {
         s: {"bytes": n, "align": a} for s, (n, a) in ctx._locals.items()
     }
     return finfo
+
+
+def _translate_func(func: Func, rules: RuleList, mctx: _ModuleCtx) -> dict:
+    return _finish_func(_translate_body(func, rules, mctx))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1656,6 +1683,10 @@ def translate(
     count: bool = False,
     dl_slots: int = 128,
     dl_records: int = 4096,
+    smem_global: bool = False,
+    e4_slots: int = 512,
+    smem_global_entries: str | None = None,
+    plain_lib_src: str | None = None,
 ) -> str:
     """Translate one PTX module for ``.target sm_80`` and return the new text.
 
@@ -1666,12 +1697,80 @@ def translate(
 
     ``async_delay`` (E1) and ``count`` (E2) put the rule module ``ptxemu.instrument`` in front
     of the rules; ``dl_slots`` / ``dl_records`` size the E1 pool (see instrument.py).
+
+    ``smem_global`` (E4) keeps the CTA shared window in a global pool (``ptxemu.rules_smem``,
+    ``e4_slots`` CTA slots); it needs ``lib_src`` built with ``-DWGEMU_SMEM_GLOBAL`` and does not
+    combine with E1 / E2. ``smem_global_entries`` (regex, E4 only) restricts E4 to the entries whose
+    mangled name matches (``re.search``); the others keep real shared memory and the ordinary
+    translation (see ``ptxemu.rules_smem``); empty / None: every entry that uses shared memory.
+    ``plain_lib_src`` (with ``smem_global_entries``): the library of E4 off; when the selector
+    matches no entry the module is translated exactly as with E4 off and that library (otherwise
+    it is unused, and a real-shared entry cannot call a library function that uses the E4 window).
     """
     if mode not in MODES:
         raise TranslateError(f"unknown mode {mode!r} (expected one of {MODES})")
     rep: dict[str, Any] = report if report is not None else {}
+    selector = None
+    if smem_global_entries and not smem_global:
+        raise _located(
+            f"{filename}: --smem-global-entries / WGEMU_E4_ENTRIES selects E4 entries and needs "
+            "E4 (--smem-global / WGEMU_SMEM_GLOBAL=1)"
+        )
+    if smem_global:
+        from . import rules_smem
+
+        if async_delay:
+            raise _located(
+                f"{filename}: E4 shadow shared memory does not support E1 delayed delivery"
+            )
+        if count:
+            raise _located(
+                f"{filename}: E4 shadow shared memory does not support E2 counters"
+            )
+        if lib_src is None:
+            raise _located(
+                f"{filename}: E4 shadow shared memory needs the emulation library (--lib)"
+            )
+        try:
+            rules_smem.check_shape(e4_slots)
+            selector = rules_smem.compile_selector(smem_global_entries)
+        except TranslateError as e:
+            raise _located(f"{filename}: {e}") from None
+    if plain_lib_src is not None and selector is None:
+        raise _located(
+            f"{filename}: the non-E4 library (--lib-plain) belongs to an E4 entry selection "
+            "(--smem-global-entries)"
+        )
     module = parse_module(src, filename)
     assert module.target is not None
+    if selector is not None and plain_lib_src is not None:
+        if not rules_smem.selects_any(module, selector):
+            # nothing selected: the module is the E4-off translation with the library of E4 off
+            out = translate(
+                src,
+                mode=mode,
+                lib_src=plain_lib_src,
+                trap=trap,
+                rules=rules,
+                filename=filename,
+                allow_cluster=allow_cluster,
+                report=rep,
+                warn_stream=warn_stream,
+            )
+            rep["e4"] = {
+                "e4_entries": [],
+                "e4_excluded": [
+                    {
+                        "entry": it.func.name,
+                        "reason": "not selected by WGEMU_E4_ENTRIES",
+                    }
+                    for it in module.items
+                    if it.kind == "func" and it.func is not None and it.func.is_entry
+                ],
+                "entry_regex": selector.pattern,
+                "library": "non-E4 (no entry selected)",
+            }
+            return out
     mctx = _ModuleCtx(
         mode,
         module.target,
@@ -1683,6 +1782,8 @@ def translate(
         count=count,
         dl_slots=dl_slots,
         dl_records=dl_records,
+        e4=smem_global,
+        e4_slots=e4_slots,
     )
     mctx.module_text = src
 
@@ -1731,6 +1832,9 @@ def translate(
         instrument.check_shape(dl_slots, dl_records)
         rule_list = [("instrument", instrument), *rule_list]
         names = ["ptxemu.instrument", *names]
+    if smem_global:
+        rule_list = [("rules_smem", rules_smem), *rule_list]
+        names = ["ptxemu.rules_smem", *names]
     loaded = [n for n, _ in rule_list]
     rep["rules"] = {
         "loaded": loaded,
@@ -1739,17 +1843,52 @@ def translate(
         ],
     }
 
+    e4_info: dict[str, Any] | None = None
     funcs = []
-    for item in module.items:
-        if item.kind == "func" and item.func is not None:
-            funcs.append(_translate_func(item.func, rule_list, mctx))
+    if smem_global:
+        # functions kept in real shared memory (entries not selected + what only they reach)
+        off = rules_smem.plan_off(module, selector) if selector is not None else set()
+        off_rules = [(n, m) for n, m in rule_list if n != "rules_smem"]
+        passes = [
+            _translate_body(
+                item.func, off_rules if item.func.name in off else rule_list, mctx
+            )
+            for item in module.items
+            if item.kind == "func" and item.func is not None
+        ]
+        heads, e4_info = rules_smem.apply(
+            module, passes, mctx, lib_src, rep, selector, off
+        )
+        kept_mod = set(e4_info["kept_shared"])
+        for i, fp in enumerate(passes):
+            funcs.append(_finish_func(fp, heads.get(i)))
+    else:
+        for item in module.items:
+            if item.kind == "func" and item.func is not None:
+                funcs.append(_translate_func(item.func, rule_list, mctx))
 
     chunks: list[list[str]] = []
+    check_chunks: list[
+        list[str]
+    ] = []  # E4 self-check input: without the real-shared parts
     for item in module.items:
         if item.kind == "func" and item.func is not None:
             chunks.append(emit_func(item.func))
+            if e4_info is None or item.func.name not in off:
+                check_chunks.append(chunks[-1])
+        elif smem_global and item.kind == "var" and item.space == "shared":
+            if (
+                item.name in kept_mod
+            ):  # referenced by a function that stays in real shared
+                chunks.append([item.text])
+            else:
+                chunks.append(
+                    [f"// wgemu E4: removed .shared declaration of {item.name}"]
+                )
+                check_chunks.append(chunks[-1])
         else:
             chunks.append([item.text])
+            check_chunks.append(chunks[-1])
     # .attribute(.unified(uuid1, uuid2)) is sm_90 only (ptx.txt 3115-3128); the declaration
     # stays, the attribute goes. rules_misc drops the matching ld operand qualifier.
     n_unified = 0
@@ -1804,8 +1943,13 @@ def translate(
     if protos:
         out.extend(protos)
         out.append("")
-    if mctx.shared:
+    if mctx.shared and not smem_global:
         for sym, (n, a) in mctx.shared.items():
+            out.append(f".shared .align {a} .b8 {sym}[{n}];")
+        out.append("")
+    elif e4_info is not None and e4_info["kept_translator_shared"]:
+        for sym in e4_info["kept_translator_shared"]:
+            n, a = mctx.shared[sym]
             out.append(f".shared .align {a} .b8 {sym}[{n}];")
         out.append("")
     if mctx.globals:
@@ -1849,6 +1993,12 @@ def translate(
             "warnings": list(mctx.warnings),
         }
     )
+    if e4_info is not None:
+        check_text = "\n".join("\n".join(c) for c in check_chunks)
+        rules_smem.selfcheck(
+            "\n".join(lib_lines), check_text, e4_info["removed_shared"]
+        )
+        rep["e4"] = e4_info
     if async_delay:
         rep["async_delay"] = {"slots": dl_slots, "records": dl_records}
     if count:

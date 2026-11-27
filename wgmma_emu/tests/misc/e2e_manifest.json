@@ -149,7 +149,8 @@
     "nvcc_args": [],
     "modes": [
       "exact",
-      "check"
+      "check",
+      "smem"
     ],
     "expect_violation": false,
     "shim": false,
@@ -316,7 +317,8 @@
     "nvcc_args": [],
     "modes": [
       "exact",
-      "check"
+      "check",
+      "smem"
     ],
     "expect_violation": false,
     "shim": false,
@@ -385,7 +387,8 @@
     "nvcc_args": [],
     "modes": [
       "exact",
-      "check"
+      "check",
+      "smem"
     ],
     "expect_violation": false,
     "shim": false,

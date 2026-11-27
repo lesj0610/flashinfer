@@ -25,6 +25,15 @@ Environment:
                          WGEMU-VIOLATION async-delay-* (tools/ptxemu/instrument.py)
   WGEMU_DL_SLOTS         E1 pool slots per module (default 128: CTAs running at the same time)
   WGEMU_DL_RECORDS       E1 pending copies per CTA (default 4096)
+  WGEMU_SMEM_GLOBAL=1    E4: the CTA shared window lives in a per-CTA slot of a global pool, real
+                         shared memory is a 32 byte header (tools/ptxemu/rules_smem.py); builds the
+                         library with -DWGEMU_SMEM_GLOBAL (own cache key); excludes WGEMU_ASYNC_DELAY
+  WGEMU_E4_SLOTS         E4 pool slots, CTAs resident at the same time (default 512, 1..65535)
+  WGEMU_E4_ENTRIES       E4: regex (re.search on the mangled entry name); only the matching entries use
+                         E4, the others keep real shared memory and the ordinary translation. Unset or
+                         empty: every entry that uses shared memory. Needs WGEMU_SMEM_GLOBAL=1.
+                         A module in which the regex matches no entry is translated exactly as with
+                         E4 off, with the E4-off library (built too, own cache key; not with WGEMU_LIB)
   WGEMU_COUNT=1          E2: per-launch counters; host/shim.c prints one WGEMU-COUNT line per
                          launch of a counted kernel
   WGEMU_REAL_NVCC        real nvcc path (default: CUDA home recorded by make_cuda_home_shadow.sh,
@@ -274,7 +283,9 @@ def _hash_tree(h: Any, base: Path) -> None:
         h.update(f.read_bytes() + b"\0")
 
 
-def library_plan(real_nvcc: str) -> tuple[Path, list[str] | None]:
+def library_plan(
+    real_nvcc: str, smem_global: bool = False
+) -> tuple[Path, list[str] | None]:
     """(emu_lib.ptx path, build command or None if it already exists / was given)."""
     given = os.environ.get("WGEMU_LIB")
     if given:
@@ -294,6 +305,7 @@ def library_plan(real_nvcc: str) -> tuple[Path, list[str] | None]:
         "--ptx",
         "-O3",
         "-std=c++17",
+        *(["-DWGEMU_SMEM_GLOBAL"] if smem_global else []),
         "-I",
         str(ROOT / "include"),
         str(src),
@@ -609,6 +621,7 @@ class Driver:
         self.p = p
         self.kd = kd
         self._lib: Path | None = None
+        self._lib_plain: Path | None = None
         self.mode = os.environ.get("WGEMU_MODE", "exact")
         if self.mode not in ("exact", "fast", "check"):
             raise EmuError(f"WGEMU_MODE={self.mode} (expected exact, fast or check)")
@@ -616,6 +629,29 @@ class Driver:
         self.allow_cluster = os.environ.get("WGEMU_ALLOW_CLUSTER") == "1"
         self.async_delay = os.environ.get("WGEMU_ASYNC_DELAY") == "1"
         self.count = os.environ.get("WGEMU_COUNT") == "1"
+        self.smem_global = os.environ.get("WGEMU_SMEM_GLOBAL") == "1"
+        self.e4_slots = os.environ.get("WGEMU_E4_SLOTS", "")
+        self.e4_entries = os.environ.get("WGEMU_E4_ENTRIES", "")
+        if self.e4_entries and not self.smem_global:
+            raise EmuError(
+                "WGEMU_E4_ENTRIES selects E4 entries and needs WGEMU_SMEM_GLOBAL=1"
+            )
+        if self.e4_entries:
+            try:
+                re.compile(self.e4_entries)
+            except re.error as e:
+                raise EmuError(
+                    f"WGEMU_E4_ENTRIES={self.e4_entries!r} is not a regex: {e}"
+                ) from e
+        if self.smem_global and self.async_delay:
+            raise EmuError(
+                "E4 shadow shared memory does not support E1 delayed delivery "
+                "(WGEMU_SMEM_GLOBAL=1 with WGEMU_ASYNC_DELAY=1)"
+            )
+        if self.e4_slots and not (
+            self.e4_slots.isdigit() and 1 <= int(self.e4_slots) <= 65535
+        ):
+            raise EmuError(f"WGEMU_E4_SLOTS={self.e4_slots} (expected 1..65535)")
         self.dl_slots = os.environ.get("WGEMU_DL_SLOTS", "")
         self.dl_records = os.environ.get("WGEMU_DL_RECORDS", "")
         for name, val in (
@@ -641,7 +677,7 @@ class Driver:
     def library(self) -> Path:
         """emu_lib.ptx, built (or found in the cache) on first use."""
         if self._lib is None:
-            lib, cmd = library_plan(self.real)
+            lib, cmd = library_plan(self.real, self.smem_global)
             if cmd is not None:
                 self.script.append(
                     shlex.join([*cmd, str(lib)]) + "   # emulation library build"
@@ -651,6 +687,27 @@ class Driver:
                     ensure_library(lib, cmd)
             self._lib = lib
         return self._lib
+
+    def library_plain(self) -> Path | None:
+        """The E4-off emu_lib.ptx for a module whose WGEMU_E4_ENTRIES selects nothing; None when
+        WGEMU_LIB gives the one library (then that module fails closed instead)."""
+        if os.environ.get("WGEMU_LIB"):
+            return None
+        if self._lib_plain is None:
+            lib, cmd = library_plan(self.real, False)
+            if cmd is not None:
+                self.script.append(
+                    shlex.join([*cmd, str(lib)])
+                    + "   # emulation library build (E4 off)"
+                )
+                self.echo(
+                    shlex.join([*cmd, str(lib)])
+                    + "   # emulation library build (E4 off)"
+                )
+                if not self.p.dryrun:
+                    ensure_library(lib, cmd)
+            self._lib_plain = lib
+        return self._lib_plain
 
     def translate(self, src: str, dst: str) -> None:
         srcp = (self.cwd / src).resolve()
@@ -685,6 +742,15 @@ class Driver:
                 argv += ["--dl-records", self.dl_records]
         if self.count:
             argv.append("--count")
+        if self.smem_global:
+            argv.append("--smem-global")
+            if self.e4_slots:
+                argv += ["--e4-slots", self.e4_slots]
+            if self.e4_entries:
+                argv += ["--smem-global-entries", self.e4_entries]
+                plain = self.library_plain()
+                if plain is not None:
+                    argv += ["--lib-plain", str(plain)]
         if self.inventory:
             argv += ["--inventory", self.inventory]
         shell = f"cp {shlex.quote(str(srcp))} {shlex.quote(str(orig))} && PYTHONPATH={shlex.quote(str(TOOLS_DIR))} {shlex.quote(sys.executable)} -m ptxemu {shlex.join(argv)}"
@@ -825,7 +891,11 @@ def main(argv: list[str]) -> int:
     if dry.returncode != 0:
         sys.stderr.write(dry.stderr)
         return dry.returncode
-    drv = Driver(real, p, kd)
+    try:
+        drv = Driver(real, p, kd)
+    except EmuError as e:
+        log(f"error: {e.args[0]}")
+        return e.args[1] if len(e.args) > 1 else 1
     env = dict(os.environ)
     cmds: list[str] = []
     for line in dry.stderr.splitlines():

@@ -100,6 +100,7 @@
 
 #include <stdint.h>
 
+#include "wgmma_emu/e4_device.cuh"  // E4 shadow shared memory mode (empty unless WGEMU_SMEM_GLOBAL)
 #include "wgmma_emu/numerics.h"
 #include "wgmma_emu/spec.h"
 #include "wgmma_emu/types.h"
@@ -475,6 +476,9 @@ inline __device__ __noinline__ void fatal(const char* what, uint32_t x) {
   __trap();
 }
 
+#ifdef WGEMU_SMEM_GLOBAL
+WGEMU_DEV uint32_t lds(uint32_t addr, int bits) { return e4::lds(addr, bits); }
+#else
 WGEMU_DEV uint32_t lds(uint32_t addr, int bits) {
   uint32_t v;
   if (bits == 8) {
@@ -486,6 +490,7 @@ WGEMU_DEV uint32_t lds(uint32_t addr, int bits) {
   }
   return v;
 }
+#endif
 
 WGEMU_DEV uint32_t elem_addr(const spec::Desc& d, bool mn_major, EType t, int mn, int k) {
   return spec::smem_addr(d, mn_major, load_bits(t), mn, k);

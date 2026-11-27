@@ -441,45 +441,57 @@ __device__ __noinline__ void red_global(uint64_t a, uint32_t op, uint32_t ty, ui
 __device__ __noinline__ void red_shared(uint32_t a, uint32_t op, uint32_t ty, uint64_t v) {
   const uint32_t x = (uint32_t)v;
   const bool s = ty == WGEMU_RT_S32;
+  const sh_addr_t sa = sh_addr(a, ty == WGEMU_RT_U64 ? 8u : 4u);
   if (ty == WGEMU_RT_B32 || ty == WGEMU_RT_U32 || ty == WGEMU_RT_S32) {
     switch (op) {
       case WGEMU_RED_ADD:
-        asm volatile("red.relaxed.cta.shared::cta.add.u32 [%0], %1;" ::"r"(a), "r"(x) : "memory");
+        asm volatile("red.relaxed.cta." WGEMU_SH_SP ".add.u32 [%0], %1;" ::WGEMU_SH_C(sa), "r"(x)
+                     : "memory");
         return;
       case WGEMU_RED_MIN:
         if (s) {
-          asm volatile("red.relaxed.cta.shared::cta.min.s32 [%0], %1;" ::"r"(a), "r"(x) : "memory");
+          asm volatile("red.relaxed.cta." WGEMU_SH_SP ".min.s32 [%0], %1;" ::WGEMU_SH_C(sa), "r"(x)
+                       : "memory");
         } else {
-          asm volatile("red.relaxed.cta.shared::cta.min.u32 [%0], %1;" ::"r"(a), "r"(x) : "memory");
+          asm volatile("red.relaxed.cta." WGEMU_SH_SP ".min.u32 [%0], %1;" ::WGEMU_SH_C(sa), "r"(x)
+                       : "memory");
         }
         return;
       case WGEMU_RED_MAX:
         if (s) {
-          asm volatile("red.relaxed.cta.shared::cta.max.s32 [%0], %1;" ::"r"(a), "r"(x) : "memory");
+          asm volatile("red.relaxed.cta." WGEMU_SH_SP ".max.s32 [%0], %1;" ::WGEMU_SH_C(sa), "r"(x)
+                       : "memory");
         } else {
-          asm volatile("red.relaxed.cta.shared::cta.max.u32 [%0], %1;" ::"r"(a), "r"(x) : "memory");
+          asm volatile("red.relaxed.cta." WGEMU_SH_SP ".max.u32 [%0], %1;" ::WGEMU_SH_C(sa), "r"(x)
+                       : "memory");
         }
         return;
       case WGEMU_RED_INC:
-        asm volatile("red.relaxed.cta.shared::cta.inc.u32 [%0], %1;" ::"r"(a), "r"(x) : "memory");
+        asm volatile("red.relaxed.cta." WGEMU_SH_SP ".inc.u32 [%0], %1;" ::WGEMU_SH_C(sa), "r"(x)
+                     : "memory");
         return;
       case WGEMU_RED_DEC:
-        asm volatile("red.relaxed.cta.shared::cta.dec.u32 [%0], %1;" ::"r"(a), "r"(x) : "memory");
+        asm volatile("red.relaxed.cta." WGEMU_SH_SP ".dec.u32 [%0], %1;" ::WGEMU_SH_C(sa), "r"(x)
+                     : "memory");
         return;
       case WGEMU_RED_AND:
-        asm volatile("red.relaxed.cta.shared::cta.and.b32 [%0], %1;" ::"r"(a), "r"(x) : "memory");
+        asm volatile("red.relaxed.cta." WGEMU_SH_SP ".and.b32 [%0], %1;" ::WGEMU_SH_C(sa), "r"(x)
+                     : "memory");
         return;
       case WGEMU_RED_OR:
-        asm volatile("red.relaxed.cta.shared::cta.or.b32 [%0], %1;" ::"r"(a), "r"(x) : "memory");
+        asm volatile("red.relaxed.cta." WGEMU_SH_SP ".or.b32 [%0], %1;" ::WGEMU_SH_C(sa), "r"(x)
+                     : "memory");
         return;
       case WGEMU_RED_XOR:
-        asm volatile("red.relaxed.cta.shared::cta.xor.b32 [%0], %1;" ::"r"(a), "r"(x) : "memory");
+        asm volatile("red.relaxed.cta." WGEMU_SH_SP ".xor.b32 [%0], %1;" ::WGEMU_SH_C(sa), "r"(x)
+                     : "memory");
         return;
       default:
         break;
     }
   } else if (ty == WGEMU_RT_U64 && op == WGEMU_RED_ADD) {
-    asm volatile("red.relaxed.cta.shared::cta.add.u64 [%0], %1;" ::"r"(a), "l"(v) : "memory");
+    asm volatile("red.relaxed.cta." WGEMU_SH_SP ".add.u64 [%0], %1;" ::WGEMU_SH_C(sa), "l"(v)
+                 : "memory");
     return;
   }
   fatal("reduce-op-type-unsupported-shared", op, ty);
@@ -853,6 +865,7 @@ WGEMU_DEV void bulk_g2s_run(uint32_t dst, uint64_t src, uint32_t size, uint32_t 
   }
 }
 
+#ifndef WGEMU_SMEM_GLOBAL  // E1 delayed delivery is not part of the E4 build
 // ==== E1 delayed delivery ========================================================================
 // Header fields (byte offsets from the shared address `hdr`) and slot regions, see
 // "E1 delayed delivery" in async_device.cuh. Every update of records, owner map, shadow, header
@@ -1010,6 +1023,8 @@ WGEMU_DEV void dl_deliver_phase(uint32_t hdr, uint32_t bar, uint32_t parity, uin
   dl_shrink(hdr, slot);
   dl_unlock(hdr);
 }
+
+#endif  // !WGEMU_SMEM_GLOBAL
 
 WGEMU_DEV uint32_t warp_lane() {
   uint32_t l;
@@ -1292,7 +1307,7 @@ __device__ __noinline__ void wgemu_st_async(uint32_t addr, uint64_t lo, uint64_t
   } else if (nbytes == 8u) {
     shared_st(addr, 8, lo);
   } else if (nbytes == 16u) {
-    asm volatile("st.shared::cta.v2.u64 [%0], {%1, %2};" ::"r"(addr), "l"(lo), "l"(hi) : "memory");
+    shared_st_u64x2(addr, lo, hi);
   } else {
     fatal("st.async-size", nbytes, addr);
   }
@@ -1403,6 +1418,7 @@ __device__ __noinline__ uint32_t wgemu_tmap_query_large(uint64_t tmap) {
   return wgemu_tm_get((uint32_t)gen_ld(tmap + 8, 4), WGEMU_TM_ALLOC_LARGE_SHIFT, 1);
 }
 
+#ifndef WGEMU_SMEM_GLOBAL  // E1 delayed delivery is not part of the E4 build
 // ---- E1 delayed delivery ------------------------------------------------------------------------
 // Entry prologue of every kernel, all threads. Thread 0 claims a pool slot and writes the header.
 __device__ __noinline__ void wgemu_dl_init(uint32_t hdr, uint64_t pool, uint32_t nslots,
@@ -1657,6 +1673,8 @@ __device__ __noinline__ void wgemu_dl_cp_mbar_arrive(uint32_t hdr, uint32_t bar,
   dl_unlock(hdr);
 }
 
+#endif  // !WGEMU_SMEM_GLOBAL
+
 // ---- E2 counters --------------------------------------------------------------------------------
 // counter[off] += sum of v over the active lanes that add to the same counter (one atomic per
 // counter). Diverged lanes can enter together with different offsets, e.g. a bulk copy issuer
@@ -1693,5 +1711,159 @@ __device__ __noinline__ uint32_t wgemu_tma_bytes(uint64_t tmap, uint32_t flags) 
   tmap_read(tmap, t);
   return tensor_box_bytes(t);
 }
+
+#ifdef WGEMU_SMEM_GLOBAL
+// ---- E4 shadow shared memory --------------------------------------------------------------------
+// The CTA's shared window is a slot of the global pool, addressed by virtual offsets (see
+// include/wgmma_emu/e4_device.cuh). A slot is leased with atom.acquire.gpu.cas on its lease word
+// and returned with atom.release.gpu.exch by the last thread of the CTA, so the shadow bytes of a
+// finished CTA are visible to the next CTA that leases the slot. The lease and stats addresses
+// live in the slot bytes below WGEMU_E4_ORIGIN (no shared access can reach them).
+constexpr uint64_t kE4LeaseWaitNs = 10000000000ull;  // 10 s
+
+// Prologue of every E4 entry, all threads (meta = (WGEMU_E4_MAGIC << 32) | dynamic bytes).
+__device__ __noinline__ void wgemu_e4_enter(uint64_t meta, uint32_t dyn_base, uint64_t pool,
+                                            uint64_t lease, uint64_t stats, uint32_t slots) {
+  using namespace wgemu::async;
+  if (linear_tid() == 0u) {
+    if ((uint32_t)(meta >> 32) != WGEMU_E4_MAGIC) {
+      fatal("e4-meta: launched without the shim's metadata", (uint32_t)(meta >> 32),
+            (uint32_t)meta);
+    }
+    uint32_t dsz;
+    asm volatile("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dsz));
+    if (dsz != 0u) fatal("e4-dynamic-smem-nonzero", dsz, 0u);
+    const uint64_t window64 = (uint64_t)dyn_base + (uint64_t)(uint32_t)meta;
+    if (window64 > WGEMU_E4_WINDOW_MAX || window64 > WGEMU_E4_STRIDE ||
+        window64 < WGEMU_E4_ORIGIN || window64 - WGEMU_E4_ORIGIN > WGEMU_E4_SM90_BLOCK_MAX) {
+      fatal("e4-window", (uint32_t)window64, dyn_base);
+    }
+    if (slots == 0u) fatal("e4-slots", slots, 0u);
+    const uint32_t window = (uint32_t)window64;
+    const uint32_t nthr = blockDim.x * blockDim.y * blockDim.z;
+    const uint32_t lin = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+    uint32_t smid;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+    const uint64_t t0 = globaltimer();
+    const uint32_t h = (lin * 2654435761u) ^ (smid * 40503u) ^ (uint32_t)(t0 >> 7) * 2246822519u;
+    uint32_t idx = 0xFFFFFFFFu;
+    for (;;) {
+      for (uint32_t k = 0; k < slots; ++k) {
+        const uint32_t i = (h + k) % slots;
+        uint32_t old;
+        asm volatile("atom.acquire.gpu.global.cas.b32 %0, [%1], 0, 1;"
+                     : "=r"(old)
+                     : "l"(to_global(lease + 4ull * i))
+                     : "memory");
+        if (old == 0u) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx != 0xFFFFFFFFu) break;
+      if (globaltimer() - t0 > kE4LeaseWaitNs) {
+        fatal("e4-no-slot: raise WGEMU_E4_SLOTS (slots, grid CTAs)", slots,
+              gridDim.x * gridDim.y * gridDim.z);
+      }
+      nanosleep_ns(1000);
+    }
+    const uint64_t slot = pool + (uint64_t)WGEMU_E4_STRIDE * idx;
+    gen_st(slot + WGEMU_E4_S_LEASE, 8, lease + 4ull * idx);
+    gen_st(slot + WGEMU_E4_S_STATS, 8, stats);
+    atomicAdd(reinterpret_cast<unsigned long long*>(stats), 1ull);
+    atomicMax(reinterpret_cast<unsigned long long*>(stats + 8), (unsigned long long)window);
+    const unsigned long long cur =
+        atomicAdd(reinterpret_cast<unsigned long long*>(stats + 24), 1ull) + 1ull;
+    atomicMax(reinterpret_cast<unsigned long long*>(stats + 16), cur);
+    wgemu::e4::hdr_st64<WGEMU_E4_H_BASE>(slot);
+    wgemu::e4::hdr_st32<WGEMU_E4_H_WINDOW>(window);
+    wgemu::e4::hdr_st32<WGEMU_E4_H_DYN>((uint32_t)meta);
+    wgemu::e4::hdr_st32<WGEMU_E4_H_ALIVE>(nthr);
+    wgemu::e4::hdr_st32<WGEMU_E4_H_SLOT>(idx);
+    wgemu::e4::hdr_st32<WGEMU_E4_H_MAGIC>(WGEMU_E4_MAGIC);
+  }
+  __syncthreads();
+}
+
+// Before every ret and exit of an E4 entry, all threads. The last thread of the CTA clears the
+// header and returns the slot.
+__device__ __noinline__ void wgemu_e4_exit() {
+  using namespace wgemu::async;
+  using namespace wgemu::e4;
+  if (hdr_ld32<WGEMU_E4_H_MAGIC>() != WGEMU_E4_MAGIC) return;
+  const uint64_t slot = hdr_ld64<WGEMU_E4_H_BASE>();
+  if (hdr_alive_dec() != 1u) return;
+  const uint64_t lease = gen_ld(slot + WGEMU_E4_S_LEASE, 8);
+  const uint64_t stats = gen_ld(slot + WGEMU_E4_S_STATS, 8);
+  hdr_st32<WGEMU_E4_H_MAGIC>(0u);
+  hdr_st64<WGEMU_E4_H_BASE>(0ull);
+  hdr_st32<WGEMU_E4_H_WINDOW>(0u);
+  atomicAdd(reinterpret_cast<unsigned long long*>(stats + 24), 0xFFFFFFFFFFFFFFFFull);
+  uint32_t old;
+  asm volatile("atom.release.gpu.global.exch.b32 %0, [%1], 0;"
+               : "=r"(old)
+               : "l"(to_global(lease))
+               : "memory");
+  asm volatile("" ::"r"(old));  // the exchange result is not needed
+}
+
+// Non-bulk cp.async (SM80 form): cp_size 4, 8 or 16 bytes, src_size bytes copied, zero fill
+// after them. The copy completes before the call returns.
+__device__ __noinline__ void wgemu_e4_cp_async(uint32_t dst, uint64_t src, uint32_t cp_size,
+                                               uint32_t src_size) {
+  using namespace wgemu::async;
+  if ((cp_size != 4u && cp_size != 8u && cp_size != 16u) || (dst & (cp_size - 1u)) ||
+      (src_size != 0u && (src & (cp_size - 1u)))) {
+    fatal("e4-cp-async-size-or-alignment", dst, cp_size);
+  }
+  if (src_size > cp_size) fatal("e4-cp-async-src-size", src_size, cp_size);
+  if (cp_size == 16u && src_size == 16u) {
+    uint32_t w[4];
+    gen_ld16(src, w);
+    shared_st16(dst, w);
+    return;
+  }
+  for (uint32_t o = 0; o < cp_size; o += 4u) {
+    uint32_t v = 0u;
+    if (o + 4u <= src_size) {
+      v = (uint32_t)gen_ld(src + o, 4);
+    } else {
+      for (uint32_t b = 0; b < 4u; ++b) {
+        if (o + b < src_size) v |= (uint32_t)gen_ld(src + o + b, 1) << (8u * b);
+      }
+    }
+    shared_st(dst + o, 4, v);
+  }
+}
+
+// cp.async.mbarrier.arrive(.noinc): the copies of this thread are complete already. With .noinc
+// the arrive-on counts once (release: the shadow writes above are ordered before it); without it
+// the pending count is incremented and decremented again, so only the barrier address is checked.
+__device__ __noinline__ void wgemu_e4_cp_async_arrive(uint32_t bar, uint32_t noinc) {
+  using namespace wgemu::async;
+  if (bar & 7u) fatal("mbarrier-misaligned", bar, 0u);
+  if (noinc) {
+    mb_update(bar, 1u, 0, false, false, 0u);
+  } else {
+    mb_check_valid(bar, mb_load_relaxed(bar), 0u);
+  }
+}
+
+__device__ __noinline__ uint32_t wgemu_e4_dyn_smem() {
+  using namespace wgemu::e4;
+  if (hdr_ld32<WGEMU_E4_H_MAGIC>() != WGEMU_E4_MAGIC) {
+    wgemu::async::fatal("e4-header-uninitialized", 0u, 0u);
+  }
+  return hdr_ld32<WGEMU_E4_H_DYN>();
+}
+
+__device__ __noinline__ uint32_t wgemu_e4_total_smem() {
+  using namespace wgemu::e4;
+  if (hdr_ld32<WGEMU_E4_H_MAGIC>() != WGEMU_E4_MAGIC) {
+    wgemu::async::fatal("e4-header-uninitialized", 0u, 0u);
+  }
+  return hdr_ld32<WGEMU_E4_H_WINDOW>() - WGEMU_E4_ORIGIN;
+}
+#endif  // WGEMU_SMEM_GLOBAL
 
 }  // extern "C"

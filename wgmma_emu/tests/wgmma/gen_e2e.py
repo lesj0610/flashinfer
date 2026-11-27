@@ -90,6 +90,9 @@ FP8 = ("e4m3", "e5m2")
 INT8 = ("s8", "u8")
 SW = (0, 32, 64, 128)
 MODES_ALL = ["exact", "fast", "check"]
+# E4 (shadow shared memory) variant of the generated positive tests. cute_gmma.cu is excluded: its
+# PTX converts shared addresses with cvta.shared, which the E4 translation rejects.
+MODES_SMEM = [*MODES_ALL, "smem"]
 BASE_COVERS = [
     r"wgmma\.fence\.sync\.aligned",
     r"wgmma\.commit_group\.sync\.aligned",
@@ -803,7 +806,7 @@ def generate() -> dict[Path, str]:
                 "name": c.test_name,
                 "source": rel,
                 "nvcc_args": [],
-                "modes": MODES_ALL,
+                "modes": MODES_SMEM,
                 "expect_violation": False,
                 "shim": False,
                 "covers": covers,

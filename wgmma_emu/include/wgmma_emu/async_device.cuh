@@ -84,6 +84,7 @@
 
 #include <stdint.h>
 
+#include "e4_device.cuh"  // E4 shadow shared memory mode (empty unless WGEMU_SMEM_GLOBAL)
 #include "tensormap.h"
 #include "types.h"
 
@@ -226,6 +227,22 @@ namespace wgemu {
 namespace async {
 
 // ---- raw memory access ------------------------------------------------------------------------
+// WGEMU_SMEM_GLOBAL (E4 shadow shared memory mode, include/wgmma_emu/e4_device.cuh): every
+// shared address is a virtual offset into the CTA's slot in global memory; the accessors check
+// the offset against the window, then access the global state space.
+#ifdef WGEMU_SMEM_GLOBAL
+WGEMU_DEV uint64_t shared_ld(uint32_t a, int n) { return e4::ld(a, n); }
+WGEMU_DEV void shared_st(uint32_t a, int n, uint64_t v) { e4::st(a, n, v); }
+WGEMU_DEV void shared_ld16(uint32_t a, uint32_t* w) { e4::ld16(a, w); }
+WGEMU_DEV void shared_st16(uint32_t a, const uint32_t* w) { e4::st16(a, w); }
+WGEMU_DEV void shared_st_u64x2(uint32_t a, uint64_t lo, uint64_t hi) { e4::st_u64x2(a, lo, hi); }
+// Address operand of an atomic / reduction / mbarrier access of `n` bytes, in the state space
+// WGEMU_SH_SP: a checked 64-bit global address ("l"); without E4 the 32-bit shared address ("r").
+typedef uint64_t sh_addr_t;
+WGEMU_DEV sh_addr_t sh_addr(uint32_t a, uint32_t n) { return e4::addr(a, n); }
+#define WGEMU_SH_SP "global"
+#define WGEMU_SH_C "l"
+#else
 WGEMU_DEV uint64_t shared_ld(uint32_t a, int n) {
   uint64_t v = 0;
   if (n == 1) {
@@ -270,6 +287,19 @@ WGEMU_DEV void shared_st16(uint32_t a, const uint32_t* w) {
                "r"(w[2]), "r"(w[3])
                : "memory");
 }
+
+WGEMU_DEV void shared_st_u64x2(uint32_t a, uint64_t lo, uint64_t hi) {
+  asm volatile("st.shared::cta.v2.u64 [%0], {%1, %2};" ::"r"(a), "l"(lo), "l"(hi) : "memory");
+}
+
+typedef uint32_t sh_addr_t;
+WGEMU_DEV sh_addr_t sh_addr(uint32_t a, uint32_t n) {
+  (void)n;
+  return a;
+}
+#define WGEMU_SH_SP "shared::cta"
+#define WGEMU_SH_C "r"
+#endif
 
 // Generic addressing (global memory, and tensor maps in .param/.const/.global/.shared).
 WGEMU_DEV uint64_t gen_ld(uint64_t a, int n) {
@@ -336,22 +366,37 @@ WGEMU_DEV void nanosleep_ns(uint32_t ns) { asm volatile("nanosleep.u32 %0;" ::"r
 // ---- mbarrier word ------------------------------------------------------------------------------
 WGEMU_DEV uint64_t mb_load_acquire(uint32_t bar) {
   uint64_t v;
+#ifdef WGEMU_SMEM_GLOBAL
+  asm volatile("ld.acquire.cta.global.u64 %0, [%1];" : "=l"(v) : "l"(sh_addr(bar, 8u)) : "memory");
+#else
   asm volatile("ld.acquire.cta.shared::cta.u64 %0, [%1];" : "=l"(v) : "r"(bar) : "memory");
+#endif
   return v;
 }
 
 WGEMU_DEV uint64_t mb_load_relaxed(uint32_t bar) {
   uint64_t v;
+#ifdef WGEMU_SMEM_GLOBAL
+  asm volatile("ld.relaxed.cta.global.u64 %0, [%1];" : "=l"(v) : "l"(sh_addr(bar, 8u)) : "memory");
+#else
   asm volatile("ld.relaxed.cta.shared::cta.u64 %0, [%1];" : "=l"(v) : "r"(bar) : "memory");
+#endif
   return v;
 }
 
 WGEMU_DEV uint64_t mb_cas(uint32_t bar, uint64_t cmp, uint64_t val) {
   uint64_t old;
+#ifdef WGEMU_SMEM_GLOBAL
+  asm volatile("atom.acq_rel.cta.global.cas.b64 %0, [%1], %2, %3;"
+               : "=l"(old)
+               : "l"(sh_addr(bar, 8u)), "l"(cmp), "l"(val)
+               : "memory");
+#else
   asm volatile("atom.acq_rel.cta.shared::cta.cas.b64 %0, [%1], %2, %3;"
                : "=l"(old)
                : "r"(bar), "l"(cmp), "l"(val)
                : "memory");
+#endif
   return old;
 }
 

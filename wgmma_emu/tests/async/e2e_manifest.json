@@ -92,7 +92,8 @@
       "fast",
       "check",
       "delay",
-      "count"
+      "count",
+      "smem"
     ],
     "expect_violation": false,
     "shim": false,
@@ -137,7 +138,8 @@
       "exact",
       "fast",
       "check",
-      "delay"
+      "delay",
+      "smem"
     ],
     "expect_violation": false,
     "shim": true,
@@ -164,7 +166,8 @@
       "exact",
       "fast",
       "check",
-      "delay"
+      "delay",
+      "smem"
     ],
     "expect_violation": false,
     "shim": true,
@@ -221,7 +224,8 @@
       "exact",
       "fast",
       "check",
-      "delay"
+      "delay",
+      "smem"
     ],
     "expect_violation": false,
     "shim": false,
@@ -259,7 +263,8 @@
       "exact",
       "fast",
       "check",
-      "delay"
+      "delay",
+      "smem"
     ],
     "expect_violation": false,
     "shim": false,
@@ -400,7 +405,8 @@
     "modes": [
       "exact",
       "delay",
-      "count"
+      "count",
+      "smem"
     ],
     "expect_violation": false,
     "shim": true,
@@ -446,7 +452,8 @@
     "source": "neg_delay_nowait.cu",
     "nvcc_args": [],
     "modes": [
-      "exact"
+      "exact",
+      "smem"
     ],
     "expect_violation": false,
     "shim": false,
@@ -504,7 +511,8 @@
       "-DREUSE=1"
     ],
     "modes": [
-      "exact"
+      "exact",
+      "smem"
     ],
     "expect_violation": false,
     "shim": false,
@@ -517,7 +525,8 @@
       "-DREUSE=2"
     ],
     "modes": [
-      "exact"
+      "exact",
+      "smem"
     ],
     "expect_violation": false,
     "shim": false,
@@ -530,7 +539,8 @@
       "-DREUSE=3"
     ],
     "modes": [
-      "exact"
+      "exact",
+      "smem"
     ],
     "expect_violation": false,
     "shim": false,

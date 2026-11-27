@@ -77,6 +77,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="E1: pending copies per CTA",
     )
     ap.add_argument(
+        "--smem-global",
+        action="store_true",
+        help="E4: keep the CTA shared window in a global per-CTA pool (needs a library built with -DWGEMU_SMEM_GLOBAL)",
+    )
+    ap.add_argument(
+        "--smem-global-entries",
+        metavar="REGEX",
+        default=None,
+        help="E4: only entries whose mangled name matches (re.search) use E4; the other entries keep "
+        "real shared memory (needs --smem-global; empty: every entry that uses shared memory)",
+    )
+    ap.add_argument(
+        "--lib-plain",
+        metavar="PTX",
+        default=None,
+        help="with --smem-global-entries: the emulation library of E4 off; used instead of --lib "
+        "when the regex selects no entry (the module is then the E4-off translation)",
+    )
+    ap.add_argument(
+        "--e4-slots",
+        type=int,
+        default=512,
+        help="E4: pool slots (CTAs resident at the same time), 1..65535",
+    )
+    ap.add_argument(
         "--count",
         action="store_true",
         help="E2: per-launch counters printed by host/shim.c (WGEMU-COUNT lines)",
@@ -115,6 +140,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         src = _read(args.input)
         lib = _read(args.lib) if args.lib else None
+        plain = _read(args.lib_plain) if args.lib_plain else None
     except OSError as e:
         print(f"ptxemu: error: {e}", file=sys.stderr)
         return EXIT_ERROR
@@ -131,6 +157,10 @@ def run(args: argparse.Namespace) -> int:
             count=args.count,
             dl_slots=args.dl_slots,
             dl_records=args.dl_records,
+            smem_global=args.smem_global,
+            e4_slots=args.e4_slots,
+            smem_global_entries=args.smem_global_entries,
+            plain_lib_src=plain,
         )
     except (core.TranslateError, lx.LexError) as e:
         print(f"ptxemu: error: {e}", file=sys.stderr)

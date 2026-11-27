@@ -5,7 +5,7 @@ Manifest (PLAN section 11): a JSON list of objects with exactly the keys
 ``name`` (str), ``source`` (path relative to the area directory), ``nvcc_args`` (list of str;
 an item ``area:<path>`` is an extra input file relative to the area directory, e.g. a second
 -rdc translation unit),
-``modes`` (non-empty subset of exact/fast/check/delay/count), ``expect_violation`` (false, or
+``modes`` (non-empty subset of exact/fast/check/delay/count/smem), ``expect_violation`` (false, or
 the non-empty list of WGEMU-VIOLATION kinds a negative test must print; such a test has the
 single mode "check" or "delay", and the pseudo-kind "mismatch" in the list means the run must
 report result mismatches instead of clean results), ``shim`` (bool; run with LD_PRELOAD of the
@@ -20,7 +20,9 @@ For every (test, mode) the source is built with ``tools/nvcc_emu`` in parallel (
 exact/fast/check set WGEMU_MODE=<mode>; "delay" builds exact with WGEMU_ASYNC_DELAY=1 (E1,
 asynchronous copies delivered when a wait observes them); "count" builds exact with
 WGEMU_COUNT=1 (E2) and always runs with the host shim, which prints one WGEMU-COUNT line per
-launch. Tests then run one at a time on --gpu with a timeout. Output lines
+launch; "smem" builds exact with WGEMU_SMEM_GLOBAL=1 (E4, the CTA shared window lives in a global
+pool; positive tests only) and always runs with the host shim, which passes the hidden meta
+parameter and the zero dynamic shared memory of every E4 launch. Tests then run one at a time on --gpu with a timeout. Output lines
 
     WGEMU-TEST name=<id> cases=<n> mismatches=<m>
     WGEMU-TEST-END
@@ -65,7 +67,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 TOOLS = ROOT / "tools"
 NVCC_EMU = TOOLS / "nvcc_emu"
-MODES = ("exact", "fast", "check", "delay", "count")
+MODES = ("exact", "fast", "check", "delay", "count", "smem")
 # Build environment per mode (translate-time switches of tools/nvcc_emu).
 MODE_ENV = {
     "exact": {"WGEMU_MODE": "exact"},
@@ -73,6 +75,7 @@ MODE_ENV = {
     "check": {"WGEMU_MODE": "check"},
     "delay": {"WGEMU_MODE": "exact", "WGEMU_ASYNC_DELAY": "1"},
     "count": {"WGEMU_MODE": "exact", "WGEMU_COUNT": "1"},
+    "smem": {"WGEMU_MODE": "exact", "WGEMU_SMEM_GLOBAL": "1"},
 }
 NEG_MODES = ("check", "delay")
 MISMATCH = "mismatch"  # pseudo violation kind: the negative test must report mismatches
@@ -333,7 +336,13 @@ def build_one(job: Job, timeout: int) -> None:
     env = {
         k: v
         for k, v in os.environ.items()
-        if k not in ("WGEMU_ASYNC_DELAY", "WGEMU_COUNT")
+        if k
+        not in (
+            "WGEMU_ASYNC_DELAY",
+            "WGEMU_COUNT",
+            "WGEMU_SMEM_GLOBAL",
+            "WGEMU_E4_SLOTS",
+        )
     }
     env.update(MODE_ENV[job.mode])
     log = Path(str(job.exe) + ".build.log")
@@ -463,24 +472,35 @@ def run_one(job: Job, gpu: str, timeout: int, shim: Path | None) -> None:
 
 
 def needs_shim(job: Job) -> bool:
-    return job.entry.shim or job.mode == "count"
+    return job.entry.shim or job.mode in ("count", "smem")
 
 
 def check_instrumented(job: Job) -> None:
-    """Delay / count mode: the translation reports must show the E1 / E2 instrumentation."""
-    if job.mode not in ("delay", "count") or job.build_rc != 0:
+    """Delay / count / smem mode: the translation reports must show the E1 / E2 / E4 work."""
+    if job.mode not in ("delay", "count", "smem") or job.build_rc != 0:
         return
     reports = sorted(job.keep_dir.glob("*.wgemu_report.json"))
     if not reports:
         job.instr_missing = "no *.wgemu_report.json in keep dir"
         return
     counted = False
+    e4_entries = 0
     for rp in reports:
         try:
-            called = json.loads(rp.read_text()).get("called") or {}
+            rep = json.loads(rp.read_text())
+            called = rep.get("called") or {}
         except (OSError, ValueError) as e:
             job.instr_missing = f"{rp.name}: {e}"
             return
+        if job.mode == "smem":
+            e4 = rep.get("e4")
+            if not isinstance(e4, dict):
+                job.instr_missing = (
+                    f"{rp.name}: not translated with E4 (no 'e4' record)"
+                )
+                return
+            e4_entries += len(e4.get("entries") or [])
+            continue
         if job.mode == "delay":
             orig = rp.with_name(
                 rp.name.replace(".wgemu_report.json", ".wgemu_orig.ptx")
@@ -491,6 +511,8 @@ def check_instrumented(job: Job) -> None:
                 return
         elif "wgemu_count_add" in called or "wgemu_count_wgmma" in called:
             counted = True
+    if job.mode == "smem" and not e4_entries:
+        job.instr_missing = "no E4 entry (no kernel uses shared memory?)"
     if job.mode == "count" and not counted:
         job.instr_missing = "no module calls wgemu_count_add / wgemu_count_wgmma"
 
