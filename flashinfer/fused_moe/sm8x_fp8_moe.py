@@ -429,22 +429,23 @@ def cutile_activation(
 
 
 # The 128x4-swizzled copy of every prepared [E, N, K / 32] UE8M0 weight-scale tensor
-# the SM8x GEMMs read, keyed by the tensor and stamped with its address and version:
-# prepared weights are written once at model load (``MoEWeightPack``).
+# the SM8x GEMMs read, keyed by the tensor and stamped with its address and version.
 _SWIZZLED_WEIGHT_SCALES: WeakIdKeyDictionary = WeakIdKeyDictionary()
 
 
 def _swizzled_weight_scales(scale: torch.Tensor) -> torch.Tensor:
     from ..quantization.fp4_quantization import block_scale_interleave
 
-    stamp = (scale.data_ptr(), -1 if scale.is_inference() else scale._version)
+    # An inference tensor has no version counter, and a graph replay never re-runs
+    # this check: both read scale itself each call, as the native kernels do.
+    if scale.is_inference() or torch.cuda.is_current_stream_capturing():
+        return block_scale_interleave(scale.view(torch.uint8))
+    stamp = (scale.data_ptr(), scale._version)
     cached = _SWIZZLED_WEIGHT_SCALES.get(scale)
     if cached is not None and cached[0] == stamp:
         return cached[1]
     swizzled = block_scale_interleave(scale.view(torch.uint8))
-    # A copy made during capture lives in the graph's pool; it is recomputed on replay.
-    if not torch.cuda.is_current_stream_capturing():
-        _SWIZZLED_WEIGHT_SCALES[scale] = (stamp, swizzled)
+    _SWIZZLED_WEIGHT_SCALES[scale] = (stamp, swizzled)
     return swizzled
 
 
