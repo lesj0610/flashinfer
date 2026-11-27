@@ -1,0 +1,838 @@
+[
+  {
+    "name": "wgmma.e2e.dense.f16.f16.f16",
+    "source": "e2e/dense_f16_f16_f16.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k16\\.f16\\.f16\\.f16",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k16\\.f16\\.f16\\.f16",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k16\\.f16\\.f16\\.f16",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.f32.f16.f16",
+    "source": "e2e/dense_f32_f16_f16.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k16\\.f32\\.f16\\.f16",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k16\\.f32\\.f16\\.f16",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k16\\.f32\\.f16\\.f16",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.f32.bf16.bf16",
+    "source": "e2e/dense_f32_bf16_bf16.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k16\\.f32\\.bf16\\.bf16",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k16\\.f32\\.bf16\\.bf16",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k16\\.f32\\.bf16\\.bf16",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.f32.tf32.tf32",
+    "source": "e2e/dense_f32_tf32_tf32.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k8\\.f32\\.tf32\\.tf32",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k8\\.f32\\.tf32\\.tf32",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k8\\.f32\\.tf32\\.tf32",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.f16.e4m3.e4m3",
+    "source": "e2e/dense_f16_e4m3_e4m3.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.f16\\.e4m3\\.e4m3",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k32\\.f16\\.e4m3\\.e4m3",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k32\\.f16\\.e4m3\\.e4m3",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.f32.e4m3.e4m3",
+    "source": "e2e/dense_f32_e4m3_e4m3.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.f32\\.e4m3\\.e4m3",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k32\\.f32\\.e4m3\\.e4m3",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k32\\.f32\\.e4m3\\.e4m3",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.f16.e4m3.e5m2",
+    "source": "e2e/dense_f16_e4m3_e5m2.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.f16\\.e4m3\\.e5m2",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k32\\.f16\\.e4m3\\.e5m2",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k32\\.f16\\.e4m3\\.e5m2",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.f32.e4m3.e5m2",
+    "source": "e2e/dense_f32_e4m3_e5m2.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.f32\\.e4m3\\.e5m2",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k32\\.f32\\.e4m3\\.e5m2",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k32\\.f32\\.e4m3\\.e5m2",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.f16.e5m2.e4m3",
+    "source": "e2e/dense_f16_e5m2_e4m3.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.f16\\.e5m2\\.e4m3",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k32\\.f16\\.e5m2\\.e4m3",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k32\\.f16\\.e5m2\\.e4m3",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.f32.e5m2.e4m3",
+    "source": "e2e/dense_f32_e5m2_e4m3.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.f32\\.e5m2\\.e4m3",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k32\\.f32\\.e5m2\\.e4m3",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k32\\.f32\\.e5m2\\.e4m3",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.f16.e5m2.e5m2",
+    "source": "e2e/dense_f16_e5m2_e5m2.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.f16\\.e5m2\\.e5m2",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k32\\.f16\\.e5m2\\.e5m2",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k32\\.f16\\.e5m2\\.e5m2",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.f32.e5m2.e5m2",
+    "source": "e2e/dense_f32_e5m2_e5m2.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.f32\\.e5m2\\.e5m2",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k32\\.f32\\.e5m2\\.e5m2",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k32\\.f32\\.e5m2\\.e5m2",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.s32.s8.s8",
+    "source": "e2e/dense_s32_s8_s8.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.s32\\.s8\\.s8",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k32\\.s32\\.s8\\.s8",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k32\\.s32\\.s8\\.s8",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.s32\\.s8\\.s8\\.satfinite",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.s32.s8.u8",
+    "source": "e2e/dense_s32_s8_u8.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.s32\\.s8\\.u8",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k32\\.s32\\.s8\\.u8",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k32\\.s32\\.s8\\.u8",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.s32\\.s8\\.u8\\.satfinite",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.s32.u8.s8",
+    "source": "e2e/dense_s32_u8_s8.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.s32\\.u8\\.s8",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k32\\.s32\\.u8\\.s8",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k32\\.s32\\.u8\\.s8",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.s32\\.u8\\.s8\\.satfinite",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.s32.u8.u8",
+    "source": "e2e/dense_s32_u8_u8.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.s32\\.u8\\.u8",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k32\\.s32\\.u8\\.u8",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k32\\.s32\\.u8\\.u8",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.s32\\.u8\\.u8\\.satfinite",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.dense.s32.b1.b1",
+    "source": "e2e/dense_s32_b1_b1.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k256\\.s32\\.b1\\.b1\\.and\\.popc",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n8k256\\.s32\\.b1\\.b1",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n256k256\\.s32\\.b1\\.b1",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.f16.f16.f16",
+    "source": "e2e/sp_f16_f16_f16.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k32\\.f16\\.f16\\.f16",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k32\\.f16\\.f16\\.f16",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k32\\.f16\\.f16\\.f16",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.f32.f16.f16",
+    "source": "e2e/sp_f32_f16_f16.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k32\\.f32\\.f16\\.f16",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k32\\.f32\\.f16\\.f16",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k32\\.f32\\.f16\\.f16",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.f32.bf16.bf16",
+    "source": "e2e/sp_f32_bf16_bf16.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k32\\.f32\\.bf16\\.bf16",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k32\\.f32\\.bf16\\.bf16",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k32\\.f32\\.bf16\\.bf16",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.f32.tf32.tf32",
+    "source": "e2e/sp_f32_tf32_tf32.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k16\\.f32\\.tf32\\.tf32",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k16\\.f32\\.tf32\\.tf32",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k16\\.f32\\.tf32\\.tf32",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.f16.e4m3.e4m3",
+    "source": "e2e/sp_f16_e4m3_e4m3.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.f16\\.e4m3\\.e4m3",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k64\\.f16\\.e4m3\\.e4m3",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k64\\.f16\\.e4m3\\.e4m3",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.f32.e4m3.e4m3",
+    "source": "e2e/sp_f32_e4m3_e4m3.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.f32\\.e4m3\\.e4m3",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k64\\.f32\\.e4m3\\.e4m3",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k64\\.f32\\.e4m3\\.e4m3",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.f16.e4m3.e5m2",
+    "source": "e2e/sp_f16_e4m3_e5m2.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.f16\\.e4m3\\.e5m2",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k64\\.f16\\.e4m3\\.e5m2",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k64\\.f16\\.e4m3\\.e5m2",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.f32.e4m3.e5m2",
+    "source": "e2e/sp_f32_e4m3_e5m2.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.f32\\.e4m3\\.e5m2",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k64\\.f32\\.e4m3\\.e5m2",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k64\\.f32\\.e4m3\\.e5m2",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.f16.e5m2.e4m3",
+    "source": "e2e/sp_f16_e5m2_e4m3.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.f16\\.e5m2\\.e4m3",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k64\\.f16\\.e5m2\\.e4m3",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k64\\.f16\\.e5m2\\.e4m3",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.f32.e5m2.e4m3",
+    "source": "e2e/sp_f32_e5m2_e4m3.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.f32\\.e5m2\\.e4m3",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k64\\.f32\\.e5m2\\.e4m3",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k64\\.f32\\.e5m2\\.e4m3",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.f16.e5m2.e5m2",
+    "source": "e2e/sp_f16_e5m2_e5m2.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.f16\\.e5m2\\.e5m2",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k64\\.f16\\.e5m2\\.e5m2",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k64\\.f16\\.e5m2\\.e5m2",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.f32.e5m2.e5m2",
+    "source": "e2e/sp_f32_e5m2_e5m2.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.f32\\.e5m2\\.e5m2",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k64\\.f32\\.e5m2\\.e5m2",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k64\\.f32\\.e5m2\\.e5m2",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.s32.s8.s8",
+    "source": "e2e/sp_s32_s8_s8.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.s32\\.s8\\.s8",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k64\\.s32\\.s8\\.s8",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k64\\.s32\\.s8\\.s8",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.s32\\.s8\\.s8\\.satfinite",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.s32.s8.u8",
+    "source": "e2e/sp_s32_s8_u8.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.s32\\.s8\\.u8",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k64\\.s32\\.s8\\.u8",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k64\\.s32\\.s8\\.u8",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.s32\\.s8\\.u8\\.satfinite",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.s32.u8.s8",
+    "source": "e2e/sp_s32_u8_s8.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.s32\\.u8\\.s8",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k64\\.s32\\.u8\\.s8",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k64\\.s32\\.u8\\.s8",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.s32\\.u8\\.s8\\.satfinite",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.sp.s32.u8.u8",
+    "source": "e2e/sp_s32_u8_u8.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "fast",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.s32\\.u8\\.u8",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n8k64\\.s32\\.u8\\.u8",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n256k64\\.s32\\.u8\\.u8",
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n\\d+k64\\.s32\\.u8\\.u8\\.satfinite",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.neg.acc_read_before_wait",
+    "source": "e2e/neg_acc_read_before_wait.cu",
+    "nvcc_args": [],
+    "modes": [
+      "check"
+    ],
+    "expect_violation": [
+      "acc-access-before-wait"
+    ],
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n16k16\\.f32\\.f16\\.f16",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.neg.smem_write_before_wait",
+    "source": "e2e/neg_smem_write_before_wait.cu",
+    "nvcc_args": [],
+    "modes": [
+      "check"
+    ],
+    "expect_violation": [
+      "smem-modified-before-wait"
+    ],
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n16k16\\.f32\\.f16\\.f16",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.neg.acc_write_without_fence",
+    "source": "e2e/neg_acc_write_without_fence.cu",
+    "nvcc_args": [],
+    "modes": [
+      "check"
+    ],
+    "expect_violation": [
+      "fence-missing"
+    ],
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n16k16\\.f32\\.f16\\.f16",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.neg.wait_group_too_few",
+    "source": "e2e/neg_wait_group_too_few.cu",
+    "nvcc_args": [],
+    "modes": [
+      "check"
+    ],
+    "expect_violation": [
+      "acc-access-before-wait"
+    ],
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n16k16\\.f32\\.f16\\.f16",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.neg.rs_a_write_before_wait",
+    "source": "e2e/neg_rs_a_write_before_wait.cu",
+    "nvcc_args": [],
+    "modes": [
+      "check"
+    ],
+    "expect_violation": [
+      "rs-a-modified-before-wait"
+    ],
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n16k16\\.f32\\.f16\\.f16",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.e2e.neg.sparse_b_kmajor_sw32",
+    "source": "e2e/neg_sparse_b_kmajor_sw32.cu",
+    "nvcc_args": [],
+    "modes": [
+      "check"
+    ],
+    "expect_violation": [
+      "desc-undefined"
+    ],
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sp\\.sync\\.aligned\\.m64n16k32\\.f32\\.f16\\.f16",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  },
+  {
+    "name": "wgmma.cute.gmma",
+    "source": "cute_gmma.cu",
+    "nvcc_args": [
+      "-I",
+      "/nvme512g/wgmma_emu_0fff1f87/cutlass/include",
+      "--expt-relaxed-constexpr"
+    ],
+    "modes": [
+      "exact",
+      "fast",
+      "check"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k16\\.f32\\.f16\\.f16",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k16\\.f16\\.f16\\.f16",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k16\\.f32\\.bf16\\.bf16",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k8\\.f32\\.tf32\\.tf32",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.f32\\.e4m3\\.e4m3",
+      "wgmma\\.mma_async\\.sync\\.aligned\\.m64n\\d+k32\\.s32\\.s8\\.s8",
+      "wgmma\\.fence\\.sync\\.aligned",
+      "wgmma\\.commit_group\\.sync\\.aligned",
+      "wgmma\\.wait_group\\.sync\\.aligned"
+    ]
+  }
+]

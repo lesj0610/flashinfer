@@ -1,0 +1,420 @@
+[
+  {
+    "name": "misc.cvt",
+    "source": "e2e_cvt.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "check"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "cvt\\.f64\\.bf16",
+      "cvt\\.ftz\\.f32\\.bf16",
+      "cvt\\.rm\\.bf16\\.f16",
+      "cvt\\.rm\\.bf16\\.f64",
+      "cvt\\.rm\\.bf16\\.s16",
+      "cvt\\.rm\\.f16\\.bf16",
+      "cvt\\.rmi\\.bf16\\.bf16",
+      "cvt\\.rmi\\.s64\\.bf16",
+      "cvt\\.rn\\.bf16\\.f16",
+      "cvt\\.rn\\.bf16\\.f64",
+      "cvt\\.rn\\.bf16\\.s32",
+      "cvt\\.rn\\.bf16\\.s64",
+      "cvt\\.rn\\.bf16\\.u16",
+      "cvt\\.rn\\.bf16\\.u8",
+      "cvt\\.rn\\.f16\\.bf16",
+      "cvt\\.rn\\.f16x2\\.e4m3x2",
+      "cvt\\.rn\\.f16x2\\.e5m2x2",
+      "cvt\\.rn\\.relu\\.f16x2\\.e4m3x2",
+      "cvt\\.rn\\.relu\\.f16x2\\.e5m2x2",
+      "cvt\\.rn\\.relu\\.tf32\\.f32",
+      "cvt\\.rn\\.sat\\.bf16\\.f16",
+      "cvt\\.rn\\.satfinite\\.e4m3x2\\.f16x2",
+      "cvt\\.rn\\.satfinite\\.e4m3x2\\.f32",
+      "cvt\\.rn\\.satfinite\\.e5m2x2\\.f16x2",
+      "cvt\\.rn\\.satfinite\\.e5m2x2\\.f32",
+      "cvt\\.rn\\.satfinite\\.relu\\.e4m3x2\\.f16x2",
+      "cvt\\.rn\\.satfinite\\.relu\\.e4m3x2\\.f32",
+      "cvt\\.rn\\.satfinite\\.relu\\.e5m2x2\\.f16x2",
+      "cvt\\.rn\\.satfinite\\.relu\\.e5m2x2\\.f32",
+      "cvt\\.rn\\.tf32\\.f32",
+      "cvt\\.rni\\.bf16\\.bf16",
+      "cvt\\.rni\\.s16\\.bf16",
+      "cvt\\.rni\\.s8\\.bf16",
+      "cvt\\.rni\\.u32\\.bf16",
+      "cvt\\.rp\\.bf16\\.f16",
+      "cvt\\.rp\\.bf16\\.f64",
+      "cvt\\.rp\\.bf16\\.u32",
+      "cvt\\.rpi\\.bf16\\.bf16",
+      "cvt\\.rpi\\.u64\\.bf16",
+      "cvt\\.rpi\\.u8\\.bf16",
+      "cvt\\.rz\\.bf16\\.f16",
+      "cvt\\.rz\\.bf16\\.f64",
+      "cvt\\.rz\\.bf16\\.s8",
+      "cvt\\.rz\\.bf16\\.u64",
+      "cvt\\.rz\\.f16\\.bf16",
+      "cvt\\.rz\\.relu\\.tf32\\.f32",
+      "cvt\\.rz\\.tf32\\.f32",
+      "cvt\\.rzi\\.bf16\\.bf16",
+      "cvt\\.rzi\\.s32\\.bf16",
+      "cvt\\.rzi\\.u16\\.bf16"
+    ]
+  },
+  {
+    "name": "misc.arith",
+    "source": "e2e_arith.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "check"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "add\\.bf16",
+      "add\\.rn\\.bf16",
+      "add\\.rn\\.bf16x2",
+      "add\\.s16x2",
+      "add\\.u16x2",
+      "ex2\\.approx\\.ftz\\.bf16",
+      "ex2\\.approx\\.ftz\\.bf16x2",
+      "fma\\.rn\\.oob\\.bf16",
+      "fma\\.rn\\.oob\\.bf16x2",
+      "fma\\.rn\\.oob\\.f16",
+      "fma\\.rn\\.oob\\.f16x2",
+      "fma\\.rn\\.oob\\.relu\\.bf16",
+      "fma\\.rn\\.oob\\.relu\\.bf16x2",
+      "fma\\.rn\\.oob\\.relu\\.f16",
+      "fma\\.rn\\.oob\\.relu\\.f16x2",
+      "max\\.NaN\\.xorsign\\.abs\\.f16x2",
+      "max\\.ftz\\.xorsign\\.abs\\.f16",
+      "max\\.ftz\\.xorsign\\.abs\\.f32",
+      "max\\.relu\\.s16x2",
+      "max\\.relu\\.s32",
+      "max\\.s16x2",
+      "max\\.u16x2",
+      "max\\.xorsign\\.abs\\.bf16",
+      "max\\.xorsign\\.abs\\.f32",
+      "min\\.NaN\\.xorsign\\.abs\\.bf16",
+      "min\\.NaN\\.xorsign\\.abs\\.f32",
+      "min\\.ftz\\.NaN\\.xorsign\\.abs\\.f32",
+      "min\\.relu\\.s16x2",
+      "min\\.relu\\.s32",
+      "min\\.s16x2",
+      "min\\.u16x2",
+      "min\\.xorsign\\.abs\\.bf16x2",
+      "min\\.xorsign\\.abs\\.f16",
+      "min\\.xorsign\\.abs\\.f32",
+      "mul\\.bf16",
+      "mul\\.rn\\.bf16",
+      "mul\\.rn\\.bf16x2",
+      "set\\.eq\\.u32\\.bf16",
+      "set\\.equ\\.u16\\.bf16",
+      "set\\.ge\\.bf16x2\\.bf16x2",
+      "set\\.gtu\\.bf16\\.bf16",
+      "set\\.le\\.bf16\\.f16",
+      "set\\.lt\\.s16\\.bf16",
+      "set\\.lt\\.xor\\.s32\\.bf16",
+      "set\\.ne\\.bf16\\.f32",
+      "set\\.num\\.u32\\.bf16x2",
+      "setp\\.ge\\.and\\.bf16",
+      "setp\\.lt\\.bf16x2",
+      "setp\\.ltu\\.or\\.bf16x2",
+      "sub\\.bf16",
+      "sub\\.bf16x2",
+      "sub\\.rn\\.bf16",
+      "tanh\\.approx\\.bf16",
+      "tanh\\.approx\\.bf16x2",
+      "setp\\.eq\\.bf16",
+      "setp\\.ne\\.bf16",
+      "setp\\.lt\\.bf16",
+      "setp\\.le\\.bf16",
+      "setp\\.gt\\.bf16",
+      "setp\\.ge\\.bf16",
+      "setp\\.equ\\.bf16",
+      "setp\\.neu\\.bf16",
+      "setp\\.ltu\\.bf16",
+      "setp\\.leu\\.bf16",
+      "setp\\.gtu\\.bf16",
+      "setp\\.geu\\.bf16",
+      "setp\\.num\\.bf16",
+      "setp\\.nan\\.bf16"
+    ]
+  },
+  {
+    "name": "misc.atom",
+    "source": "e2e_atom.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "atom\\.add\\.noftz\\.f32",
+      "atom\\.cluster\\.global\\.max\\.s32",
+      "atom\\.global\\.add\\.noftz\\.bf16",
+      "atom\\.global\\.add\\.noftz\\.bf16x2",
+      "atom\\.global\\.add\\.noftz\\.f32",
+      "atom\\.global\\.v2\\.bf16x2\\.max\\.noftz",
+      "atom\\.global\\.v2\\.f32\\.add",
+      "atom\\.global\\.v4\\.f16\\.min\\.noftz",
+      "atom\\.global\\.v8\\.bf16\\.add\\.noftz",
+      "atom\\.relaxed\\.cluster\\.global\\.add\\.u32",
+      "atom\\.relaxed\\.cluster\\.shared::cluster\\.add\\.u32",
+      "atom\\.shared\\.add\\.noftz\\.f32",
+      "atom\\.shared::cluster\\.add\\.noftz\\.f16",
+      "atom\\.shared::cluster\\.add\\.u32",
+      "multimem\\.ld_reduce\\.acquire\\.gpu\\.global\\.min\\.v2\\.f16x2",
+      "multimem\\.ld_reduce\\.global\\.max\\.acc::f32\\.v4\\.bf16",
+      "multimem\\.ld_reduce\\.relaxed\\.cluster\\.global\\.and\\.b64",
+      "multimem\\.ld_reduce\\.relaxed\\.sys\\.global\\.add\\.f32",
+      "multimem\\.ld_reduce\\.weak\\.global\\.add\\.v4\\.f32",
+      "multimem\\.red\\.global\\.add\\.v4\\.f16",
+      "multimem\\.red\\.relaxed\\.sys\\.global\\.add\\.u32",
+      "multimem\\.red\\.relaxed\\.sys\\.global\\.add\\.v2\\.bf16x2",
+      "multimem\\.red\\.relaxed\\.sys\\.global\\.min\\.s32",
+      "multimem\\.red\\.release\\.gpu\\.global\\.add\\.f32",
+      "multimem\\.st\\.global\\.f32",
+      "multimem\\.st\\.relaxed\\.sys\\.global\\.v2\\.f32",
+      "multimem\\.st\\.release\\.gpu\\.global\\.v8\\.bf16",
+      "red\\.global\\.add\\.noftz\\.bf16",
+      "red\\.global\\.add\\.noftz\\.bf16x2",
+      "red\\.global\\.add\\.noftz\\.f32",
+      "red\\.global\\.add\\.noftz\\.v2\\.f16x2",
+      "red\\.global\\.add\\.noftz\\.v4\\.f32",
+      "red\\.relaxed\\.cluster\\.global\\.add\\.noftz\\.bf16",
+      "red\\.release\\.cluster\\.global\\.add\\.u32",
+      "red\\.shared::cluster\\.add\\.u32"
+    ]
+  },
+  {
+    "name": "misc.atom_b128",
+    "source": "e2e_atom_b128.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "check"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "atom\\.exch\\.b128",
+      "atom\\.global\\.cas\\.b128",
+      "atom\\.shared\\.cas\\.b128"
+    ]
+  },
+  {
+    "name": "misc.atom_b128_rdc",
+    "source": "e2e_atom_b128_rdc.cu",
+    "nvcc_args": [
+      "-rdc=true",
+      "area:e2e_atom_b128_rdc_tu2.cu"
+    ],
+    "modes": [
+      "exact",
+      "check"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "atom\\.global\\.cas\\.b128"
+    ]
+  },
+  {
+    "name": "misc.mma",
+    "source": "e2e_mma.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "check"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "mma\\.sp\\.sync\\.aligned\\.m16n8k64\\.row\\.col\\.f32\\.e5m2\\.e4m3\\.f32",
+      "mma\\.sp::ordered_metadata\\.sync\\.aligned\\.m16n8k64\\.row\\.col\\.f32\\.e4m3\\.e4m3\\.f32",
+      "mma\\.sync\\.aligned\\.m16n8k16\\.row\\.col\\.f16\\.e5m2\\.e4m3\\.f16",
+      "mma\\.sync\\.aligned\\.m16n8k16\\.row\\.col\\.f32\\.e4m3\\.e4m3\\.f32",
+      "mma\\.sync\\.aligned\\.m16n8k16\\.row\\.col\\.f64\\.f64\\.f64\\.f64",
+      "mma\\.sync\\.aligned\\.m16n8k32\\.row\\.col\\.f16\\.e5m2\\.e5m2\\.f16",
+      "mma\\.sync\\.aligned\\.m16n8k32\\.row\\.col\\.f32\\.e4m3\\.e5m2\\.f32",
+      "mma\\.sync\\.aligned\\.m16n8k4\\.row\\.col\\.f64\\.f64\\.f64\\.f64",
+      "mma\\.sync\\.aligned\\.m16n8k8\\.row\\.col\\.f64\\.f64\\.f64\\.f64\\.rn"
+    ]
+  },
+  {
+    "name": "misc.matrix",
+    "source": "e2e_matrix.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "check"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "ldmatrix\\.sync\\.aligned\\.m8n16\\.x1\\.shared::cta\\.s8\\.s4",
+      "ldmatrix\\.sync\\.aligned\\.m8n16\\.x2\\.shared\\.s8\\.s4",
+      "ldmatrix\\.sync\\.aligned\\.m8n16\\.x4\\.s8\\.s4",
+      "ldmatrix\\.sync\\.aligned\\.m8n16\\.x4\\.shared::cta\\.s8\\.s4",
+      "stmatrix\\.sync\\.aligned\\.m8n8\\.x1\\.shared\\.b16",
+      "stmatrix\\.sync\\.aligned\\.m8n8\\.x1\\.trans\\.shared\\.b16",
+      "stmatrix\\.sync\\.aligned\\.m8n8\\.x2\\.shared::cta\\.b16",
+      "stmatrix\\.sync\\.aligned\\.m8n8\\.x2\\.trans\\.shared::cta\\.b16",
+      "stmatrix\\.sync\\.aligned\\.m8n8\\.x4\\.b16",
+      "stmatrix\\.sync\\.aligned\\.m8n8\\.x4\\.shared\\.b16",
+      "stmatrix\\.sync\\.aligned\\.m8n8\\.x4\\.trans\\.b16"
+    ]
+  },
+  {
+    "name": "misc.cluster",
+    "source": "e2e_cluster.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "check"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "barrier\\.cluster\\.arrive",
+      "barrier\\.cluster\\.arrive\\.relaxed\\.aligned",
+      "barrier\\.cluster\\.arrive\\.release",
+      "barrier\\.cluster\\.arrive\\.release\\.aligned",
+      "barrier\\.cluster\\.wait",
+      "barrier\\.cluster\\.wait\\.acquire",
+      "barrier\\.cluster\\.wait\\.acquire\\.aligned",
+      "barrier\\.cluster\\.wait\\.aligned",
+      "elect\\.sync",
+      "getctarank\\.shared::cluster\\.u32",
+      "getctarank\\.u32",
+      "griddepcontrol\\.launch_dependents",
+      "griddepcontrol\\.wait",
+      "ld\\.shared::cluster\\.u32",
+      "mapa\\.shared::cluster\\.u32",
+      "mapa\\.shared::cluster\\.u64",
+      "mapa\\.u64",
+      "setmaxnreg\\.dec\\.sync\\.aligned\\.u32",
+      "setmaxnreg\\.inc\\.sync\\.aligned\\.u32",
+      "st\\.shared::cluster\\.u32",
+      "%clusterid",
+      "%nclusterid",
+      "%cluster_ctaid",
+      "%cluster_nctaid",
+      "%cluster_ctarank",
+      "%cluster_nctarank",
+      "%aggr_smem_size"
+    ]
+  },
+  {
+    "name": "misc.cluster_dims",
+    "source": "e2e_cluster_dims.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "barrier\\.cluster\\.arrive",
+      "barrier\\.cluster\\.wait",
+      "%is_explicit_cluster",
+      "%cluster_nctarank",
+      "%cluster_ctarank",
+      "%clusterid",
+      "%cluster_nctaid",
+      "\\.explicitcluster",
+      "\\.reqnctapercluster",
+      "\\.maxclusterrank"
+    ]
+  },
+  {
+    "name": "misc.block_size",
+    "source": "e2e_block_size.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "check"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "%is_explicit_cluster",
+      "%clusterid",
+      "%nclusterid",
+      "\\.blocksareclusters",
+      "\\.reqnctapercluster"
+    ]
+  },
+  {
+    "name": "misc.memory",
+    "source": "e2e_memory.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "check"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "cvta\\.shared::cluster\\.u64",
+      "cvta\\.to\\.shared::cluster\\.u64",
+      "isspacep\\.shared::cluster",
+      "ld\\.acquire\\.cluster\\.global\\.u32",
+      "ld\\.global\\.relaxed\\.cluster\\.u32",
+      "ld\\.global\\.u32\\.proxy::readonly",
+      "ld\\.relaxed\\.cluster\\.global\\.u32",
+      "ld\\.u32\\.proxy::readonly",
+      "prefetch\\.L1::32B\\.valid_addr",
+      "prefetch\\.global\\.L1::32B\\.valid_addr",
+      "st\\.relaxed\\.cluster\\.global\\.u32",
+      "st\\.relaxed\\.cluster\\.u32",
+      "st\\.release\\.cluster\\.global\\.u32",
+      "st\\.shared::cluster\\.u32",
+      "\\.target"
+    ]
+  },
+  {
+    "name": "misc.multimem_cp",
+    "source": "e2e_multimem_cp.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "check",
+      "smem"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "cp\\.async\\.bulk\\.commit_group",
+      "cp\\.async\\.bulk\\.wait_group",
+      "fence\\.proxy\\.async\\.shared::cta",
+      "multimem\\.cp\\.async\\.bulk\\.global\\.shared::cta\\.bulk_group",
+      "multimem\\.cp\\.reduce\\.async\\.bulk\\.global\\.shared::cta\\.bulk_group\\.add\\.noftz\\.bf16",
+      "multimem\\.cp\\.reduce\\.async\\.bulk\\.global\\.shared::cta\\.bulk_group\\.add\\.u32",
+      "multimem\\.cp\\.reduce\\.async\\.bulk\\.global\\.shared::cta\\.bulk_group\\.min\\.s32",
+      "multimem\\.cp\\.reduce\\.async\\.bulk\\.relaxed\\.gpu\\.global\\.shared::cta\\.bulk_group\\.add\\.f32"
+    ]
+  },
+  {
+    "name": "misc.unified",
+    "source": "e2e_unified.cu",
+    "nvcc_args": [],
+    "modes": [
+      "exact",
+      "check"
+    ],
+    "expect_violation": false,
+    "shim": false,
+    "covers": [
+      "\\.unified"
+    ]
+  }
+]
