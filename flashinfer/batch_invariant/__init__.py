@@ -110,19 +110,21 @@ def _mx_family(arch, op: str = "mm_mxfp8") -> str:
             )
         arch = torch.device("cuda", torch.cuda.current_device())
     if isinstance(arch, str):
-        if arch not in PART_TABLE:
+        families = sorted([*PART_TABLE, SM8X_FAMILY])
+        if arch not in families:
             raise ValueError(
-                f"fingerprint({op!r}) takes arch as one of {sorted(PART_TABLE)}, a compute capability or a device, not {arch!r}"
+                f"fingerprint({op!r}) takes arch as one of {families}, a compute capability or a device, not {arch!r}"
             )
-        return arch
-    if isinstance(arch, torch.device):
-        from .support import compute_capability
+        family = arch
+    else:
+        if isinstance(arch, torch.device):
+            from .support import compute_capability
 
-        arch = compute_capability(arch)
-    family = family_of(tuple(arch))
+            arch = compute_capability(arch)
+        family = family_of(tuple(arch))
     if family == SM8X_FAMILY and op not in _SM8X_FINGERPRINT_OPS:
         raise BatchInvariantUnsupportedError(
-            f"batch_invariant: {op} has no SM8x class; compute capability {tuple(arch)} is not a part of its mode"
+            f"batch_invariant: {op} has no SM8x class; {arch!r} is not a part of its mode"
         )
     return family
 

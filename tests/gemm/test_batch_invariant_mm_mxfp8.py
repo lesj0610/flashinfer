@@ -729,8 +729,8 @@ def test_split_implementations_agree(M, N, K, od):
         bits(bi_mm(a, b, sfa, sfb, out_dtype=od)), ref
     )  # the dispatcher's own pick is a member too
     if (
-        fam != "sm_80"
-    ):  # SM8x: the two folds' difference can stay under the output's rounding here
+        fam != "sm_80" or od == torch.float16
+    ):  # SM8x: the two folds' difference can stay under a bf16 output's rounding
         assert not torch.equal(
             bits(
                 mm_mxfp8_batch_invariant(
