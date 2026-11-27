@@ -15,10 +15,11 @@ limitations under the License.
 
 The prepared contiguous grouped FP8 GEMM programs on SM8x. The grouped GEMM runs on the
 SM8x FP8 GEMM (groupwise FP32 scales per 128-element K step, the rows in tiles that each
-lie in one expert); the fused gate_up + SwiGLU + FP8 group quantization stages run it
-into a BF16 intermediate, then FlashInfer's ``silu_and_mul`` and the group quantization
-of the generated activation kernel. Preparation makes the routing scratch and buffers;
-the calls allocate nothing.
+lie in one expert). The prepared grouped GEMM's launch routes the expert runs on the
+device per call, its scratch from the caching allocator. The fused gate_up + SwiGLU + FP8
+group quantization stages run it into a BF16 intermediate, then FlashInfer's
+``silu_and_mul`` and the group quantization of the generated activation kernel;
+preparation makes their routing scratch and buffers and the calls allocate nothing.
 """
 
 from __future__ import annotations
@@ -34,6 +35,78 @@ _ROWS = 64
 _GROUP = 128
 _EPS = 1e-10
 _E4M3_MAX = 448.0
+
+
+def _ue8m0_powers(words: torch.Tensor, k_blocks: int) -> torch.Tensor:
+    """FP32 ``2^(e - 127)`` of the UE8M0 exponents packed four per int32 word along the last
+    dim (``e`` of K block ``q`` the byte ``q % 4`` of ``words[..., q // 4]``, low byte first),
+    ``e = 255`` NaN, for ``q < k_blocks``."""
+    q = torch.arange(k_blocks, dtype=torch.int32, device=words.device)
+    e = (words[..., q // 4] >> q % 4 * 8) & 255
+    bits = torch.where(e == 0, 1 << 22, e << 23)  # 2^-127 is subnormal
+    return torch.where(e == 255, 0x7FC00000, bits).view(torch.float32)
+
+
+class Sm8xContiguousGroupGemmEntry:
+    """The generated program of the prepared contiguous grouped FP8 GEMM on SM8x, called
+    with the program's bound arguments (named by its argument plan; the grid is not
+    launched): ``out[r] = sum_q (a[r, q] . b[g, :, q]) sa[r, q] sb[g, :, q]`` over the
+    128-element K blocks ``q`` for ``g = m_indices[r]``, on the SM8x FP8 GEMM routed by
+    expert run. The scales are the FP32 ones, or the packed UE8M0 words decoded to their
+    powers of two (the weight's first row of every 128-row block); that family reads a
+    ``-1`` padding row as the preceding expert's, its output row unspecified. Each call
+    routes on the device (no host sync) and takes its scratch from the caching
+    allocator."""
+
+    def __init__(self, arg_plan: Sequence[Sequence[str]]) -> None:
+        from ..fused_moe.core import _w4a16_moe_sm80_module
+
+        self.names = tuple(name for _, name in arg_plan)
+        _w4a16_moe_sm80_module(
+            None, False, None, False
+        )  # loaded here, not under a capture
+
+    def __call__(self, *arguments: Any) -> None:
+        from .sm8x_fp8_dense import _run_fp8
+
+        bound = dict(zip(self.names, arguments, strict=True))
+        a = bound["A"].view(torch.float8_e4m3fn)
+        b = bound["B"].view(torch.float8_e4m3fn)
+        m, k = (int(v) for v in a.shape)
+        groups, n = (int(v) for v in b.shape[:2])
+        device = a.device
+        m_indices = bound["m_indices"]
+        if "a_scale" in bound:
+            # FP32 scales (the host forward-fills a -1 row with fill_padding)
+            out, sa, sb = bound["C"], bound["a_scale"], bound["b_scale"]
+        else:
+            out = bound["C_tma"]
+            k_blocks = k // 128
+            cols = -(-k_blocks // 4)
+            if "SFA" in bound:  # words at base[row * rs + col * cs]
+                sfa = bound["SFA"].as_strided(
+                    (m, cols), (bound["sfa_row_stride"], bound["sfa_col_stride"])
+                )
+                sfb = bound["SFB"].as_strided(
+                    (groups, n // 128, cols),
+                    (bound["sfb_group_stride"], bound["sfb_row_stride"], bound["sfb_col_stride"]),
+                )  # fmt: skip
+            else:  # the swap-AB surfaces [cols, M] and [G * sf_cols, N] (rows repeated)
+                sfa = bound["SFA_packed"].view(torch.int32).T
+                sfb = bound["SFB_packed"].view(torch.int32)
+                sfb = sfb.as_strided(
+                    (groups, n // 128, cols), (bound["sf_cols"] * n, 128, n)
+                )
+            sa, sb = _ue8m0_powers(sfa, k_blocks), _ue8m0_powers(sfb, k_blocks)
+            # a -1 padding row follows the preceding expert (expert 0 when leading)
+            m_indices = torch.cummax(m_indices, 0).values.clamp_(min=0)
+        experts = torch.arange(groups + 1, dtype=torch.int32, device=device)
+        m_indptr = torch.searchsorted(m_indices, experts, out_int32=True)
+        one = torch.ones(1, dtype=torch.float32, device=device)
+        _run_fp8(
+            a[None], b.transpose(1, 2), sa, sb, out[None], _ROWS, False, gm=1,
+            m_indptr=m_indptr, one=one,
+        )  # fmt: skip
 
 
 class Sm8xContiguousGroupGemm:

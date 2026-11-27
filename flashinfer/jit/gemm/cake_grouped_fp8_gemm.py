@@ -977,10 +977,14 @@ ARCH_NVCC_FLAGS = {
     "sm_103a": sm103a_nvcc_flags,
     "sm_107a": sm107a_nvcc_flags,
 }
+# SM8x plans the sm_100a routes on its own SM count and runs every planned launch with the
+# SM8x grouped FP8 GEMM (flashinfer.gemm.sm8x_fp8_grouped); it never loads a generated program
+SM8X_COMPUTE_CAPABILITIES = frozenset({(8, 0), (8, 6), (8, 7), (8, 9)})
 SUPPORTED_COMPUTE_CAPABILITIES = {
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
     (10, 7): "sm_107a",
+    **dict.fromkeys(sorted(SM8X_COMPUTE_CAPABILITIES), "sm_100a"),
 }
 # Routes whose programs differ per architecture: the architecture's own route map
 # replaces ``ROUTES`` there.
@@ -1071,6 +1075,7 @@ __all__ = [
     "ROUTES",
     "ROUTE_GEOMETRY",
     "SM107A_ROUTES",
+    "SM8X_COMPUTE_CAPABILITIES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "device_arch",
     "gen_cake_grouped_fp8_gemm_module",

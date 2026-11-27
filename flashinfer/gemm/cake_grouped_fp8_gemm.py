@@ -61,6 +61,7 @@ from ..jit.gemm.cake_grouped_fp8_gemm import (
     MODULES,
     PROGRAMS,
     ROUTE_GEOMETRY,
+    SM8X_COMPUTE_CAPABILITIES,
     SUPPORTED_COMPUTE_CAPABILITIES,
     device_arch,
     generated_program_available,
@@ -68,6 +69,7 @@ from ..jit.gemm.cake_grouped_fp8_gemm import (
     route_program,
     select_module,
 )
+from .sm8x_fp8_grouped import Sm8xContiguousGroupGemmEntry
 
 B_SCALE_BLOCK_N = 128
 K_BLOCK = 128
@@ -1745,7 +1747,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
     arch = device_arch(device_index)
     if arch is None:
         raise NotImplementedError(
-            "prepared contiguous grouped FP8 GEMM requires an SM100a, SM103a or SM107a device "
+            "prepared contiguous grouped FP8 GEMM requires an SM100a, SM103a, SM107a or SM8x device "
             f"(compute capability {sorted(SUPPORTED_COMPUTE_CAPABILITIES)}); "
             f"got {torch.cuda.get_device_capability(device_index)}"
         )
@@ -1880,8 +1882,14 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
             route, grid = window_plan
     module_name = select_module(arch, route)
     program = PROGRAMS[MODULES[module_name]["program"]]
-    module = load_cake_grouped_fp8_gemm_module(module_name)
-    entry = getattr(module, program["ffi_entry"])
+    arg_plan = ARG_PLANS[program["arg_plan"]]
+    entry: Callable[..., Any]
+    if torch.cuda.get_device_capability(device_index) in SM8X_COMPUTE_CAPABILITIES:
+        # SM8x runs the planned launch with the SM8x grouped GEMM (no generated program)
+        entry = Sm8xContiguousGroupGemmEntry(arg_plan)
+    else:
+        module = load_cake_grouped_fp8_gemm_module(module_name)
+        entry = getattr(module, program["ffi_entry"])
 
     # The scalar-store route never reads its output tensor map; the validated
     # A tensor provides an aligned BF16 view with a compatible descriptor.
@@ -1929,7 +1937,6 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
             "K": k,
             "G": groups,
         }
-    arg_plan = ARG_PLANS[program["arg_plan"]]
     return PreparedGroupGemmFp8NtGroupwiseContiguous(
         route=route,
         module_name=module_name,

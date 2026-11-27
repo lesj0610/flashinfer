@@ -143,6 +143,7 @@ def _run_fp8(
     m_indptr: Optional[torch.Tensor] = None,
     m_keys: Optional[torch.Tensor] = None,
     masked_m: Optional[torch.Tensor] = None,
+    one: Optional[torch.Tensor] = None,
 ) -> None:
     """``out = scale_a * scale_b * (a @ b)``: ``a`` ``(batch, M, K)``, ``b`` ``(batch, K, N)``
     (``shuffled``: the trtllm weight, batch 1: per-tensor ``(K / 128, N, 128)``, MXFP8 its
@@ -152,7 +153,8 @@ def _run_fp8(
     128)][ceil(K / 128)]`` (any strides). ``a`` and ``out`` batch 1 routed to ``b[i]``:
     ``m_indptr`` (groupwise) rows ``m_indptr[i] .. m_indptr[i + 1]``, ``m_keys`` (MXFP8,
     ``scale_b`` each group's at a 128-row atom) the rows of key ``i``; ``masked_m``: the first
-    ``masked_m[i]`` rows of batch ``i``. Rows routed nowhere are left unwritten."""
+    ``masked_m[i]`` rows of batch ``i``. Rows routed nowhere are left unwritten. ``one``: the
+    device FP32 1 of the ``mx`` / ``gm`` alpha (default the cached constant)."""
     batches, m, k = (int(x) for x in a.shape)
     n = int(out.shape[2])
     routed = m_indptr is not None or m_keys is not None
@@ -188,7 +190,7 @@ def _run_fp8(
                     out[i : i + 1, r0 : r0 + rows], r, shuffled, mx, a8x4, gm,
                     None if m_indptr is None else m_indptr - r0,
                     None if m_keys is None else m_keys[r0 : r0 + rows],
-                    None if masked_m is None else masked_m[i : i + 1] - r0,
+                    None if masked_m is None else masked_m[i : i + 1] - r0, one,
                 )  # fmt: skip
         return
     x = a.view(torch.uint8)
@@ -229,10 +231,12 @@ def _run_fp8(
         target[:, :n].view(batches, m, n).copy_(out)
     gemm = module if out.dtype == torch.bfloat16 else _out_module(out.dtype)
     alpha, beta, sf, asf, gsa, gsb = scale_a, scale_b, None, None, None, None
+    if (mx or gm) and one is None:
+        one = _ones(a.device)
     if mx:
-        alpha, beta, sf, asf = _ones(a.device), None, scale_b, scale_a
+        alpha, beta, sf, asf = one, None, scale_b, scale_a
     elif gm:
-        alpha, beta, gsa, gsb = _ones(a.device), None, scale_a, scale_b
+        alpha, beta, gsa, gsb = one, None, scale_a, scale_b
     gemm.gemm_f8(
         w, alpha, beta, act, meta, rowmap, target, r, n, k, max_blocks, groups, rs, ks, bs,
         _FMT[b.dtype], shuffled, sf, asf, a8x4, sf_bstride, gsa, gsb, max(gm, 1), None,
