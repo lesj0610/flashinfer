@@ -1,4 +1,4 @@
-"""The unified MoELayer on the records backends (SM80 to SM90): each FP4 pair, NVFP4 per
+"""The unified MoELayer on the records backends (SM80 to SM89): each FP4 pair, NVFP4 per
 token and an activation beyond TRT-LLM's against the dequantized reference of
 tests/moe/test_records_nvfp4_moe.py."""
 
@@ -44,8 +44,8 @@ from tests.moe.utils import compute_reference_activation, powlu_ref
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or get_compute_capability(torch.device("cuda"))[0] not in (8, 9),
-    reason="records MoE runs on SM80 to SM90",
+    or get_compute_capability(torch.device("cuda"))[0] != 8,
+    reason="records MoE runs on SM80 to SM89",
 )
 
 F4 = QuantFormat.NVFP4, QuantFormat.MXFP4

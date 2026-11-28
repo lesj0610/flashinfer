@@ -67,6 +67,17 @@ def _skip_unless_sm10x(device: torch.device) -> None:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
 
 
+def _skip_unless_runs(device: torch.device, *, activation_type: ActivationType) -> None:
+    """SM100 and SM103 run every case; SM90 the tuples FlashInfer reports it runs."""
+    if moe_utils.sm90_fp4_moe_runs(
+        "trtllm",
+        per_token=True,
+        activation_type=activation_type,
+    ):
+        return
+    _skip_unless_sm10x(device)
+
+
 def _per_token_routed_case(
     *,
     num_tokens: int,
@@ -395,7 +406,7 @@ def test_routed_fused_moe(
     zero_rows: bool,
 ):
     device = torch.device("cuda:0")
-    _skip_unless_sm10x(device)
+    _skip_unless_runs(device, activation_type=activation_type)
     kwargs, reference, _ = _per_token_routed_case(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
@@ -444,7 +455,7 @@ def test_pinned_recipe_matches_env(recipe: NVFP44Over6Config, use_4over6: bool):
     (``globalScaleInv``) from ``1/(448*6)`` to ``1/(256*6)``.
     """
     device = torch.device("cuda:0")
-    _skip_unless_sm10x(device)
+    _skip_unless_runs(device, activation_type=ActivationType.Swiglu)
     kwargs, _reference, _ = _per_token_routed_case(
         num_tokens=64,
         hidden_size=1024,
@@ -487,7 +498,7 @@ def test_fc2_input_out(num_tokens: int, expert_parallel: bool):
     (128x4). Expert parallelism leaves the slots of non-local experts zeroed.
     """
     device = torch.device("cuda:0")
-    _skip_unless_sm10x(device)
+    _skip_unless_runs(device, activation_type=ActivationType.Swiglu)
     hidden_size, intermediate_size, num_experts, top_k = 1024, 2048, 32, 4
     kwargs, _reference, parts = _per_token_routed_case(
         num_tokens=num_tokens,
@@ -621,7 +632,7 @@ def test_fc2_input_out_from_logits(num_tokens: int):
     writes for the expert IDs the routing kernel selected.
     """
     device = torch.device("cuda:0")
-    _skip_unless_sm10x(device)
+    _skip_unless_runs(device, activation_type=ActivationType.Swiglu)
     hidden_size, intermediate_size, num_experts, top_k = 1024, 2048, 32, 4
     kwargs, _reference, _parts = _per_token_routed_case(
         num_tokens=num_tokens,
@@ -686,7 +697,7 @@ def test_fc2_input_out_valid_intermediate_size():
     """With ``valid_intermediate_size`` the buffers keep the padded width and
     the leading valid columns hold the GEMM2 input."""
     device = torch.device("cuda:0")
-    _skip_unless_sm10x(device)
+    _skip_unless_runs(device, activation_type=ActivationType.Swiglu)
     num_tokens, hidden_size, intermediate_size, num_experts, top_k = (
         64,
         1024,
@@ -757,7 +768,7 @@ def test_fc2_input_out_valid_intermediate_size():
 
 def test_fc2_input_out_requires_per_token_scale():
     device = torch.device("cuda:0")
-    _skip_unless_sm10x(device)
+    _skip_unless_runs(device, activation_type=ActivationType.Swiglu)
     kwargs, _reference, _ = _per_token_routed_case(
         num_tokens=8,
         hidden_size=1024,
@@ -794,7 +805,7 @@ def test_fc2_input_out_bypasses_trace_apply():
     )
 
     device = torch.device("cuda:0")
-    _skip_unless_sm10x(device)
+    _skip_unless_runs(device, activation_type=ActivationType.Swiglu)
     num_tokens, hidden_size, intermediate_size, top_k = 8, 1024, 2048, 4
     kwargs, _reference, _ = _per_token_routed_case(
         num_tokens=num_tokens,

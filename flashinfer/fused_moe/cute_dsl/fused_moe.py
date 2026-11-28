@@ -1117,7 +1117,8 @@ class CuteDslMoEWrapper:
     parameter or `autotune()` context.
 
     Supported architectures: SM100, SM103, and SM107. Of these, W4A8 and W8A8 are
-    limited to SM100 and SM103. SM80 to SM90 run the records path of :func:`cute_dsl_fused_moe`.
+    limited to SM100 and SM103. SM90 and SM80 to SM89 run the SM90 and records paths of
+    :func:`cute_dsl_fused_moe`.
 
     Attributes:
         num_experts: Total number of experts.
@@ -1340,8 +1341,7 @@ class CuteDslMoEWrapper:
                 and torch.cuda.get_device_capability(device_obj)[0] < 10
             ):
                 raise NotImplementedError(
-                    "Below SM100 CuTe-DSL MoE runs W4A4, W4A16 and W4A8 on records, "
-                    "not quant_mode='mxfp8'."
+                    "Below SM100 CuTe-DSL MoE does not run quant_mode='mxfp8'."
                 )
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
@@ -1602,7 +1602,7 @@ class CuteDslMoEWrapper:
             Output tensor of shape ``[num_tokens, hidden_size]``.
         """
         if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
-            # Below SM100: the functional API's records path under this configuration.
+            # Below SM100: the functional API's SM90 or records path under this configuration.
             return cute_dsl_fused_moe(
                 x, x_sf, token_selected_experts, token_final_scales, w1_weight, w1_weight_sf,
                 w1_alpha, fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha, self.num_experts,
@@ -1612,8 +1612,10 @@ class CuteDslMoEWrapper:
                 swiglu_limit=self.swiglu_limit, situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta, quant_mode=self.quant_mode,
                 per_token_scale=per_token_scale, tactic=tactic, nvfp4_4over6=nvfp4_4over6,
+                use_fused_finalize=self.use_fused_finalize,
                 clamped_relu2_limit=self.clamped_relu2_limit,
                 routing_weights_before_fc2=self.routing_weights_before_fc2,
+                swap_ab=self.swap_ab,
             )  # fmt: skip
         validate_pre_fc2_options(
             self.routing_weights_before_fc2,
@@ -1728,6 +1730,10 @@ class CuteDslMoEWrapper:
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
         cuda = torch.cuda.is_available()
+        if cuda and torch.cuda.get_device_capability(self.device)[0] == 9:
+            from ..sm90.driver import SM90_FP4_TACTICS
+
+            return list(SM90_FP4_TACTICS)
         if cuda and torch.cuda.get_device_capability(self.device)[0] < 10:  # records
             from ..core import _W4A16_SM80_PT_TACTICS
             from ..prepare import W4A16_SM80_TACTICS
@@ -1936,9 +1942,11 @@ def cute_dsl_fused_moe(
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
     Supported architectures: SM100, SM103, and SM107. Of these, W4A8 and W8A8 are
-    limited to SM100 and SM103. SM80 to SM90 run W4A4 and W4A16 on the records of
-    :func:`prepare_records_nvfp4_weights` in ``w1_weight_sf`` and ``w2_weight_sf``, W4A8 on
-    those of :func:`prepare_records_mxfp4_weights` (their global scales in the alphas).
+    limited to SM100 and SM103. SM90 runs W4A4 with per-token activation scales and a
+    4over6 recipe on these same weights (``flashinfer.fused_moe.sm90``). SM80 to SM89 run
+    W4A4 and W4A16 on the records of :func:`prepare_records_nvfp4_weights` in
+    ``w1_weight_sf`` and ``w2_weight_sf``, W4A8 on those of
+    :func:`prepare_records_mxfp4_weights` (their global scales in the alphas).
     This is the simple functional API; for CUDA-graph support
     use :class:`CuteDslMoEWrapper` instead.
 
@@ -2138,7 +2146,7 @@ def cute_dsl_fused_moe(
         # W4A8 prepare_records_mxfp4_weights, their global scales in the alphas), which hold
         # the weights too, in the weight-scale slots: the weights give only shapes.
         # localized_* (per-domain copies of these weights) only steer the SM100 kernels.
-        if swap_ab:  # SM100 and SM103 only, as SM100's check below
+        if swap_ab:  # SM90, SM100 and SM103 only, as SM100's check below
             from ..prepare import _cute_dsl_gated_weight_group_size
 
             _cute_dsl_gated_weight_group_size(x.device, swap_ab)
@@ -2149,10 +2157,30 @@ def cute_dsl_fused_moe(
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         w4a4, pt = quant_mode == "w4a4", per_token_scale is not None
         w4a8 = quant_mode == "w4a8"  # MXFP8 x, GEMM2's input MXFP8 as on SM100
+        sm90 = torch.cuda.get_device_capability(x.device)[0] == 9
+        if sm90:  # SM90's W4A16 has SM100's ClampedRelu2 rejection, at SM100's place
+            _check_clamped_relu2_supported(activation, quant_mode, x.device)
         validate_pre_fc2_routing(
             routing_weights_before_fc2, quant_mode, activation, output_dtype, swap_ab,
             per_token_scale=pt, localized_weights=localized_weights is not None,
         )  # fmt: skip
+        if sm90:
+            # SM90 runs the SM100 tuples on the native weights (sm90.driver).
+            from ..sm90.driver import cute_dsl_fp4_sm90_moe
+
+            if quant_mode == "w4a16":  # its checks, in SM100's order, are the driver's
+                return cute_dsl_fp4_sm90_moe(locals(), activation, swap_ab)
+            shape = (x.shape[0], w2_weight.shape[1])
+            if moe_output is None:
+                moe_output = x.new_empty(shape, dtype=output_dtype)
+            else:
+                check_shape_dtype_device(
+                    moe_output, shape, output_dtype, x.device, "moe_output"
+                )
+            if pt and nvfp4_4over6 is not _UNSET:  # as on SM100
+                recipe = resolve_nvfp4_4over6(nvfp4_4over6)
+                _check_gemm2_input_scale(fc2_input_scale, recipe)
+            return cute_dsl_fp4_sm90_moe(locals(), activation, swap_ab)
         x16 = (torch.bfloat16, torch.float16)
         if quant_mode == "w4a16" and (x_sf is not None or fc2_input_scale is not None):
             raise ValueError(  # as on SM100

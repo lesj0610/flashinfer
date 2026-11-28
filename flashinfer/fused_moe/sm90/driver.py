@@ -1,0 +1,1873 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+SM90 (wgmma) FP4 MoE driver (``csrc/fp4_moe_sm90.cu``).
+
+The SM100+ MoE entry points (``trtllm_fp4_block_scale_moe`` and its routed variant,
+``cutlass_fused_moe``, ``cute_dsl_fused_moe``) run their NVFP4 tuples here on SM90,
+on the weights in each entry point's own SM100+ layout. Other tuples raise on SM90.
+"""
+
+from __future__ import annotations
+
+import functools
+import math
+import operator
+from dataclasses import dataclass, replace
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import torch
+
+from ...autotuner import (
+    AutoTuner,
+    ConstraintSpec,
+    DynamicTensorSpec,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+)
+from ...jit.fused_moe import fp4_sm90_recipe_bits, gen_fp4_moe_sm90_module
+from ...quantization.nvfp4_quantization_utils import (
+    env_flag_enabled,
+    nvfp4_4over6_cache_key,
+    resolve_nvfp4_4over6,
+)
+from ...tllm_enums import (
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    ActivationType,
+)
+from ...utils import check_shape_dtype_device
+from ..shared.validation import resolve_moe_act_sf_layout
+from ..utils import make_hybrid_bucket_mapper, map_to_hybrid_bucket
+from .spec import (
+    SM90_TACTIC,
+    AFmt,
+    Fq,
+    Pair,
+    Sm90EpilogueSpec,
+    Sm90Routing,
+    Sm90WeightView,
+    XFmt,
+)
+from .weights import sm90_weight_view
+
+__all__ = [
+    "SM90_FP4_TACTICS",
+    "Sm90Fp4MoeRunner",
+    "Sm90W4A16",
+    "default_sm90_fp4_tactic",
+    "sm90_fp4_moe",
+    "sm90_fp4_moe_supports",
+    "sm90_fp4_valid_tactics",
+]
+
+#: One tactic per GEMM, ``((cta_m1, n1, stages1), (cta_m2, n2, stages2))``: the runner's input of
+#: ``profile_ids`` launches only; the autotuner and every ``SM90_TACTIC`` consumer see 3-tuples.
+Sm90GemmTactics = Tuple[SM90_TACTIC, SM90_TACTIC]
+
+#: D7 shapes (cta_m, n, stages); stages 0 = the most that fit shared memory, as built.
+#: ``Sm90Fp4MoeRunner.get_valid_tactics`` reports the built stage counts and drops shapes
+#: whose kernels hold fewer than two stages.
+SM90_FP4_TACTICS: Tuple[SM90_TACTIC, ...] = tuple(
+    (cta_m, n, 0)
+    for cta_m in (128, 256)
+    for n in (8, 16, 32, 64, 128, 256)
+    if (cta_m // 128) * n // 2 <= 128
+)
+
+#: Activations of the ``fp4_sm90`` GEMM1 epilogue: ``cutlass_fused_moe``'s (gate/up pairing
+#: follows ``ActivationType.is_gated``).
+SM90_FP4_ACTIVATIONS = tuple(
+    a
+    for a in ActivationType
+    if a not in (ActivationType.InvalidType, ActivationType.ClampedRelu2)
+)
+
+
+def _not_on_sm90(what: str) -> NotImplementedError:
+    return NotImplementedError(f"SM90 FP4 MoE: {what} is not implemented on SM90 yet.")
+
+
+def _check_localized(
+    a: Dict[str, Any], x: torch.Tensor
+) -> Optional[Tuple[List[torch.Tensor], List[int], int]]:
+    """SM100's checks of a localized TRT-LLM launch (``localized_weights``), in its order; its
+    shards (per locality domain FC1's and FC2's rows of the domain and their scales, FC1's a
+    gated weight of its own), domain streams and SM count, or None without localization."""
+    from ..core import _flatten_localized_moe_args
+
+    shards, streams, sm_count = _flatten_localized_moe_args(
+        a.get("localized_weights"),
+        a.get("localized_streams"),
+        a.get("localized_sm_count"),
+        x.device,
+    )
+    if not shards:
+        return None
+    if (
+        a.get("routing_metadata") is not None
+    ):  # core.py's check of the SM100 op, first in it
+        raise ValueError("localized_weights does not support routing_metadata")
+    for ok, what in (
+        (
+            x.dtype == a["gemm1_weights"].dtype == torch.uint8,
+            "supports NVFP4 activations and weights only.",
+        ),
+        (ActivationType(a["activation_type"]).is_gated, "requires a gated activation."),
+        (
+            a["per_token_scale"] is None
+            and all(
+                a.get(n) is None
+                for n in ("gemm1_lora_delta", "gemm1_bias", "gemm2_bias")
+            ),
+            "supports neither per-token scales, LoRA deltas nor GEMM biases.",
+        ),
+        (not a.get("_nfse"), "does not support fused shared experts."),
+        (
+            a.get("valid_hidden_size") is None
+            and a.get("valid_intermediate_size") is None,
+            "does not support padded (valid) dimensions.",
+        ),
+        (a.get("workspace_buffer") is None, "does not support workspace_buffer."),
+    ):
+        if not ok:
+            raise RuntimeError(f"Localized MoE {what}")
+    experts, hidden, inter = (
+        a["local_num_experts"],
+        x.shape[1] * 2,
+        a["intermediate_size"],
+    )
+    for d in range(
+        2
+    ):  # FC1 [E, I, H / 2] and FC2 [E, H / 2, I / 2] rows, and their scales
+        for i, (n, rows, k, per) in enumerate(
+            (
+                ("gemm1_weights", inter, hidden, 2),
+                ("gemm1_weights_scale", inter, hidden, 16),
+                ("gemm2_weights", hidden // 2, inter, 2),
+                ("gemm2_weights_scale", hidden // 2, inter, 16),
+            )
+        ):
+            t = shards[4 * d + i]
+            s, numel = (*t.shape, 0, 0), experts * rows * k // per
+            for bad, what in (
+                (
+                    t.dtype != (torch.uint8 if per == 2 else torch.float8_e4m3fn),
+                    "has the wrong dtype.",
+                ),
+                (not t.is_contiguous(), "must be contiguous."),
+                (t.device != x.device, "must be on the device of hidden_states."),
+                (t.dim() != 3, "must be 3D."),
+                (s[0] != experts, "dim 0 must be local_num_experts."),
+                (s[1] != rows, f"dim 1 must be {rows} (half of the full-width rows)."),
+                (t.numel() != numel, f"must have {numel} elements."),
+            ):
+                if bad:
+                    raise RuntimeError(f"{n} shard {d} {what}")
+    if hidden % 256 or inter % 256:
+        raise RuntimeError(
+            "Localized MoE needs hidden and intermediate sizes that are multiples of 256, "
+            f"got hidden={hidden}, intermediate={inter}"
+        )
+    return shards, list(streams), sm_count
+
+
+def default_sm90_fp4_tactic(
+    num_tokens: int, top_k: int, num_local_experts: int
+) -> SM90_TACTIC:
+    """Untuned tactic (D7): CTA_M 128, n the smallest power of two in [8, 256] at least the
+    mean rows per local expert."""
+    rows = -(-num_tokens * top_k // max(num_local_experts, 1))
+    n = 8
+    while n < rows and n < 256:
+        n *= 2
+    return (128, n, 0)
+
+
+@functools.cache
+def get_fp4_moe_sm90_module(recipe=None, exact=False, act=None, f16=False, w4a16=False):
+    return gen_fp4_moe_sm90_module(recipe, exact, act, f16, w4a16).build_and_load()
+
+
+@functools.cache
+def _module_tactics(
+    recipe, exact, act, f16, w4a16, per_token, w1_fmt, w2_fmt, a_path, gemm=0
+) -> Tuple[SM90_TACTIC, ...]:
+    """The module's tactics: ``gemm`` 0 the (cta_m, n, stages) of both GEMMs together (the
+    autotuner's candidates), 1 or 2 those of that GEMM alone (``profile_ids``' lists)."""
+    flat = list(
+        get_fp4_moe_sm90_module(recipe, exact, act, f16, w4a16).fp4_moe_sm90_tactics(
+            per_token, int(w1_fmt), int(w2_fmt), a_path, gemm
+        )
+    )
+    return tuple(
+        (int(flat[i]), int(flat[i + 1]), int(flat[i + 2]))
+        for i in range(0, len(flat), 3)
+    )
+
+
+#: Weight layout of each entry point's view (``fp4_sm90::AFmt``; CuTe DSL's SF is 128x4 bytes).
+_ENTRY_AFMT = {
+    "trtllm": AFmt.NVFP4_TRTLLM_SHUFFLED,
+    "cutlass": AFmt.NVFP4_SWZ128X4,
+    "cute_dsl": AFmt.NVFP4_SWZ128X4,
+}
+
+
+#: Activations each entry point runs on SM90 (at their default parameters); per token,
+#: TRT-LLM's ``_TRTLLM_PER_TOKEN_ACTIVATIONS``.
+_ENTRY_ACTIVATIONS = {
+    "trtllm": (
+        ActivationType.Swiglu,
+        ActivationType.Geglu,
+        ActivationType.Relu2,
+        ActivationType.SwigluStep,
+        ActivationType.Identity,
+        ActivationType.Situ,
+    ),
+    "cutlass": SM90_FP4_ACTIVATIONS,
+    "cute_dsl": (ActivationType.Swiglu, ActivationType.Relu2),
+}
+_TRTLLM_PER_TOKEN_ACTIVATIONS = (
+    ActivationType.Swiglu,
+    ActivationType.Relu2,
+    ActivationType.SwigluStep,
+)
+
+#: Activations of CuTe DSL's W4A16 (BF16 x NVFP4) on SM90, as SM100's: SwiGLU (``Swiglu``, at any
+#: alpha, beta and limit), SiTU (``Situ``: SwiGLU with ``situ_beta``), GeGLU-tanh and ReLU2.
+#: These parameters are the module's run-time constants (``Sm90W4A16``), not per-expert vectors.
+_W4A16_ACTIVATIONS = (
+    ActivationType.Swiglu,
+    ActivationType.Situ,
+    ActivationType.GegluTanh,
+    ActivationType.Relu2,
+)
+
+
+def sm90_fp4_moe_supports(
+    entry: str, *, per_token: bool, activation_type: int, w4a16: bool = False
+) -> bool:
+    """Whether SM90 runs this NVFP4 x NVFP4 tuple of ``entry`` (``"trtllm"``, ``"cutlass"`` or
+    ``"cute_dsl"``): per-tensor activation scales for CUTLASS, either for TRT-LLM and CuTe DSL,
+    and an activation the entry runs on SM90. With ``w4a16`` the NVFP4 x BF16 tuple (no
+    activation scales) of CuTe DSL. The entry points reject the rest on SM90 with
+    ``NotImplementedError``."""
+    if w4a16:
+        return (
+            entry == "cute_dsl"
+            and ActivationType(activation_type) in _W4A16_ACTIVATIONS
+        )
+    acts = _ENTRY_ACTIVATIONS[entry]
+    if entry == "trtllm" and per_token:
+        acts = _TRTLLM_PER_TOKEN_ACTIVATIONS
+    return (entry != "cutlass" or not per_token) and ActivationType(
+        activation_type
+    ) in acts
+
+
+def sm90_fp4_valid_tactics(
+    entry: str,
+    recipe,
+    act: int,
+    per_token: bool,
+    a_path: int = 0,
+    w4a16: bool = False,
+) -> List[SM90_TACTIC]:
+    """Tactics of ``entry``'s (``"trtllm"``, ``"cutlass"`` or ``"cute_dsl"``) M3 tuple, as
+    ``Sm90Fp4MoeRunner.get_valid_tactics`` reports them (builds the module)."""
+    fmt = _ENTRY_AFMT[entry]
+    return list(
+        _module_tactics(
+            recipe, _exact(), int(act), False, w4a16, per_token, fmt, fmt, a_path, 0
+        )
+    )
+
+
+def _device_fp32(t: torch.Tensor, what: str) -> torch.Tensor:
+    """``t`` as the device FP32 vector the kernel reads (no host read, graph-capture safe)."""
+    if not t.is_cuda or t.dtype != torch.float32:
+        raise TypeError(f"SM90 FP4 MoE: {what} must be a CUDA FP32 tensor")
+    return t.reshape(-1).contiguous()
+
+
+def _check_act_globals(fc1: torch.Tensor, fc2: torch.Tensor, experts: int) -> None:
+    """SM100's NVFP4 checks of the activation global scales (``quant_scales[0]`` and
+    ``[3]``), in its order: a scalar or one per local expert."""
+    given = ((fc1, "fc1"), (fc2, "fc2"))
+    for t, n in given:
+        if t.dtype != torch.float32:
+            raise RuntimeError(f"Inconsistency of Tensor type: {n}_act_global")
+    for t, n in given:
+        if t.dim() > 1:
+            raise RuntimeError(f"{n} act global must be a scalar or 1-D tensor")
+    for t, n in given:
+        if t.dim() == 1 and t.shape[0] != experts:
+            raise RuntimeError(
+                f"{n} act global must be scalar or (num_experts_on_rank,)"
+            )
+
+
+def _geometry(w: Sm90WeightView) -> List[int]:
+    return [
+        int(w.a_fmt),
+        int(w.pair),
+        w.rows,
+        w.rows_phys,
+        w.k,
+        w.k_phys,
+        w.half_rows,
+        w.pair_g,
+        w.codes_expert_stride,
+        w.sf_expert_stride,
+        w.num_experts,
+    ]
+
+
+def _bytes(t: torch.Tensor) -> torch.Tensor:
+    return t if t.dtype == torch.uint8 else t.view(torch.uint8)
+
+
+def _tuning(
+    num_experts: int,
+    num_tokens: int,
+    tune_max_num_tokens: int,
+    inputs: Sequence[Optional[torch.Tensor]],
+    x_sf_swizzled: bool,
+) -> TuningConfig:
+    """Tuning of ``Sm90Fp4MoeRunner``'s inputs [x, topk_ids, topk_weights, x_sf, token_scale,
+    out] at ``num_tokens``' bucket: seeded inputs, ids and softmaxed weights, cold L2."""
+
+    def seeded(fn, *args):
+        def init(shape, dtype, device):
+            generator = torch.Generator(device).manual_seed(515)
+            return fn(*args, shape, dtype=dtype, device=device, generator=generator)
+
+        return init
+
+    def empty(shape, dtype, device):
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    def given(i):
+        return inputs[i] is not None
+
+    codes, randn = inputs[0].dtype == torch.uint8, seeded(torch.randn)
+    dynamic = [0, 1] + [2] * given(2) + [3] * (given(3) and not x_sf_swizzled)
+    dynamic += [4] * given(4) + [5] * given(5)
+    initializers = [
+        (0, seeded(torch.randint, 0, 256) if codes else randn),
+        (1, seeded(torch.randint, 0, num_experts)),
+    ]
+    if given(2):
+        initializers.append((2, lambda *args: randn(*args).softmax(-1)))
+    if given(3):  # E4M3 scales by their bytes in [2^-1, 2^2): FP8 has no random fill
+        scales = seeded(torch.randint, 48, 72)
+        initializers.append(
+            (3, lambda s, dtype, d: scales(s, torch.uint8, d).view(dtype))
+        )
+    if given(4):
+        initializers.append((4, seeded(torch.rand)))
+    if given(5):
+        initializers.append((5, empty))
+    constraints = []
+    if given(3) and x_sf_swizzled:  # 128x4 tiles over [tokens, K / 16]
+        constraints.append(
+            ConstraintSpec(
+                3, 0, lambda s: -(-s[0][0] // 128) * 128 * -(-s[0][1] // 32) * 4
+            )
+        )
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                tuple(dynamic),
+                (0,) * len(dynamic),
+                (map_to_hybrid_bucket(num_tokens, tune_max_num_tokens),),
+                make_hybrid_bucket_mapper(tune_max_num_tokens),
+            ),
+        ),
+        constraint_specs=tuple(constraints),
+        tensor_initializers=tuple(initializers),
+        use_cold_l2_cache=True,
+    )
+
+
+#: ``Sm90W4A16.flags``: bit 0 SwiGLU at non-default alpha, beta or limit, bit 1 SiTU with its
+#: linear beta (the module reads ``consts`` accordingly), bit 2 ``use_fused_finalize`` (GEMM2
+#: scales each row by alpha x its FP32 routing weight, the finalize sums the rows in BF16).
+W4A16_FLAG_SWIGLU_PARAMS = 1
+W4A16_FLAG_SITU_LINEAR_BETA = 2
+W4A16_FLAG_FUSED_FINALIZE = 4
+
+
+@dataclass(frozen=True)
+class Sm90W4A16:
+    """The W4A16 mode (BF16 ``x`` x NVFP4 weights, no activation scales) of ``sm90_fp4_moe``:
+    GEMM1's activation parameters as four FP32 constants (SM100's, computed on the host in
+    double) and their ``flags``. ``consts`` is None where the module reads none (default
+    SwiGLU, GeGLU-tanh and ReLU2):
+
+    * SwiGLU: ``(-alpha * log2(e), beta, limit, 0)``; SiTU: ``(situ_beta, 1 / situ_beta,
+      situ_linear_beta, 1 / situ_linear_beta)`` (0 without the linear beta).
+    """
+
+    consts: Optional[Tuple[float, float, float, float]] = None
+    flags: int = 0
+
+
+@functools.cache
+def _w4a16_consts_tensor(consts: Tuple[float, ...]) -> torch.Tensor:
+    """The CPU FP32 ``[4]`` tensor of ``Sm90W4A16.consts`` (built once per value, never on the
+    device: the call reads it on the host, so CUDA graph capture is unaffected)."""
+    return torch.tensor(consts, dtype=torch.float32)
+
+
+class Sm90Fp4MoeRunner(TunableRunner):
+    """``sm90_fp4_moe`` on fixed weights and epilogues; inputs [x, topk_ids, topk_weights,
+    x_sf, token_scale, out], tactic (cta_m, n, stages) (GEMM1's; GEMM2 runs ``(cta_m, n, 0)``) or,
+    for ``profile_ids``, one such tuple per GEMM. ``w4a16`` (BF16 ``x``, no ``x_sf`` or
+    ``token_scale``) runs the module of that mode (``fp4_moe_sm90_run_w4a16``)."""
+
+    def __init__(
+        self,
+        w1: Sm90WeightView,
+        w2: Sm90WeightView,
+        epi1: Sm90EpilogueSpec,
+        epi2: Sm90EpilogueSpec,
+        *,
+        num_experts: int,
+        local_expert_offset: int,
+        num_local_experts: int,
+        recipe=None,
+        exact: bool = False,
+        x_global: Optional[torch.Tensor] = None,
+        x_sf_swizzled: bool = False,
+        do_finalize: bool = True,
+        a_path: int = 0,
+        localized: Optional[Tuple[List[Sm90WeightView], List[int], int]] = None,
+        keep_unrouted: bool = False,
+        w4a16: Optional[Sm90W4A16] = None,
+    ):
+        self.w1, self.w2, self.epi1, self.epi2 = w1, w2, epi1, epi2
+        self.w4a16 = w4a16
+        # Built once with the runner (CPU, contiguous): the call neither allocates nor copies.
+        self.w4a16_consts = (
+            None
+            if w4a16 is None or w4a16.consts is None
+            else _w4a16_consts_tensor(tuple(w4a16.consts))
+        )
+        self.localized = localized
+        self.keep_unrouted = keep_unrouted
+        self.num_experts, self.num_local_experts = num_experts, num_local_experts
+        self.local_expert_offset = local_expert_offset
+        self.recipe, self.exact, self.x_global = recipe, exact, x_global
+        self.x_sf_swizzled, self.do_finalize, self.a_path = (
+            x_sf_swizzled,
+            do_finalize,
+            a_path,
+        )
+        self.per_token = epi1.fq == Fq.NONE
+        self.module_key = (recipe, exact, int(epi1.act), False, w4a16 is not None)
+        self.key = (
+            nvfp4_4over6_cache_key(recipe),
+            exact,
+            int(epi1.act),
+            w4a16 is not None,
+            self.per_token,
+            tuple(_geometry(w1)),
+            tuple(_geometry(w2)),
+            num_experts,
+            local_expert_offset,
+            num_local_experts,
+            x_sf_swizzled,
+            do_finalize,
+            a_path,
+            epi2.out_dtype,
+            None
+            if localized is None
+            else (tuple(tuple(_geometry(v)) for v in localized[0]), localized[2]),
+        )
+
+    def __hash__(self) -> int:
+        return hash(self.key)
+
+    def get_cache_key_extras(self, inputs) -> tuple:
+        # Persisted keys omit the runner hash: include what changes the tactics' meaning, the
+        # module and the launch (not the local expert offset: as SM100's ranks, it only shifts
+        # timings).
+        return (
+            inputs[0].dtype,
+            self.x_global is not None,
+            nvfp4_4over6_cache_key(self.recipe),
+            self.exact,
+            int(self.epi1.act),
+            self.w4a16 is not None,
+            self.per_token,
+            tuple(_geometry(self.w1)),
+            tuple(_geometry(self.w2)),
+            self.num_experts,
+            self.num_local_experts,
+            self.x_sf_swizzled,
+            self.do_finalize,
+            self.a_path,
+            self.epi2.out_dtype,
+            self.localized is not None,
+        )
+
+    def get_valid_tactics(
+        self, inputs, profile: OptimizationProfile
+    ) -> List[SM90_TACTIC]:
+        return list(
+            _module_tactics(
+                *self.module_key,
+                self.per_token,
+                self.w1.a_fmt,
+                self.w2.a_fmt,
+                self.a_path,
+            )
+        )
+
+    def gemm_tactics(
+        self, profile_ids: Sequence[int], tokens: int, top_k: int
+    ) -> Sm90GemmTactics:
+        """The tactics of ``profile_ids`` ``[gemm1, gemm2]``, integer indices of SM100's combined
+        list: GEMM1's tactics, then GEMM2's. -1 takes that GEMM's untuned default from its own
+        list: the default (cta_m, n) with that GEMM's stages, else the nearest n (CTA_M 128
+        first, then list order)."""
+        lists = [
+            _module_tactics(
+                *self.module_key,
+                self.per_token,
+                self.w1.a_fmt,
+                self.w2.a_fmt,
+                self.a_path,
+                gemm,
+            )
+            for gemm in (1, 2)
+        ]
+        cta_m, n, _ = default_sm90_fp4_tactic(tokens, top_k, self.num_local_experts)
+
+        def default(gemm: int, tactics: Tuple[SM90_TACTIC, ...]) -> SM90_TACTIC:
+            if not tactics:
+                raise RuntimeError(
+                    f"SM90 FP4 MoE: this module has no gemm{gemm} tactic"
+                )
+            return min(
+                tactics,
+                key=lambda t: (abs(t[1].bit_length() - n.bit_length()), t[0] != cta_m),
+            )
+
+        first = 0
+        chosen = []
+        for gemm, (pid, tactics) in enumerate(zip(profile_ids, lists, strict=True), 1):
+            pid = operator.index(pid)  # SM100 takes int64 indices only
+            if pid == -1:
+                chosen.append(default(gemm, tactics))
+            elif first <= pid < first + len(tactics):
+                chosen.append(tactics[pid - first])
+            else:
+                raise RuntimeError(f"Invalid gemm{gemm} profile id: {pid}")
+            first += len(tactics)
+        return chosen[0], chosen[1]
+
+    def _localized_args(self) -> tuple:
+        """The module's localization arguments: per domain its shards' codes and scales (w1's,
+        then w2's) and geometries, the domain streams, the SMs of each domain (0: off)."""
+        if self.localized is None:
+            return [], [], [], 0
+        views, streams, sm_count = self.localized
+        return (
+            [_bytes(t) for v in views for t in (v.codes, v.sf)],
+            [g for v in views for g in _geometry(v)],
+            streams,
+            sm_count,
+        )
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        x, ids, weights, x_sf, token_scale, out = inputs
+        tokens, top_k = ids.shape
+        if tactic is None or tactic == -1:
+            tactic = default_sm90_fp4_tactic(tokens, top_k, self.num_local_experts)
+        # A 3-tuple (the autotuner's) runs GEMM2 with the shape of GEMM1 and its table's stages.
+        if len(tactic) == 2:
+            (cta_m1, n1, stages1), (cta_m2, n2, stages2) = tactic
+        else:
+            cta_m1, n1, stages1 = tactic
+            cta_m2, n2, stages2 = cta_m1, n1, 0
+        if x.dtype == torch.uint8:
+            x_fmt = XFmt.NVFP4_SWZ128X4 if self.x_sf_swizzled else XFmt.NVFP4_LINEAR
+            quantize = 0
+        else:
+            x_fmt = XFmt.F16 if x.dtype == torch.float16 else XFmt.BF16
+            quantize = int(
+                self.w4a16 is None
+            )  # W4A16: the BF16 rows go to GEMM1 as they are
+        module = get_fp4_moe_sm90_module(*self.module_key)
+        hidden, inter = self.w1.k, self.w2.k
+        size = module.fp4_moe_sm90_workspace_bytes(
+            tokens,
+            top_k,
+            self.num_experts,
+            self.local_expert_offset,
+            self.num_local_experts,
+            hidden,
+            inter,
+            int(x_fmt),
+            quantize,
+            self.per_token,
+            n1,
+            n2,
+        )
+        out_dtype = self.epi2.out_dtype
+        lora, act_out = kwargs.get("gemm1_lora_delta"), None
+        rows = tokens * top_k
+        # The scratch is cut from the caller's buffer; what the call returns is allocated.
+        buf = kwargs.get("workspace_buffer")
+        # TRT-LLM's buffer: the call's scratch and rows, all internal (never returned), cut in
+        # SM100's allocation order by its allocator; without it plain allocations.
+        alloc = _CarveAllocator(kwargs.get("trtllm_workspace"))
+        carve_src = buf is not None and self.do_finalize and lora is None
+        carve_y = buf is not None and self.do_finalize
+        if buf is None:
+            workspace = alloc.alloc((size,), torch.uint8, x.device)
+        else:
+            src_off, y_off, end = module.fp4_moe_sm90_scratch(
+                tokens,
+                top_k,
+                self.num_local_experts,
+                hidden,
+                inter,
+                self.per_token,
+                n1,
+                n2,
+                out_dtype.itemsize,
+                carve_src,
+                carve_y,
+            )
+            pad = -buf.data_ptr() % _WORKSPACE_ALIGN
+            _check_workspace_buffer(buf, x.device, pad + end)
+            raw = buf.view(torch.uint8)[pad : pad + end]
+            workspace = raw[:size]
+        if carve_src:
+            src_permuted = raw[src_off : src_off + 4 * rows].view(torch.int32)
+        else:
+            src_permuted = alloc.alloc((rows,), torch.int32, x.device)
+        if carve_y:
+            y_bytes = rows * hidden * out_dtype.itemsize
+            y = raw[y_off : y_off + y_bytes].view(out_dtype).view(rows, hidden)
+        else:
+            y = alloc.alloc((rows, hidden), out_dtype, x.device)
+        if self.do_finalize and out is None:
+            out = torch.empty(tokens, hidden, dtype=out_dtype, device=x.device)
+        fc2_input_out = kwargs.get("fc2_input_out")
+        fc2 = (
+            [None] * 3
+            if fc2_input_out is None
+            else [
+                fc2_input_out[0].view(torch.uint8),
+                fc2_input_out[1].view(torch.uint8),
+                fc2_input_out[2],
+            ]
+        )
+        if lora is not None:  # the activation by expanded row, zero past GEMM2's K
+            width = lora.shape[2] // 2
+            act_out = (torch.zeros if width > inter else torch.empty)(
+                tokens * top_k, width, dtype=torch.bfloat16, device=x.device
+            )
+        if self.w4a16 is None:
+            run, w4a16_args = module.fp4_moe_sm90_run, ()
+        else:  # the W4A16 module's only entry: the same arguments, then its constants
+            run = module.fp4_moe_sm90_run_w4a16
+            w4a16_args = (self.w4a16_consts, self.w4a16.flags)
+        run(
+            x,
+            None if x_sf is None else _bytes(x_sf),
+            int(x_fmt),
+            self.x_global,
+            quantize,
+            token_scale,
+            ids,
+            weights,
+            self.num_experts,
+            self.local_expert_offset,
+            self.num_local_experts,
+            _bytes(self.w1.codes),
+            _bytes(self.w1.sf),
+            _geometry(self.w1),
+            _bytes(self.w2.codes),
+            _bytes(self.w2.sf),
+            _geometry(self.w2),
+            self.epi1.alpha,
+            self.epi2.alpha,
+            *self.epi1.act_params,
+            int(self.epi1.act),
+            self.per_token,
+            self.epi1.fq_global,
+            self.epi1.bias,
+            self.epi2.bias,
+            self.epi1.out_scale,
+            workspace,
+            src_permuted,
+            y,
+            out if self.do_finalize else None,
+            *fc2,
+            lora,
+            act_out,
+            cta_m1,
+            n1,
+            stages1,
+            cta_m2,
+            n2,
+            stages2,
+            self.a_path,
+            *self._localized_args(),
+            self.keep_unrouted,
+            *w4a16_args,
+        )
+        rows = src_permuted.view(tokens, top_k)
+        if self.do_finalize:
+            return [out] if lora is None else [out, rows, act_out]
+        return [y, weights, rows] + ([] if lora is None else [act_out])
+
+
+def sm90_fp4_moe(
+    x: torch.Tensor,
+    x_sf: Optional[torch.Tensor],
+    w1: Sm90WeightView,
+    w2: Sm90WeightView,
+    routing: Sm90Routing,
+    epi1: Sm90EpilogueSpec,
+    epi2: Sm90EpilogueSpec,
+    *,
+    out: Optional[torch.Tensor] = None,
+    tactic: Any = -1,
+    profile_ids: Optional[Sequence[int]] = None,
+    recipe=None,
+    exact: bool = False,
+    x_global: Optional[torch.Tensor] = None,
+    token_scale: Optional[torch.Tensor] = None,
+    x_sf_swizzled: bool = False,
+    do_finalize: bool = True,
+    tune_max_num_tokens: int = 8192,
+    a_path: int = 0,
+    localized: Optional[Tuple[List[Sm90WeightView], List[int], int]] = None,
+    fc2_input_out: Optional[Sequence[torch.Tensor]] = None,
+    gemm1_lora_delta: Optional[torch.Tensor] = None,
+    keep_unrouted: bool = False,
+    workspace_buffer: Optional[torch.Tensor] = None,
+    trtllm_workspace: Optional[torch.Tensor] = None,
+    w4a16: Optional[Sm90W4A16] = None,
+) -> List[torch.Tensor]:
+    """SM90 FP4 MoE: prep, GEMM1, row quantization (token-wise), GEMM2, finalize.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        BF16/FP16 ``[num_tokens, hidden]`` (quantized in prep with ``recipe`` under
+        ``x_global``) or NVFP4 codes uint8 ``[num_tokens, >= hidden / 2]``, with ``hidden``
+        GEMM1's K (``w1.k``): GEMM1 reads the leading ``hidden`` values of a wider row.
+    x_sf : Optional[torch.Tensor]
+        E4M3 block scales of NVFP4 ``x``, as wide as ``x``: linear or 128x4-swizzled
+        (``x_sf_swizzled``).
+    w1, w2 : Sm90WeightView
+        GEMM1 (gated: gate/up pair) and GEMM2 weights in an SM100+ entry point's layout.
+    routing : Sm90Routing
+        Global expert ids int32 ``[num_tokens, top_k]`` and their weights.
+    epi1 : Sm90EpilogueSpec
+        GEMM1: activation, its ``act_params``, ``alpha`` FP32 ``[num_local_experts]``, ``bias``;
+        ``fq`` ``Fq.NONE`` for the token-wise recipe (rows, times ``out_scale`` if given,
+        requantized with ``recipe`` per row, ``token_scale`` per token on GEMM1) or
+        ``Fq.NVFP4`` per tensor (under ``fq_global``).
+    epi2 : Sm90EpilogueSpec
+        GEMM2: ``alpha`` FP32 ``[num_local_experts]``, ``bias``, ``out_dtype`` BF16 or FP16.
+    out : Optional[torch.Tensor]
+        Finalized output ``[num_tokens, <= hidden]``, the leading columns of GEMM2's rows
+        (allocated ``hidden`` wide if None).
+    tactic : tuple or int
+        ``(cta_m, n, stages)`` (GEMM2 runs ``(cta_m, n, 0)``); -1 autotunes (or the untuned
+        default outside tuning).
+    profile_ids : Optional[Sequence[int]]
+        SM100's ``[gemm1_profile, gemm2_profile]``, absolute indices of the combined list of
+        GEMM1's tactics then GEMM2's (``fp4_moe_sm90_tactics`` with ``gemm`` 1 and 2); -1 keeps
+        that GEMM's untuned default. Replaces ``tactic`` and skips autotuning, whatever the ids.
+    recipe : Optional[NVFP44Over6Config]
+        Resolved NVFP4 recipe of every quantization in the call (the module's).
+    exact : bool
+        Quantizers without fast math (``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH``).
+    x_global : Optional[torch.Tensor]
+        FP32 global scale of the in-prep input quantization (16-bit ``x``): a scalar, or
+        ``[num_local_experts]`` per tensor (each expanded row quantized with its expert's).
+    token_scale : Optional[torch.Tensor]
+        FP32 ``[num_tokens]`` per-token scales of NVFP4 ``x`` (token-wise recipe).
+    x_sf_swizzled : bool
+        ``x_sf`` 128x4-swizzled instead of linear.
+    do_finalize : bool
+        ``[out]`` if True, else ``[y, topk_weights, src_permuted]`` with ``y`` the GEMM2 rows
+        ``[num_tokens * top_k, hidden]`` and ``src_permuted`` ``[num_tokens, top_k]`` the row
+        of each (token, slot), -1 for other ranks' experts.
+    tune_max_num_tokens : int
+        Largest token bucket profiled.
+    a_path : int
+        Weight staging path of the GEMM kernels: 0 (n1) or 1 (n2).
+    localized : Optional[tuple]
+        SM100's ``localized_*``: per locality domain the views of its ``w1`` and ``w2`` shards
+        (the domain's rows), the domain streams (``cudaStream_t`` handles) and the SMs of each
+        domain's GEMMs. Each GEMM then runs per domain on its stream, forked from and joined
+        back to the current stream (also under CUDA graph capture).
+    fc2_input_out : Optional[Sequence[torch.Tensor]]
+        Token-wise recipe only: ``[codes, block_scales, token_scales]`` that also receive
+        GEMM2's NVFP4 input in caller order, codes uint8 ``[>= num_tokens, top_k, >= inter /
+        2]``, E4M3 (or uint8) block scales ``[>= num_tokens, top_k, codes' width / 8]`` and
+        FP32 token scales ``[>= num_tokens, top_k]``; other ranks' slots and the columns past
+        ``inter`` are zero. Not passed to autotuning.
+    gemm1_lora_delta : Optional[torch.Tensor]
+        Gated only: BF16 ``[num_tokens, top_k, 2 * I]`` (``I >= inter``) added to
+        GEMM1's rows before the activation in output units (after GEMM1's scales),
+        ``[up; gate]`` halves by (token, slot).
+        The calls also return the activation (before GEMM2's input quantization), BF16
+        ``[num_tokens * top_k, I]`` by row of ``y``, as TRT-LLM's ``gemm1_output``. Not passed
+        to autotuning.
+    keep_unrouted : bool
+        Finalize leaves the ``out`` rows of tokens without a local expert as they are (the
+        all-to-all behavior of SM100's unfused finalize) instead of writing zeros.
+
+    workspace_buffer : Optional[torch.Tensor]
+        int8/uint8 1-D CUDA buffer (SM100's checks, 128 B aligned) that holds the call's scratch
+        from its next 256 B boundary: ``cutlass_fused_moe_workspace_size`` bytes always fit.
+        Tensors the call returns (``y`` and ``src_permuted`` of ``do_finalize=False``,
+        ``src_permuted`` with ``gemm1_lora_delta``) are allocated, not cut from it. Not passed
+        to autotuning, which allocates its own.
+    trtllm_workspace : Optional[torch.Tensor]
+        TRT-LLM's ``workspace_buffer`` (checked by ``trtllm_fp4_sm90_moe``, ``do_finalize`` without
+        ``gemm1_lora_delta``) in SM100's allocation: each call and each autotuning candidate cuts
+        the scratch, ``src_permuted`` and ``y`` from offset 0 on 256 B boundaries, a tensor that
+        does not fit allocated. Exclusive with ``workspace_buffer``.
+    w4a16 : Optional[Sm90W4A16]
+        The W4A16 mode: BF16 ``x`` goes to GEMM1 as it is (no quantization, ``x_sf``,
+        ``token_scale``, ``x_global`` or biases), ``epi1`` is token-wise (``Fq.NONE``) without
+        ``fq_global`` or ``out_scale``, its activation one of ``_W4A16_ACTIVATIONS`` with the
+        parameters in ``w4a16`` (not ``epi1.act_params``), and GEMM2's input is not quantized.
+
+    Returns
+    -------
+    List[torch.Tensor]
+        See ``do_finalize``; with ``gemm1_lora_delta`` ``[out, src_permuted, activation]`` or
+        ``[y, topk_weights, src_permuted, activation]``.
+    """
+    if workspace_buffer is not None and trtllm_workspace is not None:
+        raise ValueError("SM90 FP4 MoE: one workspace buffer, not two.")
+    act = ActivationType(epi1.act)
+    per_token = epi1.fq == Fq.NONE
+    num_local = routing.num_local_experts
+    if num_local is None:
+        num_local = routing.num_experts
+    if (
+        act not in SM90_FP4_ACTIVATIONS
+        or epi1.fq not in (Fq.NONE, Fq.NVFP4)
+        or epi2.fq != Fq.NONE
+        or not epi2.gemm2
+        or epi2.out_dtype not in (torch.bfloat16, torch.float16)
+        or (not per_token and epi1.recipe != fp4_sm90_recipe_bits(recipe))
+        or w1.gated != act.is_gated
+        or {w1.a_fmt, w2.a_fmt} - {AFmt.NVFP4_TRTLLM_SHUFFLED, AFmt.NVFP4_SWZ128X4}
+        or w2.pair != Pair.NONE
+    ):
+        raise _not_on_sm90(
+            f"activation {act.name}, epilogues {epi1.fq.name}/{epi2.fq.name} or weights "
+            f"{w1.a_fmt.name}/{w2.a_fmt.name} (NVFP4 only)"
+        )
+    if w4a16 is not None and (
+        act not in _W4A16_ACTIVATIONS
+        or not per_token
+        or x.dtype != torch.bfloat16
+        or x_sf is not None
+        or token_scale is not None
+        or x_global is not None
+        or localized is not None
+        or fc2_input_out is not None
+        or gemm1_lora_delta is not None
+        or any(
+            v is not None
+            for v in (
+                epi1.fq_global,
+                epi1.out_scale,
+                epi1.bias,
+                epi2.bias,
+                *epi1.act_params,
+            )
+        )
+    ):
+        raise _not_on_sm90(
+            f"W4A16 outside BF16 activations without scales, biases and localization, with "
+            f"{act.name}"
+        )
+    if per_token and w4a16 is None and (token_scale is None or x.dtype != torch.uint8):
+        raise _not_on_sm90("the token-wise recipe without NVFP4 per-token activations")
+    if fc2_input_out is not None and not per_token:
+        raise _not_on_sm90("fc2_input_out without the token-wise recipe")
+    if gemm1_lora_delta is not None and not w1.gated:
+        raise _not_on_sm90("gemm1_lora_delta without a gated activation")
+    if (
+        x.dtype != torch.uint8
+        and w4a16 is None
+        and (x_global is None or x_global.numel() not in (1, num_local))
+    ):
+        raise _not_on_sm90(
+            "16-bit input quantization without a global scale per tensor or per local expert"
+        )
+    if min(w1.num_experts, w2.num_experts) < num_local or epi1.alpha is None:
+        raise ValueError("SM90 FP4 MoE: weights and alphas of every local expert")
+    ids = routing.topk_ids
+    if ids.dtype != torch.int32 or not ids.is_contiguous():
+        ids = ids.to(torch.int32).contiguous()
+    weights = routing.topk_weights
+    if weights is not None and not weights.is_contiguous():
+        weights = weights.contiguous()
+    alpha = [e.alpha.float().reshape(-1)[:num_local].contiguous() for e in (epi1, epi2)]
+    os1 = epi1.out_scale
+    if os1 is not None:
+        os1 = os1.float().reshape(-1)[:num_local].contiguous()
+    runner = Sm90Fp4MoeRunner(
+        w1,
+        w2,
+        replace(epi1, alpha=alpha[0], out_scale=os1),
+        replace(epi2, alpha=alpha[1]),
+        num_experts=routing.num_experts,
+        local_expert_offset=routing.local_expert_offset,
+        num_local_experts=num_local,
+        recipe=recipe,
+        exact=exact,
+        x_global=None
+        if x.dtype == torch.uint8 or w4a16 is not None
+        else x_global.float().reshape(-1).contiguous(),
+        x_sf_swizzled=x_sf_swizzled,
+        do_finalize=do_finalize,
+        a_path=a_path,
+        localized=localized,
+        keep_unrouted=keep_unrouted,
+        w4a16=w4a16,
+    )
+    inputs = [x, ids, weights, x_sf, token_scale, out if do_finalize else None]
+    if profile_ids is not None:
+        tactic = runner.gemm_tactics(profile_ids, *ids.shape)
+    elif isinstance(tactic, int) and tactic == -1:
+        tuning = _tuning(
+            routing.num_experts, x.shape[0], tune_max_num_tokens, inputs, x_sf_swizzled
+        )
+        # The candidates' launches get the buffer, as SM100's tuner: each carves from offset 0.
+        tune = (
+            {} if trtllm_workspace is None else {"trtllm_workspace": trtllm_workspace}
+        )
+        _, tactic = AutoTuner.get().choose_one(
+            "flashinfer::fp4_moe_sm90", [runner], tuning, inputs, **tune
+        )
+    extra: Dict[str, Any] = {}
+    if fc2_input_out is not None:
+        extra.update(fc2_input_out=fc2_input_out)
+    if gemm1_lora_delta is not None:
+        extra.update(gemm1_lora_delta=gemm1_lora_delta)
+    if workspace_buffer is not None:
+        extra.update(workspace_buffer=workspace_buffer)
+    if trtllm_workspace is not None:
+        extra.update(trtllm_workspace=trtllm_workspace)
+    return runner(inputs, tactic=tactic, **extra)
+
+
+def _exact() -> bool:
+    return any(
+        env_flag_enabled(f"{p}_DISABLE_FP4_QUANT_FAST_MATH")
+        for p in ("FLASHINFER", "TRTLLM")
+    )
+
+
+def _per_expert(t: torch.Tensor, experts: int) -> torch.Tensor:
+    """One FP32 scale per local expert from one for all or [>= local experts] (the local first,
+    as SM100 reads them)."""
+    if t.dim() > 1 or t.numel() not in (1,) and t.numel() < experts:
+        raise ValueError(
+            f"expected one scale or [local_num_experts], got {tuple(t.shape)}"
+        )
+    t = t.float().reshape(-1)
+    return t.expand(experts) if t.numel() == 1 else t[:experts]
+
+
+def _check_per_expert_param(
+    t: Optional[torch.Tensor], n: str, x: torch.Tensor, experts: int
+) -> None:
+    """SM100's check of a per-expert activation parameter (TRT-LLM's
+    check_optional_per_expert_float_tensor), in its order."""
+    if t is None:
+        return
+    if t.device.type != "cuda":
+        raise RuntimeError(f"{n} must be a CUDA tensor.")
+    if t.device != x.device:
+        raise RuntimeError(f"{n} must be on the same device as hidden_states.")
+    if t.dtype != torch.float32:
+        raise RuntimeError(f"{n} must be float32.")
+    if t.dim() != 1:
+        raise RuntimeError(f"{n} must be 1D.")
+    if t.shape[0] != experts:
+        raise RuntimeError(
+            f"{n} must have shape [local_num_experts + num_fused_shared_experts]."
+        )
+    if not t.is_contiguous():
+        raise RuntimeError(f"{n} must be contiguous.")
+
+
+#: Start alignment of ``csrc/fp4_moe_sm90.cu``'s workspace; SM100's buffer view is 128 B aligned.
+_WORKSPACE_ALIGN = 256
+
+
+def _check_workspace_buffer(ws: torch.Tensor, device: torch.device, need: int) -> None:
+    """SM100's checks of a ``workspace_buffer`` (its getWorkspaceInfo), in its order and words;
+    ``need`` bytes from the view's start, its alignment padding included. As the binding's
+    TVM_FFI_ICHECK, which Python raises as ``RuntimeError``."""
+    if ws.dtype not in (torch.int8, torch.uint8):
+        raise RuntimeError(
+            "workspace_buffer dtype must be int8 or uint8, got "
+            f"{str(ws.dtype).replace('torch.', '')}"
+        )
+    if ws.dim() != 1:
+        raise RuntimeError(f"workspace_buffer must be 1-D, got ndim={ws.dim()}")
+    if ws.device.type != "cuda":
+        raise RuntimeError("workspace_buffer must be a CUDA tensor")
+    if ws.device.index != device.index:
+        raise RuntimeError(
+            f"workspace_buffer device ({ws.device.index}) does not match input "
+            f"device ({device.index})"
+        )
+    if ws.shape[0] < need:
+        raise RuntimeError(
+            f"workspace_buffer too small: need {need} bytes, got {ws.shape[0]}"
+        )
+    if not ws.is_contiguous():
+        raise RuntimeError("workspace_buffer must be contiguous")
+    if ws.data_ptr() % 128 != 0:
+        raise RuntimeError(
+            "workspace_buffer data pointer must be 128-byte aligned "
+            "(torch.empty on CUDA satisfies this by default)"
+        )
+
+
+def _check_trtllm_workspace(
+    ws: torch.Tensor, device: torch.device, returns_intermediates: bool
+) -> None:
+    """SM100's TRT-LLM launcher checks of a ``workspace_buffer`` (bind_workspace_buffer, its
+    ``do_finalize``), in its order and words; no size check (what does not fit is allocated)."""
+    if returns_intermediates:
+        raise RuntimeError(
+            "workspace_buffer requires do_finalize=True and is incompatible with "
+            "gemm1_lora_delta, because returned intermediates cannot live in a shared workspace."
+        )
+    if ws.dtype not in (torch.int8, torch.uint8):
+        raise RuntimeError(
+            "workspace_buffer dtype must be uint8 or int8, got "
+            f"{str(ws.dtype).replace('torch.', '')}"
+        )
+    if ws.dim() != 1:
+        raise RuntimeError(f"workspace_buffer must be 1-D, got ndim={ws.dim()}")
+    if not ws.is_contiguous():
+        raise RuntimeError("workspace_buffer must be contiguous.")
+    if ws.device.type != "cuda" or ws.device.index != device.index:
+        raise RuntimeError(
+            "workspace_buffer must be on the same CUDA device as hidden_states."
+        )
+    if ws.data_ptr() % _WORKSPACE_ALIGN:
+        raise RuntimeError(
+            f"workspace_buffer must be {_WORKSPACE_ALIGN}-byte aligned "
+            "(torch.empty on CUDA satisfies this)."
+        )
+
+
+class _CarveAllocator:
+    """SM100's TensorAllocator (TRT-LLM launcher): a call's tensors, in allocation order, from
+    offset 0 of the caller's buffer, each on a 256 B boundary; one past its end is allocated
+    (the cursor stays). Without a buffer every tensor is allocated. A buffer shared by launches
+    needs the caller's stream order, as SM100's."""
+
+    def __init__(self, buf: Optional[torch.Tensor]):
+        self.buf = None if buf is None else buf.view(torch.uint8)
+        self.used = 0
+
+    def alloc(self, shape, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        nbytes = math.prod(shape) * dtype.itemsize
+        offset = -(-self.used // _WORKSPACE_ALIGN) * _WORKSPACE_ALIGN
+        if self.buf is None or offset + nbytes > self.buf.shape[0]:
+            return torch.empty(shape, dtype=dtype, device=device)
+        self.used = offset + nbytes
+        return self.buf[offset : offset + nbytes].view(dtype).view(shape)
+
+
+# ---------------------------------------------------------------------------------------
+# Entry points: the SM100+ public APIs' arguments, their M3 tuples on SM90.
+# ---------------------------------------------------------------------------------------
+
+
+def trtllm_fp4_sm90_moe(
+    a: Dict[str, Any], ids: torch.Tensor, weights: torch.Tensor
+) -> List[torch.Tensor]:
+    """``trtllm_fp4_block_scale_moe`` / ``_routed_moe`` (their arguments ``a``; ``tactic`` an SM90
+    tactic or -1) on SM90 with the global expert ``ids`` and BF16 ``weights``: NVFP4 x NVFP4,
+    per token or per tensor."""
+    x, x_scale, pt = a["hidden_states"], a["hidden_states_scale"], a["per_token_scale"]
+    act = ActivationType(a["activation_type"])
+    s1, s_gate, s2 = (
+        a[f"output{i}_scalar"] for i in ("1_scale", "1_scale_gate", "2_scale")
+    )
+    recipe = resolve_nvfp4_4over6(a["nvfp4_4over6"]) if pt is not None else None
+    # As SM100: Swiglu's and SiTU's alpha, beta and limit, SwigluStep's limit, the biases
+    params = {
+        ActivationType.Swiglu: ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
+        ActivationType.Situ: ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
+        ActivationType.SwigluStep: ("gemm1_clamp_limit",),
+    }.get(act, ())
+    # SM100's FP4 launcher passes them on for any activation, with its per-expert checks only
+    # under fused shared experts, and the non-gated kernels ignore them: accepted, not read
+    ignored = (
+        ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+        if act in (ActivationType.Relu2, ActivationType.Identity)
+        else ()
+    )
+    biases = ("gemm1_bias", "gemm2_bias")
+    # SM100 has no SiTU GEMM1 kernel with a BiasType::Mn delta
+    lora_ok = () if act == ActivationType.Situ else ("gemm1_lora_delta",)
+    if act == ActivationType.SwigluStep and (
+        a.get("gemm1_alpha") is not None or a.get("gemm1_beta") is not None
+    ):  # as SM100's launcher
+        raise ValueError("SwigluStep takes no gemm1_alpha or gemm1_beta.")
+    loc = _check_localized(a, x)
+    if a.get("routing_metadata") is not None and (
+        a.get("gemm1_lora_delta") is not None
+        or a.get("_nfse")
+        or a.get("workspace_buffer") is not None
+        or a.get("fc2_input_out") is not None
+    ):
+        # core.py's check of the SM100 op, which SM90's early return skips; routing_metadata
+        # alone is rejected below with the others SM90 does not support
+        raise ValueError(
+            "routing_metadata supports neither gemm1_lora_delta, fused shared experts, "
+            "workspace_buffer nor fc2_input_out"
+        )
+    fo, inter, top_k = a.get("fc2_input_out"), a["intermediate_size"], ids.shape[1]
+    if fo is not None and (  # SM100's checks
+        not isinstance(fo, (tuple, list)) or len(fo) != 3
+        or pt is None or a.get("_nfse") or inter % 16
+        or any(not t.is_contiguous() or t.dim() < 2 or t.shape[0] < x.shape[0]
+               or t.shape[1] != top_k or t.device != x.device for t in fo)
+        or (fo[0].dtype, fo[0].shape[2:]) != (torch.uint8, (inter // 2,)) or fo[0].data_ptr() % 8
+        or fo[1].dtype not in (torch.uint8, torch.float8_e4m3fn)
+        or fo[1].shape[2:] != (inter // 16,) or (fo[2].dtype, fo[2].dim()) != (torch.float32, 2)
+    ):  # fmt: skip
+        raise ValueError(
+            "fc2_input_out takes per_token_scale without fused shared experts or routing "
+            "metadata, three tensors on the input's device: uint8 codes [>= num_tokens, "
+            "top_k, intermediate_size / 2] (8 B aligned), E4M3 or uint8 block scales [..., "
+            "intermediate_size / 16], FP32 token scales [>= num_tokens, top_k], contiguous."
+        )
+    unsupported = [
+        n
+        for n in (
+            "gemm1_bias",
+            "gemm1_alpha",
+            "gemm1_beta",
+            "gemm1_clamp_limit",
+            "gemm2_bias",
+            "gemm1_lora_delta",
+            "routing_metadata",
+        )
+        if a.get(n) is not None and n not in params + ignored + biases + lora_ok
+    ]
+    if (
+        x.dtype != torch.uint8
+        or x_scale is None
+        or not sm90_fp4_moe_supports(
+            "trtllm", per_token=pt is not None, activation_type=int(act)
+        )
+        or unsupported
+        or None in (s1, s_gate, s2)
+        or (s_gate.dim() > 1 and not a.get("_nfse"))  # SM100's check below with them
+        or a["gemm1_weights"].dtype != torch.uint8
+    ):
+        raise _not_on_sm90(
+            "TRT-LLM FP4 MoE outside NVFP4 x NVFP4 or with "
+            f"{act.name}{' per token' if pt is not None else ''} (set: {unsupported})"
+        )
+    if "hidden_states_scale_layout" in a:  # SM100's: linear only
+        resolve_moe_act_sf_layout(a["hidden_states_scale_layout"])
+    tokens, hidden = x.shape[0], x.shape[1] * 2
+    # SM100's checks, in its order: GEMM2's N (roundUp(valid hidden, 128) <= hidden), unfinalized
+    # rows as wide as the hidden size, a finalized output exactly valid_hidden_size wide.
+    from ..core import (
+        _check_valid_hidden_size_supports_finalize,
+        _infer_trtllm_moe_output_hidden_size,
+        _round_up,
+    )
+
+    vh, vi = a.get("valid_hidden_size"), a.get("valid_intermediate_size")
+    finalize, out = a["do_finalize"], a["output"]
+    rh = _infer_trtllm_moe_output_hidden_size(hidden, vh)
+    _check_valid_hidden_size_supports_finalize(vh, finalize, hidden)
+    if finalize and out is not None:
+        # core.py's checks of the SM100 op, in its order
+        check_shape_dtype_device(out, None, torch.bfloat16, x.device, "output")
+        if out.dim() != 2 or out.shape[1] == 0:  # SM100 fails these in its launcher
+            raise _not_on_sm90("an output other than 2-D with columns")
+        assert out.shape[0] == tokens, (
+            f"output.shape[0]={out.shape[0]} must be equal to {tokens}"
+        )
+        assert out.shape[1] <= hidden, (
+            f"output.shape[1]={out.shape[1]} must be less than or equal to {hidden}"
+        )
+        if vh is not None and out.shape[1] != vh:
+            raise ValueError(
+                f"output.shape[1] must equal valid_hidden_size={vh} when "
+                f"valid_hidden_size is provided, got {out.shape[1]}"
+            )
+    if pt is not None and (
+        pt.dtype != torch.float32 or pt.numel() != tokens or not pt.is_contiguous()
+    ):
+        raise ValueError("per_token_scale must be FP32 [num_tokens], contiguous.")
+    if x_scale.numel() != tokens * (hidden // 16):
+        raise _not_on_sm90(
+            "hidden_states_scale other than linear [num_tokens, hidden / 16]"
+        )
+    # SM100's experts: the local ones, then the fused shared (every token's last slots)
+    nfse = a.get("_nfse") or 0
+    experts, inter = a["local_num_experts"] + nfse, a["intermediate_size"]
+    for n, v, padded in (
+        ("valid_hidden_size", vh, hidden),
+        ("valid_intermediate_size", vi, inter),
+    ):  # as SM100's launcher
+        if v is not None and not 0 < v <= padded:
+            raise ValueError(
+                f"{n}={v} must be positive and <= padded dimension {padded}"
+            )
+    # GEMM1 and GEMM2 run on the leading valid rows / K of the padded weights, as SM100's
+    # roundUp(valid, 128) (at most the padded size); the padding past them is never read.
+    ri = inter if vi is None else min(_round_up(vi, 128), inter)
+    # SM100's per-expert checks, in its order: SwigluStep's limit, then with fused shared
+    # experts the expert-major tensors and the other activation parameters
+    first = params if act == ActivationType.SwigluStep else ()
+    for n in first:
+        _check_per_expert_param(a.get(n), n, x, experts)
+    if nfse:
+        each = "must be local_num_experts + num_fused_shared_experts."
+        for n in ("gemm1", "gemm2"):
+            if a[f"{n}_weights"].shape[0] != experts:
+                raise RuntimeError(f"{n} weights dim 0 {each}")
+        # SM100 passes gemm1_lora_delta in gemm1_bias's place, so a delta fails as gemm1_bias
+        g1 = a.get("gemm1_lora_delta")
+        for n, t, d in (
+            ("output1_scales_scalar", s1, 1),
+            ("output1_scales_gate_scalar", s_gate, 1),
+            ("output2_scales_scalar", s2, 1),
+            *(
+                (n, g1 if g1 is not None and n == "gemm1_bias" else a.get(n), 2)
+                for n in biases
+            ),
+        ):
+            if t is not None and t.dim() != d:
+                raise RuntimeError(f"{n} must be {d}D.")
+            if t is not None and t.shape[0] != experts:
+                raise RuntimeError(f"{n} dim 0 {each}")
+    for n in params + ignored:
+        t = a.get(n)
+        if n in first:
+            continue
+        if nfse:
+            _check_per_expert_param(t, n, x, experts)
+        elif (
+            n not in ignored
+            and t is not None
+            and (
+                t.dtype != torch.float32
+                or t.shape != (experts,)
+                or t.device != x.device
+            )
+        ):  # SM100 checks none of them without fused shared experts; SM90 reads [experts]
+            raise ValueError(
+                f"{n} must be FP32 [local_num_experts] on the input's device."
+            )
+    gated = act.is_gated
+    lora = a.get("gemm1_lora_delta")
+    # records' check. SM100's FP4 entry passes the delta in gemm1_bias's place, so a per-expert
+    # gemm1_bias beside it is neither read nor checked
+    if lora is not None:
+        if not gated or lora.dtype != torch.bfloat16 or lora.shape != (
+            tokens, top_k, 2 * inter
+        ) or lora.device != x.device:  # fmt: skip
+            raise ValueError(
+                "gemm1_lora_delta takes a gated activation, BF16 [num_tokens, top_k, 2 * "
+                "intermediate_size]."
+            )
+        lora = lora.contiguous()
+    # TRT-LLM's biases: FP32 on the weights' (shuffled) rows, in accumulator units
+    bias = [
+        None if lora is not None and n == "gemm1_bias" else a.get(n) for n in biases
+    ]
+    for n, t, rows in zip(biases, bias, (inter * (2 if gated else 1), rh), strict=True):
+        if t is not None and (
+            t.dtype != torch.float32
+            or t.shape != (experts, rows)
+            or t.device != x.device
+        ):
+            raise ValueError(
+                f"{n} must be FP32 [local_num_experts + num_fused_shared_experts, "
+                f"{rows}] on the input's device."
+            )
+    if bias[0] is not None:  # the leading valid rows (shuffled within each 32 rows)
+        bias[0] = bias[0][:, : ri * (2 if gated else 1)]
+    bias = [None if t is None else t.contiguous() for t in bias]
+    if finalize and out is None and vh is not None:
+        out = torch.empty(tokens, vh, dtype=torch.bfloat16, device=x.device)
+    w1 = sm90_weight_view(
+        "trtllm",
+        a["gemm1_weights"],
+        a["gemm1_weights_scale"],
+        rows=inter * (2 if gated else 1),
+        k=hidden,
+        gated=gated,
+        scale_kind="nvfp4",
+    )
+    w2 = sm90_weight_view(
+        "trtllm",
+        a["gemm2_weights"],
+        a["gemm2_weights_scale"],
+        rows=rh,
+        k=inter,
+        gated=False,
+        scale_kind="nvfp4",
+    )
+    w1 = replace(w1, rows=ri * (2 if gated else 1), half_rows=ri if gated else 0, k=rh)
+    w2 = replace(w2, k=ri)
+    # The full-width weights are checked; a localized launch computes on its shards, as SM100
+    localized = None
+    if loc is not None:
+        shards = loc[0]
+        localized = (
+            [
+                sm90_weight_view(
+                    "trtllm",
+                    shards[4 * d + 2 * j],
+                    shards[4 * d + 2 * j + 1],
+                    rows=(inter, hidden // 2)[j],
+                    k=(hidden, inter)[j],
+                    gated=j == 0,
+                    scale_kind="nvfp4",
+                )
+                for d in range(len(shards) // 4)
+                for j in range(2)
+            ],
+            loc[1],
+            loc[2],
+        )
+    # As SM100: GEMM1 under the gate scalar, GEMM2 input under output1_scale_scalar (gated but
+    # SiTU over the gate scalar, SiTU's inside the activation): GEMM1's NVFP4 output global
+    # scale per tensor, per token the factor of GEMM1's BF16 rows, as SM100's FC1 output. The
+    # limits are in accumulator units.
+    alpha1 = _per_expert(s_gate, experts)
+    fc2 = _per_expert(s1, experts)
+    fc2 = fc2 / alpha1 if gated and act != ActivationType.Situ else fc2
+    alpha2 = _per_expert(s2, experts)
+    limit = a.get("gemm1_clamp_limit") if params else None
+    act_params = (None, None, None if limit is None else limit * alpha1)
+    act1 = act
+    if act == ActivationType.Situ:  # TRT-LLM's defaults: alpha 1, beta 1
+        one = torch.ones(experts, dtype=torch.float32, device=x.device)
+        ab = (a.get("gemm1_alpha"), a.get("gemm1_beta"))
+        act_params = (
+            *(one if t is None else t.contiguous() for t in ab),
+            act_params[2],
+        )
+    elif act == ActivationType.Swiglu and any(a.get(n) is not None for n in params):
+        # TRT-LLM's SwiGLU with parameters is SwigluBias (defaults alpha 1, beta 0, no limit):
+        # alpha on the dequantized gate, beta in accumulator units as the limit.
+        act1 = ActivationType.SwigluBias
+        alpha, beta = a.get("gemm1_alpha"), a.get("gemm1_beta")
+        act_params = (
+            None if alpha is None else alpha.contiguous(),
+            None if beta is None else beta * alpha1,
+            act_params[2],
+        )
+    if pt is None:
+        epi1 = Sm90EpilogueSpec(
+            int(act1),
+            fq=Fq.NVFP4,
+            recipe=fp4_sm90_recipe_bits(None),
+            alpha=alpha1,
+            act_params=act_params,
+            bias=bias[0],
+            fq_global=fc2.contiguous(),
+        )
+    else:
+        epi1 = Sm90EpilogueSpec(
+            int(act1), alpha=alpha1, act_params=act_params, bias=bias[0], out_scale=fc2
+        )
+    ws = a.get("workspace_buffer")
+    if ws is not None:  # SM100's bind_workspace_buffer, as its launch starts
+        _check_trtllm_workspace(ws, x.device, not finalize or lora is not None)
+    return sm90_fp4_moe(
+        x.view(torch.uint8),
+        x_scale.view(torch.uint8).reshape(tokens, hidden // 16),
+        w1,
+        w2,
+        Sm90Routing(
+            ids,
+            weights,
+            ids.shape[1],
+            a["num_experts"] + nfse,
+            a["local_expert_offset"],
+            experts,
+        ),
+        epi1,
+        Sm90EpilogueSpec(
+            int(ActivationType.Identity), gemm2=True, alpha=alpha2, bias=bias[1]
+        ),
+        out=out if finalize else None,
+        tactic=a.get("tactic", -1),
+        recipe=recipe,
+        exact=_exact(),
+        token_scale=pt,
+        do_finalize=finalize,
+        tune_max_num_tokens=a["tune_max_num_tokens"],
+        localized=localized,
+        fc2_input_out=fo,
+        gemm1_lora_delta=lora,
+        trtllm_workspace=ws,
+    )
+
+
+def cutlass_fp4_sm90_moe(a: Dict[str, Any], recipe) -> torch.Tensor:
+    """``cutlass_fused_moe`` (its arguments ``a``, ``output`` allocated; unset optional ones at
+    their defaults, ``tactic`` an SM90 tactic or -1, ``profile_ids`` SM100's two ids) on SM90
+    with the resolved ``recipe``: NVFP4 x NVFP4 per tensor, BF16/FP16 or NVFP4 input."""
+    qs, act = a["quant_scales"], ActivationType(a["activation_type"])
+    # As SM100's argument conversion (quant_scales is an optional list of tensors), then its
+    # runMoe: the cluster first, the quant scales' count, the activation global scales.
+    for i, t in enumerate(qs or ()):
+        if not isinstance(t, torch.Tensor):
+            raise TypeError(
+                f"quant_scales[{i}] must be a tensor, not {type(t).__name__}"
+            )
+    if a.get("cluster_size", 1) != 1 or a.get("cluster_rank", 0) != 0:
+        raise RuntimeError("smart_router is supported in min_latency mode")
+    if qs is None:
+        raise RuntimeError("Expecting quant scales for nvfp4 quantization")
+    if len(qs) != 6:
+        raise RuntimeError("Expecting 6 quant scales for nvfp4 quantization")
+    x, x_sf, out = a["input"], a.get("input_sf"), a["output"]
+    fc1, fc2 = a["fc1_expert_weights"], a["fc2_expert_weights"]
+    _check_act_globals(qs[0], qs[3], fc2.shape[0])
+    profile_ids = a.get("profile_ids")
+    if profile_ids is not None and len(profile_ids) != 2:
+        raise ValueError("profile_ids must contain [gemm1_profile, gemm2_profile]")
+    biases = (a.get("fc1_expert_biases"), a.get("fc2_expert_biases"))
+    swiglu = tuple(a.get(n) for n in ("swiglu_alpha", "swiglu_beta", "swiglu_limit"))
+    # As cutlass_fused_moe: Swiglu with SwiGLU parameters runs SwigluBias; SiTU reads situ_beta
+    # and situ_linear_beta.
+    if act == ActivationType.Swiglu and any(t is not None for t in swiglu):
+        act = ActivationType.SwigluBias
+    act_params = (
+        (a.get("situ_beta"), a.get("situ_linear_beta"), None)
+        if act == ActivationType.Situ
+        else swiglu
+    )
+    codes = x.dtype == torch.uint8
+    ep_size, ep_rank = a.get("ep_size", 1), a.get("ep_rank", 0)
+    if (
+        act not in SM90_FP4_ACTIVATIONS
+        or a["output_dtype"] not in (torch.bfloat16, torch.float16)
+        or codes != (x_sf is not None)
+        or (not codes and x.dtype not in (torch.bfloat16, torch.float16))
+        or qs[2].numel() != fc1.shape[0]
+        or qs[5].numel() != fc1.shape[0]
+    ):
+        raise _not_on_sm90("CUTLASS FP4 MoE outside NVFP4 x NVFP4 per tensor")
+    if (biases[0] is None) != (biases[1] is None):
+        raise ValueError("fc1_expert_biases and fc2_expert_biases go together")
+    if (
+        a.get("tp_rank", 0) != 0
+    ):  # as cutlass_fused_moe's finalize: fc2 biases on TP rank 0
+        biases = (biases[0], None)
+    gated = act.is_gated
+    experts, hidden = fc2.shape[0], fc2.shape[1]
+    inter = fc2.shape[2] * (16 if fc2.dtype == torch.int64 else 2)
+    if fc1.shape[0] != experts or fc1.shape[1] != inter * (2 if gated else 1):
+        raise ValueError(
+            "fc1_expert_weights must be [num_experts, (2 *) intermediate_size, ...] as "
+            "fc2_expert_weights."
+        )
+    # As cutlass_fused_moe's checkedActivationParams: every supplied per-expert activation
+    # parameter is checked, whichever ones the activation reads.
+    for n in (
+        "swiglu_alpha",
+        "swiglu_beta",
+        "swiglu_limit",
+        "situ_beta",
+        "situ_linear_beta",
+    ):
+        t = a.get(n)
+        if t is None:
+            continue
+        for bad, msg in (  # SM100's checks, in its order
+            (not t.is_cuda, f"{n} must be a CUDA tensor"),
+            (not t.is_contiguous(), f"{n} must be contiguous"),
+            (t.dtype != torch.float32, f"Inconsistency of Tensor type: {n}"),
+            (t.dim() != 1, f"{n} must be a 1D tensor"),
+            (t.numel() != experts, f"{n} must have {experts} element(s)."),
+        ):
+            if bad:
+                raise RuntimeError(msg)
+    w1 = sm90_weight_view(
+        "cutlass",
+        fc1.view(torch.uint8),
+        qs[1],
+        rows=fc1.shape[1],
+        k=hidden,
+        gated=gated,
+        scale_kind="nvfp4",
+    )
+    w2 = sm90_weight_view(
+        "cutlass",
+        fc2.view(torch.uint8),
+        qs[4],
+        rows=hidden,
+        k=inter,
+        gated=False,
+        scale_kind="nvfp4",
+    )
+    bits = fp4_sm90_recipe_bits(recipe)
+    sm90_fp4_moe(
+        x.view(torch.uint8) if codes else x,
+        x_sf,
+        w1,
+        w2,
+        Sm90Routing(
+            a["token_selected_experts"],
+            a["token_final_scales"],
+            a["token_selected_experts"].shape[1],
+            experts * ep_size,
+            experts * ep_rank,
+            experts,
+        ),
+        Sm90EpilogueSpec(
+            int(act),
+            fq=Fq.NVFP4,
+            recipe=bits,
+            alpha=qs[2],
+            act_params=act_params,
+            bias=biases[0],
+            fq_global=_device_fp32(qs[3], "the GEMM2 input global scale"),
+        ),
+        Sm90EpilogueSpec(
+            int(ActivationType.Identity),
+            gemm2=True,
+            out_dtype=a["output_dtype"],
+            alpha=qs[5],
+            bias=biases[1],
+        ),
+        out=out,
+        tactic=a.get("tactic", -1),
+        # As SM100's runMoe, after the input checks: ids of GEMM1's then GEMM2's tactics, -1 a
+        # GEMM's default, no tuner.
+        profile_ids=profile_ids,
+        recipe=recipe,
+        exact=_exact(),
+        x_global=None if codes else _device_fp32(qs[0], "the input global scale"),
+        x_sf_swizzled=codes and a.get("swizzled_input_sf", False),
+        tune_max_num_tokens=a.get("tune_max_num_tokens", 8192),
+        # As SM100's unfused finalize: under all-to-all the rows without a local expert stay
+        keep_unrouted=a.get("enable_alltoall", False) and ep_size > 1,
+        workspace_buffer=a.get("workspace_buffer"),
+    )
+    return out
+
+
+_LOG2E = 1.4426950408889634
+
+
+def _w4a16_epilogue(
+    activation: ActivationType, a: Dict[str, Any]
+) -> Tuple[ActivationType, Sm90W4A16]:
+    """GEMM1's activation of SM100's W4A16 and its constants (``Sm90W4A16``): SiTU for
+    ``situ_beta`` (``swiglu_*`` unread), else ``activation``, whose ``swiglu_*`` only SwiGLU reads."""
+    situ, linear = a["situ_beta"], a["situ_linear_beta"]
+    if situ is not None:
+        return ActivationType.Situ, Sm90W4A16(
+            (
+                situ,
+                1.0 / situ,
+                0.0 if linear is None else linear,
+                0.0 if linear is None else 1.0 / linear,
+            ),
+            0 if linear is None else W4A16_FLAG_SITU_LINEAR_BETA,
+        )
+    if activation == ActivationType.Swiglu:
+        swiglu = (a["swiglu_alpha"], a["swiglu_beta"], a["swiglu_limit"])
+        defaults = (DEFAULT_SWIGLU_ALPHA, DEFAULT_SWIGLU_BETA, DEFAULT_SWIGLU_LIMIT)
+        if swiglu == defaults:
+            return activation, Sm90W4A16()
+        return activation, Sm90W4A16(
+            (-swiglu[0] * _LOG2E, swiglu[1], swiglu[2], 0.0), W4A16_FLAG_SWIGLU_PARAMS
+        )
+    return activation, Sm90W4A16()
+
+
+def _cute_dsl_w4a16_sm90_moe(
+    a: Dict[str, Any], activation: ActivationType, swap_ab: bool
+) -> torch.Tensor:
+    """``cute_dsl_fused_moe``'s ``quant_mode="w4a16"`` (BF16 ``x`` x NVFP4 weights, BF16 output) on
+    SM90, with SM100's checks of it in SM100's order (the caller ran the common ones and ClampedRelu2's): the
+    activation and its parameters are ``_w4a16_epilogue``'s. ``use_fused_finalize`` (SM100's
+    GEMM2 BF16 reduction of the rows scaled by alpha x weight) sets ``W4A16_FLAG_FUSED_FINALIZE``:
+    GEMM2 takes the same FP32 scale per row and the finalize sums the BF16 rows in BF16 in slot
+    order (deterministic; a separate finalize kernel as the unfused one)."""
+    x, ids, weights = a["x"], a["token_selected_experts"], a["token_final_scales"]
+    w1w, w2w = a["w1_weight"], a["w2_weight"]
+    if a["localized_weights"] is not None:
+        raise NotImplementedError(
+            "locality-domain localization is implemented for the W4A4 path only, "
+            "got quant_mode='w4a16'."
+        )
+    if (
+        a["x_sf"] is not None
+        or a["fc2_input_scale"] is not None
+        or a["per_token_scale"] is not None
+    ):
+        raise ValueError(
+            "x_sf, fc2_input_scale, and per_token_scale must be None "
+            "when quant_mode='w4a16'"
+        )
+    if a["output_dtype"] != torch.bfloat16:
+        raise ValueError("W4A16 only supports BF16 output")
+    if x.dtype != torch.bfloat16:
+        raise TypeError(f"W4A16 requires x.dtype=torch.bfloat16, got {x.dtype}")
+    if weights.dtype != torch.float32:
+        raise TypeError(
+            "W4A16 requires token_final_scales.dtype=torch.float32, "
+            f"got {weights.dtype}"
+        )
+    tokens, hidden = int(ids.size(0)), int(w2w.size(1))
+    if tuple(x.shape) != (tokens, hidden):
+        raise ValueError(
+            f"x must have shape {(tokens, hidden)} for W4A16, got {tuple(x.shape)}"
+        )
+    out = a["moe_output"]
+    if out is None:
+        out = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=x.device)
+    if tuple(out.shape) != (tokens, hidden):
+        raise ValueError(
+            f"moe_output must have shape {(tokens, hidden)}, got {tuple(out.shape)}"
+        )
+    inter = int(w2w.size(2)) * 2
+    act1, w4a16 = _w4a16_epilogue(activation, a)
+    if a["use_fused_finalize"]:
+        w4a16 = replace(w4a16, flags=w4a16.flags | W4A16_FLAG_FUSED_FINALIZE)
+    gated = act1.is_gated
+    rows = inter * (2 if gated else 1)
+    if int(w1w.size(1)) != rows:
+        raise ValueError(
+            f"w1_weight dim 1 must be {rows} for {activation.name}, got {w1w.size(1)}"
+        )
+    local = a["num_local_experts"]
+    local = a["num_experts"] if local is None else local
+    w1 = sm90_weight_view(
+        "cute_dsl",
+        w1w,
+        a["w1_weight_sf"],
+        rows=rows,
+        k=hidden,
+        gated=gated,
+        scale_kind="nvfp4",
+        pair_g=16 if swap_ab else 64,
+    )
+    w2 = sm90_weight_view(
+        "cute_dsl",
+        w2w,
+        a["w2_weight_sf"],
+        rows=hidden,
+        k=inter,
+        gated=False,
+        scale_kind="nvfp4",
+    )
+    sm90_fp4_moe(
+        x,
+        None,
+        w1,
+        w2,
+        Sm90Routing(
+            ids,
+            weights,
+            int(ids.size(1)),  # as SM100: the routing width, not ``top_k``
+            a["num_experts"],
+            a["local_expert_offset"],
+            local,
+        ),
+        Sm90EpilogueSpec(int(act1), alpha=a["w1_alpha"]),
+        Sm90EpilogueSpec(
+            int(ActivationType.Identity),
+            gemm2=True,
+            out_dtype=torch.bfloat16,
+            alpha=a["w2_alpha"],
+        ),
+        out=out,
+        tactic=a["tactic"] if a.get("tactic") is not None else -1,
+        exact=_exact(),
+        w4a16=w4a16,
+    )
+    return out
+
+
+def cute_dsl_fp4_sm90_moe(
+    a: Dict[str, Any], activation: ActivationType, swap_ab: bool
+) -> torch.Tensor:
+    """``cute_dsl_fused_moe`` (its arguments ``a``) on SM90: W4A4 per token or per tensor,
+    weights in the CuTe DSL layout (group interleave 64, or 16 with ``swap_ab``). Per tensor
+    ``x`` is quantized by the caller, ``w1_alpha`` dequantizes GEMM1, ``fc2_input_scale`` is
+    GEMM2's input encode scale and ``w2_alpha`` carries its inverse, as SM100's tuple.
+    SwiGLU's ``swiglu_alpha``, ``swiglu_beta`` and ``swiglu_limit`` (SM100's scalars, in real
+    units) run as ``SwigluBias`` with those scalars for every expert. ``quant_mode="w4a16"``
+    is ``_cute_dsl_w4a16_sm90_moe``'s."""
+    if a["quant_mode"] == "w4a16":
+        return _cute_dsl_w4a16_sm90_moe(a, activation, swap_ab)
+    x, x_sf, pt = a["x"], a["x_sf"], a["per_token_scale"]
+    recipe = resolve_nvfp4_4over6(a["nvfp4_4over6"]) if pt is not None else None
+    swiglu = (a["swiglu_alpha"], a["swiglu_beta"], a["swiglu_limit"])
+    defaults = (DEFAULT_SWIGLU_ALPHA, DEFAULT_SWIGLU_BETA, DEFAULT_SWIGLU_LIMIT)
+    output_dtype = a["output_dtype"]
+    if a["quant_mode"] == "w4a4":  # SM100's checks of these inputs, in its order
+        if x.dtype is not torch.uint8:
+            raise TypeError("quant_mode='w4a4' requires packed uint8 input")
+        if x_sf is None:
+            raise ValueError("x_sf is required for block-scaled MoE")
+        if a["fc2_input_scale"] is None:
+            raise ValueError("fc2_input_scale is required when quant_mode='w4a4'")
+    if (
+        a["quant_mode"] != "w4a4"
+        or activation not in (ActivationType.Swiglu, ActivationType.Relu2)
+        or a["situ_beta"] is not None
+        or a["clamped_relu2_limit"] is not None
+        or a["routing_weights_before_fc2"]
+        or a["localized_weights"] is not None
+    ):
+        raise _not_on_sm90(
+            "CuTe DSL FP4 MoE outside W4A4 with Swiglu or Relu2 (per-token or per-tensor "
+            "activation scales)"
+        )
+    tokens, hidden = x.shape[0], x.shape[1] * 2
+    if pt is not None and (
+        pt.dtype != torch.float32 or pt.numel() != tokens or not pt.is_contiguous()
+    ):
+        raise ValueError("per_token_scale must be FP32 [num_tokens], contiguous.")
+    # As SM100's quantizer of the GEMM2 input: its rows under this global (encode) scale, one
+    # for all experts. Per tensor, SM100's GEMM1 epilogue reads element 0 through a float32
+    # device pointer, so only such a tensor is taken (an empty one fails in the reshape); per
+    # token, SM100's quantizer takes exactly one value, tensor or float.
+    gsi = a["fc2_input_scale"]
+    if pt is None:
+        if not isinstance(gsi, torch.Tensor) or gsi.dtype != torch.float32:
+            raise TypeError("per-tensor fc2_input_scale must be a float32 tensor")
+        if gsi.device != x.device:
+            raise ValueError("per-tensor fc2_input_scale must be on the input device")
+        gsi = gsi.reshape(-1)[:1].reshape(1)
+    elif isinstance(gsi, torch.Tensor):
+        gsi = gsi.float().reshape(1).contiguous().to(x.device)
+    else:
+        gsi = torch.tensor([float(gsi)], dtype=torch.float32, device=x.device)
+    if x_sf.dtype not in (torch.uint8, torch.float8_e4m3fn):  # as _routed_nvfp4
+        raise TypeError("x_sf must have dtype uint8 or float8_e4m3fn")
+    if x_sf.numel() != tokens * (hidden // 16):
+        raise ValueError("x_sf must be linear: [num_tokens, hidden / 16] E4M3 scales.")
+    from ..cute_dsl.fused_moe import _intermediate_c_dtype
+
+    _intermediate_c_dtype(output_dtype)  # SM100's GEMM2 dtype check: BF16 or FP16 only
+    w1w, w2w = a["w1_weight"], a["w2_weight"]
+    inter = w2w.shape[2] * 2
+    gated = activation.is_gated
+    local = a["num_local_experts"]
+    local = a["num_experts"] if local is None else local
+    w1 = sm90_weight_view(
+        "cute_dsl",
+        w1w,
+        a["w1_weight_sf"],
+        rows=inter * (2 if gated else 1),
+        k=hidden,
+        gated=gated,
+        scale_kind="nvfp4",
+        pair_g=16 if swap_ab else 64,
+    )
+    w2 = sm90_weight_view(
+        "cute_dsl",
+        w2w,
+        a["w2_weight_sf"],
+        rows=hidden,
+        k=inter,
+        gated=False,
+        scale_kind="nvfp4",
+    )
+    out = a["moe_output"]
+    ids = a["token_selected_experts"]
+    if ids.shape[1:] != (a["top_k"],):
+        raise ValueError("token_selected_experts must be [num_tokens, top_k].")
+    act1, act_params = activation, (None, None, None)
+    if activation == ActivationType.Swiglu and swiglu != defaults:
+        # SM100's kernel: the gate clamped above and the up both ways at the limit, then
+        # gate * sigmoid(alpha * gate) * (up + beta); the scalars hold for every expert.
+        act1 = ActivationType.SwigluBias
+        act_params = tuple(
+            torch.full((local,), float(v), dtype=torch.float32, device=x.device)
+            for v in swiglu
+        )
+    if pt is not None:
+        epi1 = Sm90EpilogueSpec(
+            int(act1), alpha=a["w1_alpha"], act_params=act_params, fq_global=gsi
+        )
+    else:
+        epi1 = Sm90EpilogueSpec(
+            int(act1),
+            fq=Fq.NVFP4,
+            recipe=fp4_sm90_recipe_bits(None),
+            alpha=a["w1_alpha"],
+            act_params=act_params,
+            fq_global=gsi,
+        )
+    sm90_fp4_moe(
+        x.view(torch.uint8),
+        x_sf.view(torch.uint8).reshape(tokens, hidden // 16),
+        w1,
+        w2,
+        Sm90Routing(
+            ids,
+            a["token_final_scales"],
+            a["top_k"],
+            a["num_experts"],
+            a["local_expert_offset"],
+            local,
+        ),
+        epi1,
+        Sm90EpilogueSpec(
+            int(ActivationType.Identity),
+            gemm2=True,
+            out_dtype=output_dtype,
+            alpha=a["w2_alpha"],
+        ),
+        out=out,
+        tactic=a["tactic"] if a.get("tactic") is not None else -1,
+        recipe=recipe,
+        exact=_exact(),
+        token_scale=pt,
+    )
+    return out

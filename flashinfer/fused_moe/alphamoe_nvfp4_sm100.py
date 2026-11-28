@@ -30,6 +30,7 @@ from ..trace.templates.moe import (
 )
 from ..utils import (
     backend_requirement,
+    get_compute_capability,
     supported_compute_capability,
 )
 
@@ -1121,6 +1122,11 @@ def alphamoe_nvfp4_routed_moe(
     torch.Tensor
         The same ``out`` tensor after routed accumulation.
     """
+    if hidden_states.is_cuda and get_compute_capability(hidden_states.device)[0] == 9:
+        # The aligned API declines SM90 through backend_requirement; this one has no such gate.
+        raise NotImplementedError(
+            "alphamoe_nvfp4_routed_moe runs on SM100 and SM103; SM90 does not run it yet."
+        )
     _check_alphamoe_nvfp4_supported(
         hidden_states,
         hidden_states_scale,

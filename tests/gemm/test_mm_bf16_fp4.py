@@ -173,8 +173,9 @@ def _uses_exact_w4a16_reference(backend, device):
         if capability in ((10, 0), (10, 3), (10, 7)):
             # Every SM100-family tactic reduces the full K in one accumulator.
             return True
-        elif capability in ((11, 0), (12, 0), (12, 1)):
-            # These kernels can select split-K/GEMV and have separate layouts.
+        elif capability in ((9, 0), (11, 0), (12, 0), (12, 1)):
+            # These kernels can select split-K/GEMV and have separate layouts; SM90's wgmma
+            # kernel accumulates in its own order (torch reference, tolerance compare).
             return False
         else:
             raise ValueError(f"Unsupported cute-dsl compute capability {capability}")
@@ -307,6 +308,10 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
     SM100-family full-K tactics use zero tolerance; SM12x retains its
     existing split-K/GEMV accuracy checks. Shapes include K and M tails."""
     _skip_if_backend_unavailable("cute-dsl")
+    if get_compute_capability(torch.device("cuda")) == (9, 0):
+        pytest.skip(
+            "tactic runners of the SM100 / SM12x CuTe DSL kernels (not run on SM90)"
+        )
     from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
         _SM100_BF16_FP4_TACTICS,
         _bf16_fp4_cute_dsl_tactic_configs,
@@ -658,7 +663,12 @@ def test_cute_dsl_prepare_uses_architecture_specific_layout():
 
     b_p, sf_p, _ = prepare_bf16_fp4_weights(b_fp4, b_sf, alpha, backend="cute-dsl")
     major, minor = get_compute_capability(device)
-    if major * 10 + minor in (100, 103, 107):
+    if major * 10 + minor in (
+        90,
+        100,
+        103,
+        107,
+    ):  # SM90: the SM10x format (D10 default)
         assert b_p.dtype == torch.uint8
         assert b_p.shape == b_fp4.shape
         assert sf_p.data_ptr() == b_sf.data_ptr()

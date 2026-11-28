@@ -26,6 +26,7 @@
 
 #include <algorithm>
 
+#include "../../fp4_sm90/moe_layout.h"
 #include "../../tvm_ffi_utils.h"
 #include "cutlass_kernel_selector.h"
 #include "moe_gemm_kernels.h"
@@ -330,6 +331,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     mGemm2TacticCount = static_cast<int64_t>(gemm2_tactics.size());
     mAllProfiles = gemm1_tactics;
     mAllProfiles.insert(mAllProfiles.end(), gemm2_tactics.begin(), gemm2_tactics.end());
+    // SM90 NVFP4 runs on csrc/fp4_moe_sm90.cu, not on this runner: it has no tactics, and
+    // only get_workspace_size (the SM90 NVFP4 scratch size) is served.
+    mSm90Nvfp4Query = mAllProfiles.empty() && common::getSMVersion() == 90 && isNvfp4Quant();
+    if (!mSm90Nvfp4Query) {
+      requireTactics();
+    }
+  }
+
+  void requireTactics() const {
     TVM_FFI_ICHECK(!mAllProfiles.empty())
         << "No valid tactics available for fused moe op with the requested input combination "
            "Activation: "
@@ -798,6 +808,25 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   const char* kind() const final { return "fused_moe_runner"; }
   Optional<Function> GetFunction(const tvm::ffi::String& name) final {
+    if (mSm90Nvfp4Query && name == "get_workspace_size") {
+      // Bytes of csrc/fp4_moe_sm90.cu's scratch (fp4_sm90/moe_layout.h), by its local inter_size:
+      // as getWorkspaceSizes, the weights' own (TP-sliced) size, not divided by tp_size.
+      return Function::FromTyped([this](int64_t num_rows, int64_t hidden_size, int64_t inter_size,
+                                        int64_t num_experts_total, int64_t experts_per_token,
+                                        int64_t tp_size, int64_t tp_rank, int64_t ep_size,
+                                        int64_t ep_rank, bool min_latency_mode,
+                                        int64_t base_activation_type) -> int64_t {
+        TVM_FFI_ICHECK(ep_size > 0 && num_experts_total % ep_size == 0)
+            << "Number of experts must be a multiple of ep size";
+        const int64_t out_bytes = mOutputDtype.bits * mOutputDtype.lanes / 8;
+        return static_cast<int64_t>(flashinfer::fp4_sm90::moe_layout::query_bytes(
+            num_rows, experts_per_token, num_experts_total / ep_size, hidden_size, inter_size,
+            out_bytes));
+      });
+    }
+    if (mSm90Nvfp4Query) {
+      requireTactics();  // throws: only get_workspace_size is served
+    }
     if (name == "run_gemm_profile") {
       return Function::FromTyped(
           [this](TensorView input, TensorView fc1_expert_weights,
@@ -921,6 +950,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   };
 
   std::mutex mMutex;
+  bool mSm90Nvfp4Query{false};  // SM90 NVFP4: no tactics, get_workspace_size only
   std::shared_ptr<kernels::CutlassMoeFCRunnerInterface> mKernelRunner;
   std::shared_ptr<kernels::GemmProfilerBackend> mProfiler;
   DLDataType mActivationDtype;

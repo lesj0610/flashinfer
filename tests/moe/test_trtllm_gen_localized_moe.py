@@ -44,8 +44,8 @@ _EPILOGUE_TILE_M = 128
 
 
 def _skip_unless_sm10x():
-    if get_compute_capability(torch.device("cuda"))[0] != 10:
-        pytest.skip("trtllm-gen NVFP4 MoE needs an SM10x GPU")
+    if get_compute_capability(torch.device("cuda"))[0] not in (9, 10):
+        pytest.skip("trtllm-gen NVFP4 MoE needs an SM90 or SM10x GPU")
 
 
 @functools.cache

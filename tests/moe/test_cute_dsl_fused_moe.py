@@ -70,6 +70,7 @@ from .utils import (
     check_accuracy,
     compute_reference_moe_fp4,
     create_moe_tensors,
+    sm90_fp4_moe_runs,
 )
 
 
@@ -176,6 +177,39 @@ sm100_required = pytest.mark.skipif(
     reason="Requires CuteDSL MoE target SM100, SM103 or SM107",
 )
 sm10x_required = sm100_required
+
+
+# W4A4 per-token 4over6 with SwiGLU, which SM90 runs too.
+sm100_or_sm90_w4a4_4over6_required = pytest.mark.skipif(
+    not is_sm100_family()
+    and not sm90_fp4_moe_runs(
+        "cute_dsl",
+        per_token=True,
+        activation_type=ActivationType.Swiglu,
+    ),
+    reason="Requires CuteDSL MoE target SM100, SM103, SM107 or SM90",
+)
+
+# W4A4 SwiGLU per tensor, which SM90 runs too.
+sm90_w4a4_per_tensor_required = pytest.mark.skipif(
+    not sm90_fp4_moe_runs(
+        "cute_dsl",
+        per_token=False,
+        activation_type=ActivationType.Swiglu,
+    ),
+    reason="Requires an SM90 GPU",
+)
+
+# W4A16 (BF16 x NVFP4) SwiGLU, which SM90 runs too, with SM100's activations.
+sm90_w4a16_required = pytest.mark.skipif(
+    not sm90_fp4_moe_runs(
+        "cute_dsl",
+        per_token=False,
+        activation_type=ActivationType.Swiglu,
+        w4a16=True,
+    ),
+    reason="Requires an SM90 GPU",
+)
 
 mxfp8_required = pytest.mark.skipif(
     not (
@@ -3315,6 +3349,345 @@ class TestCuteDslFusedMoeFunctional:
 
 
 # =============================================================================
+# Test Class: SM90 entry (cute_dsl_fused_moe on Hopper)
+# =============================================================================
+
+
+@cute_dsl_available
+@sm90_w4a4_per_tensor_required
+class TestCuteDslFusedMoeSm90:
+    """``cute_dsl_fused_moe`` W4A4 on SM90: per-tensor activation scales and SwiGLU
+    ``swiglu_alpha``/``swiglu_beta``/``swiglu_limit``, as SM100 takes them. W4A16 (BF16 ``x``)
+    with SM100's activations, compared bit for bit with SM100's oracle at SM90's wgmma
+    accumulation."""
+
+    @staticmethod
+    def _run(
+        activation_type,
+        use_per_token_activation,
+        swap_ab,
+        swiglu=None,
+        num_tokens=128,
+        hidden_size=256,
+        intermediate_size=512,
+        num_experts=256,
+        top_k=2,
+        fc2_input_scale_tail=None,
+    ):
+        from flashinfer import cute_dsl_fused_moe
+
+        _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            gated=gated,
+            swap_ab=swap_ab,
+            use_per_token_activation=use_per_token_activation,
+        )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(tensors, "w4a4")
+        if (
+            fc2_input_scale_tail is not None
+        ):  # values after element 0, which must go unread
+            scale = api_inputs["fc2_input_scale"].reshape(-1)
+            api_inputs["fc2_input_scale"] = torch.cat(
+                [scale, fc2_input_scale_tail.to(scale)]
+            )
+        scalars = {} if swiglu is None else swiglu
+        result = cute_dsl_fused_moe(
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation_type=activation_type,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode("w4a4", swap_ab),
+            quant_mode="w4a4",
+            swap_ab=swap_ab,
+            **scalars,
+            **api_inputs,
+        )
+        assert result.shape == (num_tokens, hidden_size)
+        assert result.dtype == torch.bfloat16
+        assert not torch.isnan(result).any()
+
+        def reference(**swiglu_scalars):
+            return _compute_moe_quant_mode_reference(
+                tensors,
+                "w4a4",
+                swap_ab=swap_ab,
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation_type=activation_type,
+                **swiglu_scalars,
+                **reference_inputs,
+            )
+
+        return result, reference(**scalars), reference
+
+    @staticmethod
+    def _assert_close(result, ref):
+        # SM90 (wgmma) accumulates in another order than the swap-AB reference models.
+        passed, percent_within, atol = check_accuracy(result, ref)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    @pytest.mark.parametrize(
+        "use_per_token_activation", [False, True], ids=["per-tensor", "per-token"]
+    )
+    @pytest.mark.parametrize(
+        "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
+    )
+    def test_w4a4_accuracy(self, activation_type, use_per_token_activation, swap_ab):
+        """D02: per-tensor W4A4 (and the per-token one) at the default parameters."""
+        result, ref, _ = self._run(activation_type, use_per_token_activation, swap_ab)
+        self._assert_close(result, ref)
+
+    def test_fc2_input_scale_element_zero(self):
+        """Per tensor, SM100's GEMM1 epilogue reads element 0 of ``fc2_input_scale``."""
+        result, ref, _ = self._run(
+            ActivationType.Swiglu,
+            False,
+            False,
+            fc2_input_scale_tail=torch.full((3,), float("nan")),
+        )
+        self._assert_close(result, ref)
+
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    @pytest.mark.parametrize(
+        "use_per_token_activation", [False, True], ids=["per-tensor", "per-token"]
+    )
+    @pytest.mark.parametrize(
+        "swiglu",
+        [
+            pytest.param(
+                dict(swiglu_alpha=1.702, swiglu_beta=1.0, swiglu_limit=7.0), id="oai"
+            ),
+            pytest.param(dict(swiglu_limit=0.1), id="limit-only"),
+            pytest.param(
+                dict(swiglu_alpha=0.5, swiglu_beta=0.25, swiglu_limit=0.2),
+                id="all-bind",
+            ),
+        ],
+    )
+    def test_swiglu_params_accuracy(self, swiglu, use_per_token_activation, swap_ab):
+        """D05: non-default ``swiglu_*`` scalars, broadcast to every expert."""
+        result, ref, reference = self._run(
+            ActivationType.Swiglu, use_per_token_activation, swap_ab, swiglu=swiglu
+        )
+        default_ref = reference()
+
+        def rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
+            return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+        # The scalars must change the result, or the comparison below is vacuous.
+        assert rel_err(ref, default_ref) > 0.1
+        assert rel_err(result, ref) < 0.5 * rel_err(result, default_ref)
+        self._assert_close(result, ref)
+
+    @staticmethod
+    def _run_w4a16(
+        activation_type,
+        swap_ab=False,
+        top_k=2,
+        num_local_experts=256,
+        local_expert_offset=0,
+        use_fused_finalize=False,
+        edit_routing=None,
+        wrapper=False,
+        **scalars,
+    ):
+        """W4A16 against SM100's oracle (unfused finalize by default, as
+        ``_use_fused_finalize_for_quant_mode``); ``edit_routing`` edits the routing tensors
+        in place, ``wrapper`` runs ``CuteDslMoEWrapper`` instead of the functional API and
+        ``scalars`` are ``swiglu_*`` or ``situ_*``. Returns the result, the reference and a
+        function of the reference at other scalars."""
+        from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts = 256
+        _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            top_k=top_k,
+            gated=gated,
+            swap_ab=swap_ab,
+        )
+        if edit_routing is not None:
+            edit_routing(
+                tensors["token_selected_experts"], tensors["token_final_scales"]
+            )
+        api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, "w4a16")
+        inputs = dict(
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            **api_inputs,
+        )
+        config = dict(
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            activation_type=activation_type,
+            use_fused_finalize=use_fused_finalize,
+            quant_mode="w4a16",
+            swap_ab=swap_ab,
+            **scalars,
+        )
+        if wrapper:
+            moe = CuteDslMoEWrapper(
+                hidden_size=hidden_size, intermediate_size=intermediate_size, **config
+            )
+            result = moe.run(**inputs)
+        else:
+            result = cute_dsl_fused_moe(**inputs, **config)
+        assert result.shape == (num_tokens, hidden_size)
+        assert result.dtype == torch.bfloat16
+
+        def reference(fused_finalize=use_fused_finalize, **ref_scalars):
+            return split_w4a16_reference_from_tensors(
+                tensors,
+                activation_type=activation_type,
+                local_expert_offset=local_expert_offset,
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                swap_ab=swap_ab,
+                fused_finalize=fused_finalize,
+                sm90_wgmma=True,
+                **ref_scalars,
+            )
+
+        return result, reference(**scalars), reference
+
+    @sm90_w4a16_required
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    def test_w4a16_swiglu_bits(self, swap_ab):
+        """Default SwiGLU (no constants: flags 0), at both weight group sizes."""
+        result, ref, _ = self._run_w4a16(ActivationType.Swiglu, swap_ab)
+        assert_w4a16_bits(result, ref)
+
+    @sm90_w4a16_required
+    def test_w4a16_swiglu_params_bits(self):
+        """``swiglu_alpha``/``swiglu_beta``/``swiglu_limit`` as host FP32 constants."""
+        swiglu = dict(swiglu_alpha=1.702, swiglu_beta=1.0, swiglu_limit=7.0)
+        result, ref, reference = self._run_w4a16(ActivationType.Swiglu, **swiglu)
+        assert not torch.equal(ref, reference())  # the scalars must change the result
+        assert_w4a16_bits(result, ref)
+
+    @sm90_w4a16_required
+    @pytest.mark.parametrize(
+        "situ_beta,situ_linear_beta",
+        [(1.75, None), (0.8, 1.5)],
+        ids=["gate-clamp", "gate-and-up-clamp"],
+    )
+    def test_w4a16_situ_bits(self, situ_beta, situ_linear_beta):
+        """SiTU is SwiGLU with ``situ_beta``, its linear beta optional (flag bit 1)."""
+        result, ref, reference = self._run_w4a16(
+            ActivationType.Swiglu,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+        assert not torch.equal(ref, reference(situ_beta=None))
+        assert_w4a16_bits(result, ref)
+
+    @sm90_w4a16_required
+    @pytest.mark.parametrize(
+        "activation_type",
+        [ActivationType.GegluTanh, ActivationType.Relu2],
+        ids=["geglu-tanh", "relu2"],
+    )
+    def test_w4a16_activation_bits(self, activation_type):
+        """GeGLU-tanh and ReLU2, which have no constants (``consts`` None)."""
+        result, ref, _ = self._run_w4a16(activation_type)
+        assert_w4a16_bits(result, ref)
+
+    @sm90_w4a16_required
+    @pytest.mark.parametrize(
+        "top_k,num_local_experts,local_expert_offset",
+        [(2, 256, 0), (8, 256, 0), (8, 64, 64)],
+        ids=["top2", "top8", "top8-ep"],
+    )
+    def test_w4a16_fused_finalize_bits(
+        self, top_k, num_local_experts, local_expert_offset
+    ):
+        """``use_fused_finalize``: GEMM2 scales each row by alpha x its routing weight
+        and the finalize sums the BF16 rows in BF16 in slot order, one of the orders of
+        SM100's BF16 reduction. Tokens 1-3 take weights 0 and -0, FP32 subnormals and
+        terms near the BF16 subnormal range (no flush); under EP token 0 has no local
+        expert and token 4 alternates non-local and local slots (slot 0 non-local) with
+        a distinct weight per slot, so a shifted or dropped slot changes its row."""
+
+        def edit_routing(experts, weights):
+            for t in (1, 2, 3):  # distinct local experts
+                experts[t] = local_expert_offset + t * top_k + torch.arange(top_k)
+            weights[1, :2] = torch.tensor([0.0, -0.0])
+            weights[2] = 2.0**-127
+            weights[3] = 2.0**-120
+            if local_expert_offset > 0:
+                experts[0] = torch.arange(top_k)
+                slots = torch.arange(top_k)
+                local = local_expert_offset + 4 * top_k + slots
+                experts[4] = torch.where(slots % 2 == 1, local, slots)
+                weights[4] = (slots + 1).to(weights.dtype) / top_k
+
+        result, ref, reference = self._run_w4a16(
+            ActivationType.Swiglu,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            use_fused_finalize=True,
+            edit_routing=edit_routing,
+        )
+        # The fused rounding must differ from the unfused one, and the subnormal terms
+        # must survive to the output, or the comparison below is vacuous.
+        assert not torch.equal(ref, reference(fused_finalize=False))
+        tiny = torch.finfo(torch.bfloat16).tiny
+        assert ((ref[2] != 0) & (ref[2].float().abs() < tiny)).any()
+        if local_expert_offset > 0:
+            assert_w4a16_bits(ref[0], torch.zeros_like(ref[0]))
+            assert (ref[4] != 0).any()
+        assert_w4a16_bits(result, ref)
+
+    @sm90_w4a16_required
+    @pytest.mark.parametrize(
+        "use_fused_finalize", [False, True], ids=["unfused", "fused"]
+    )
+    def test_w4a16_wrapper_bits(self, use_fused_finalize):
+        """``CuteDslMoEWrapper`` runs its ``use_fused_finalize``, as on SM100."""
+        result, ref, reference = self._run_w4a16(
+            ActivationType.Swiglu, use_fused_finalize=use_fused_finalize, wrapper=True
+        )
+        # The finalizes must differ here, or a dropped flag would go unseen.
+        assert not torch.equal(ref, reference(fused_finalize=not use_fused_finalize))
+        assert_w4a16_bits(result, ref)
+
+
+# =============================================================================
 # Test Class: Wrapper API (CuteDslMoEWrapper)
 # =============================================================================
 
@@ -5896,7 +6269,7 @@ def test_cute_dsl_pinned_4over6_requires_w4a4_per_token():
         )
 
 
-@sm100_required
+@sm100_or_sm90_w4a4_4over6_required
 @cute_dsl_available
 @pytest.mark.parametrize(
     "swap_ab,use_fused_finalize,disable_fp4_quant_fast_math",
@@ -6003,8 +6376,11 @@ def test_cute_dsl_pinned_recipe_matches_env(
                 nvfp4_4over6_config=effective_recipe,
                 disable_fp4_quant_fast_math=disable_fp4_quant_fast_math,
             )
-            assert_cute_dsl_moe_bits(functional, expected)
-            assert_cute_dsl_moe_bits(wrapped, expected)
+            for out in (functional, wrapped):
+                if is_sm100_family():  # the reference models SM100's accumulation
+                    assert_cute_dsl_moe_bits(out, expected)
+                else:  # SM90 (wgmma) accumulates in another order
+                    assert check_accuracy(out, expected)[0]
         return functional.clone(), wrapped.clone()
 
     with (

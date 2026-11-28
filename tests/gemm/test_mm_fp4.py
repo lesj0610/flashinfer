@@ -44,8 +44,8 @@ def _test_mm_fp4(
     if backend in ("cute-dsl", "cutedsl_low_latency"):
         if not use_128x4_sf_layout:
             pytest.skip(f"{backend} backend only supports 128x4 SF layout")
-        if compute_capability[0] not in [10]:
-            pytest.skip(f"{backend} backend only supports SM100/SM103 GPUs.")
+        if compute_capability[0] not in [9, 10]:
+            pytest.skip(f"{backend} backend only supports SM90/SM100/SM103 GPUs.")
     if backend == "b12x":
         if not use_128x4_sf_layout:
             pytest.skip("b12x backend only supports 128x4 SF layout")
@@ -377,8 +377,8 @@ def test_mm_fp4_b12x_short_k_multi_wave():
 
 def test_mm_fp4_cute_dsl_misaligned_n_raises():
     device = torch.device("cuda")
-    if get_compute_capability(device)[0] != 10:
-        pytest.skip("cute_dsl backend only supports SM100/SM103 GPUs.")
+    if get_compute_capability(device)[0] not in (9, 10):
+        pytest.skip("cute_dsl backend only supports SM90/SM100/SM103 GPUs.")
     m, n, k = 16, 130, 128  # n % 8 == 2
     a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
@@ -477,8 +477,8 @@ def test_mm_fp4_cute_dsl_stale_split_k_tactic_falls_back(m, tile_n):
 
 def _skip_unless_per_token_alpha_gpu():
     major, minor = get_compute_capability(torch.device("cuda"))
-    if (major, minor) not in [(10, 0), (10, 3)]:
-        pytest.skip("per-token alpha needs the cute-dsl FP4 GEMM (SM100/SM103).")
+    if (major, minor) not in [(9, 0), (10, 0), (10, 3)]:
+        pytest.skip("per-token alpha needs the cute-dsl FP4 GEMM (SM90/SM100/SM103).")
 
 
 # m is swept in full because the per-row indexing is what varies with it; n and
@@ -590,8 +590,8 @@ def test_mm_fp4_per_token_alpha_auto_misaligned_n_raises():
     requirement function like any other backend: n % 8 != 0 is refused before
     the runner is built (it used to reach the runner and crash with a
     TypeError once no tactic was valid)."""
-    if get_compute_capability(torch.device("cuda"))[0] != 10:
-        pytest.skip("cute_dsl backend only supports SM100/SM103 GPUs.")
+    if get_compute_capability(torch.device("cuda"))[0] not in (9, 10):
+        pytest.skip("cute_dsl backend only supports SM90/SM100/SM103 GPUs.")
     m, n, k = 16, 130, 128  # n % 8 == 2
     torch.manual_seed(0)
     _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)

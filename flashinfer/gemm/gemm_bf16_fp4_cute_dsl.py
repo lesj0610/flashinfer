@@ -453,13 +453,14 @@ def _prepare_cute_dsl(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Dispatch weight preparation to the architecture-specific DSL kernel."""
     major, minor = get_compute_capability(b.device)
-    if _cute_dsl_uses_sm100_layout(major, minor):
+    if _cute_dsl_uses_sm100_layout(major, minor) or (major, minor) == (9, 0):
+        # SM90 (D10 default, pending the first build): the SM10x format, no copy.
         return _prepare_cute_dsl_sm100(b, b_descale, alpha, block_size)
     elif major == 12:
         return _prepare_cute_dsl_sm12x(b, b_descale, alpha, block_size)
     else:
         raise NotImplementedError(
-            "cute-dsl w4a16 GEMM only supports SM100/103/107 and SM12x; "
+            "cute-dsl w4a16 GEMM only supports SM90, SM100/103/107 and SM12x; "
             f"got {major}.{minor}"
         )
 

@@ -2383,7 +2383,7 @@ def prepare_records_nvfp4_weights(
     source_format: str = "modelopt",
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Build the records view of the SM80 to SM90 NVFP4 runners from checkpoint NVFP4 weights.
+    """Build the records view of the SM80 to SM89 NVFP4 runners from checkpoint NVFP4 weights.
 
     Takes packed E2M1 ``w1_fp4 [E, rows, H / 2]`` (``rows`` ``2 * I`` in ``[up, gate]`` order
     for a gated activation, else ``I``) and ``w2_fp4 [E, H, I / 2]``, their linear E4M3 block
@@ -2489,7 +2489,7 @@ def prepare_records_mxfp4_weights(
     activation_type: ActivationType = ActivationType.Swiglu,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Build the records view of the SM80 to SM90 MXFP4 runners from checkpoint MXFP4 weights.
+    """Build the records view of the SM80 to SM89 MXFP4 runners from checkpoint MXFP4 weights.
 
     Takes packed E2M1 ``w1_fp4 [E, rows, H / 2]`` (``rows`` ``2 * I`` in ``[up, gate]`` order
     for a gated activation, else ``I``) and ``w2_fp4 [E, H, I / 2]`` with their linear E8M0 block
@@ -2791,9 +2791,9 @@ def _cute_dsl_gated_weight_group_size(
     if not swap_ab:
         return 64
     arch = get_compute_capability(torch.device(device))
-    if arch in ((10, 0), (10, 3)):
+    if arch in ((9, 0), (10, 0), (10, 3)):  # SM90 reads the same layout (sm90.driver)
         return 16
-    raise ValueError("CuTe DSL MoE swap_ab=True requires SM100 or SM103")
+    raise ValueError("CuTe DSL MoE swap_ab=True requires SM90, SM100 or SM103")
 
 
 def _interleave_linear_and_gate(

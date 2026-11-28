@@ -2503,6 +2503,31 @@ def _gemm_prepared(
     return plan, entry, arg_plan
 
 
+def _mm_fp4_per_token_sm90(
+    a_u8: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_u8: torch.Tensor,
+    b_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """SM90: the per-token NVFP4 GEMM is the wgmma dense GEMM with a per-row alpha epilogue
+    (``flashinfer.gemm.sm90_fp4_dense``) on the same operands; the programs generated for
+    SM100/SM103 do not apply. The N >= 32 limit of every cake program is kept."""
+    from ...fused_moe.sm90.spec import AFmt
+    from ...gemm.sm90_fp4_dense import sm90_dense_weight_view, sm90_fp4_dense
+
+    n = int(b_u8.shape[0])
+    if n < 32:
+        raise ValueError(
+            f"the cake mm_fp4 backend requires an output of at least 32 columns, got n={n}"
+        )
+    w = sm90_dense_weight_view(
+        "mm_fp4:cake", AFmt.NVFP4_SWZ128X4, b_u8, b_sf, n, 2 * int(b_u8.shape[1])
+    )
+    return sm90_fp4_dense(a_u8, a_descale, w, alpha, out.dtype, out=out)
+
+
 def mm_fp4_per_token(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2554,6 +2579,8 @@ def mm_fp4_per_token(
     cols = padded_sf_cols(k)
     a_flat = _flat_u8_scales(a_descale, "a_sf", padded_rows(m), cols)
     b_flat = _flat_u8_scales(b_sf, "b_sf", padded_rows(n), cols)
+    if get_compute_capability(device) == (9, 0):
+        return _mm_fp4_per_token_sm90(a_u8, a_descale, b_u8, b_sf, alpha, out)
     plan, entry, arg_plan = _gemm_prepared(
         m, n, k, out.dtype == torch.float16, _device_index(device)
     )

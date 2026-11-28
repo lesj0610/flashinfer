@@ -36,7 +36,7 @@ def check_weights(b, b_descale, alpha, block_size=16):
     return n, k
 
 
-@supported_compute_capability([120, 121])
+@supported_compute_capability([90, 120, 121])
 def check_native_bf16_fp4(
     a,
     b,

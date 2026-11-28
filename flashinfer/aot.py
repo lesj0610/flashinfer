@@ -63,6 +63,7 @@ from .jit.fp4_quantization import (
     gen_fp4_quantization_sm120f_module,
     gen_fp4_quantization_sm121_module,
 )
+from .jit.fp4_dense_sm90 import FP4_DENSE_SM90_A_FMTS, gen_fp4_dense_sm90_module
 from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
 from .jit.blackwell_msa import (
@@ -112,6 +113,7 @@ from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm120_module,
+    gen_fp4_moe_sm90_aot_modules,
     gen_trtllm_gen_fused_moe_sm100_module,
     gen_trtllm_gen_routing_module,
     gen_w4a16_moe_sm80_module,
@@ -993,6 +995,13 @@ def gen_all_modules(
             if get_cuda_version() >= Version("12.8"):
                 jit_specs.append(gen_fp4_quantization_sm90_module())
                 jit_specs.append(gen_mxfp8_quantization_sm100_module("90"))
+                # wgmma FP4 MoE (flashinfer.fused_moe.sm90)
+                jit_specs.extend(gen_fp4_moe_sm90_aot_modules())
+                # wgmma FP4 dense GEMM (flashinfer.gemm.sm90_fp4_dense)
+                for a_fmt in FP4_DENSE_SM90_A_FMTS:
+                    for f16 in (False, True):
+                        if not (f16 and a_fmt.startswith("mxfp4")):
+                            jit_specs.append(gen_fp4_dense_sm90_module(f16, a_fmt))
             # The generic module only: the device-specific prebuilt-D variants are
             # selected at JIT time and must not follow the build host's GPU.
             jit_specs.append(gen_cutlass_fused_moe_sm90_module(enable_prebuilt_d=False))

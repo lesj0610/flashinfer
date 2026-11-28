@@ -65,6 +65,7 @@ from tests.moe.utils import (
     fp8_per_tensor_global_scale,
     fp8_per_tensor_requant_hook,
     powlu_ref,
+    sm90_fp4_moe_runs,
 )
 from flashinfer.utils import (
     get_compute_capability,
@@ -123,9 +124,11 @@ def test_cutlass_bf16_config_architectures_and_registration():
         assert CutlassMxfp8Mxfp4Config.supported(arch)
     for arch in (100, 103, 107):
         assert CutlassMxfp8Config.supported(arch)
+    # SM90 runs the 4over6 tuples (flashinfer.fused_moe.sm90); the runner rejects the rest.
+    assert CutlassNvfp4Config.supported(90)
+    assert not CutlassMxfp8Mxfp4Config.supported(90)
     assert not CutlassBf16Config.supported(80)
     assert not CutlassW4A16Config.supported(100)
-    assert not CutlassNvfp4Config.supported(90)
     assert not CutlassFp8BlockConfig.supported(100)
     assert not CutlassMxfp8Config.supported(90)
     assert not CutlassMxfp8Config.supported(110)
@@ -2575,6 +2578,27 @@ cutlass_nvfp4_required = pytest.mark.skipif(
 )
 
 
+def _is_sm90_cutlass_nvfp4_supported() -> bool:
+    """SM90 runs per-tensor NVFP4 x NVFP4 (flashinfer.fused_moe.sm90)."""
+    return (
+        torch.cuda.is_available()
+        and is_sm90a_supported(torch.device("cuda"))
+        and CutlassNvfp4Config.supported(90)
+        and sm90_fp4_moe_runs(
+            "cutlass",
+            per_token=False,
+            activation_type=SwiGLU().type,
+        )
+    )
+
+
+cutlass_nvfp4_or_sm90_required = pytest.mark.skipif(
+    not _is_cutlass_nvfp4_runtime_supported()
+    and not _is_sm90_cutlass_nvfp4_supported(),
+    reason="requires SM90/SM100/SM110/SM12x CUTLASS NVFP4 GPU and CUDA toolkit",
+)
+
+
 def _make_nvfp4_case(num_tokens: int = 16, activation=None):
     torch.manual_seed(44)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -2713,7 +2737,7 @@ def _nvfp4_requant_hook(device):
     return hook
 
 
-@cutlass_nvfp4_required
+@cutlass_nvfp4_or_sm90_required
 @pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
 def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
     config, act, weights, view = _make_nvfp4_case(activation=activation)
@@ -2735,7 +2759,8 @@ def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
     expected = _nvfp4_quantized_reference(act, view, activation)
 
     assert layer.winner_backend == "cutlass_nvfp4"
-    assert runner._workspace is not None
+    # SM90 allocates its own workspace per call.
+    assert runner._workspace is not None or runner._device_arch == 90
     torch.testing.assert_close(actual, flat, rtol=0, atol=0)
     assert torch.isfinite(actual).all(), "CUTLASS NVFP4 produced non-finite output"
     # Identity is the only pure pass-through here, so GEMM1 output reaches the
@@ -2749,7 +2774,7 @@ def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
     _assert_numerically_close(actual, expected, rtol=ref_rtol, atol=ref_atol)
 
 
-@cutlass_nvfp4_required
+@cutlass_nvfp4_or_sm90_required
 @pytest.mark.parametrize(
     "recipe",
     [

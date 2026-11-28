@@ -244,6 +244,17 @@ def nvfp4_4over6_env(use_4over6: bool):
             os.environ["FLASHINFER_NVFP4_4OVER6"] = original_value
 
 
+def sm90_fp4_moe_runs(entry: str, **tuple_kwargs) -> bool:
+    """Whether SM90 runs this NVFP4 tuple of ``entry`` (flashinfer.fused_moe.sm90)."""
+    if not torch.cuda.is_available() or get_compute_capability(
+        torch.device("cuda")
+    ) != (9, 0):
+        return False
+    from flashinfer.fused_moe.sm90.driver import sm90_fp4_moe_supports
+
+    return sm90_fp4_moe_supports(entry, **tuple_kwargs)
+
+
 @pytest.fixture(autouse=True)
 def set_nvfp4_4over6_env(request):
     if "use_4over6" not in request.fixturenames:
@@ -303,6 +314,7 @@ def skip_checks(
     zero_hidden_states=False,
     gemm1_lora_delta=None,
     moe_gemm_backend=None,
+    activation_params=False,
 ):
     """Common skip logic for all tests."""
     from tests.moe.trtllm_gen_fused_moe_utils import MoeGemmBackend
@@ -310,7 +322,17 @@ def skip_checks(
     if moe_gemm_backend is None:
         moe_gemm_backend = MoeGemmBackend.TRTLLM
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10]:
+    # SM90 runs the NVFP4 x NVFP4 tuples FlashInfer reports it runs (flashinfer.fused_moe.sm90).
+    sm90_runs = (
+        type(moe_impl).__name__ == "FP4Moe"
+        and moe_impl.quant_mode == QuantMode.FP4_NVFP4_NVFP4
+        and moe_gemm_backend == MoeGemmBackend.TRTLLM
+        and not activation_params
+        and sm90_fp4_moe_runs(
+            "trtllm", per_token=False, activation_type=activation_type
+        )
+    )
+    if compute_capability[0] not in [10] and not sm90_runs:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
 
     # Check moe_impl class by name to avoid circular imports
@@ -814,27 +836,12 @@ def _fp4_quantize_per_expert(weight, global_scale, sf_vec_size):
     return torch.stack(quantized), torch.cat([sf.reshape(-1) for sf in scales])
 
 
-def create_moe_tensors(
-    num_tokens: int,
-    hidden_size: int,
-    intermediate_size: int,
-    num_experts: int,
-    num_local_experts: int,
-    top_k: int,
-    device: str = "cuda",
-    seed: int = 42,
-    gated: bool = True,
-    use_per_token_activation: bool = False,
-    interleave_gated_weights: bool = True,
-    use_nontrivial_alphas: bool = True,
-    vary_block_scales: bool = False,
-    swap_ab: bool = False,
-):
-    """Create properly quantized MoE tensors for testing.
+def _quantize_moe_input(x_bf16, sf_vec_size, use_per_token_activation):
+    """Quantize the MoE input to NVFP4, per token or with global scale 1.
 
-    CuTe SM100 kernels consume interleaved gated weights and the tests exercise
-    nontrivial per-expert alpha scales. B12x kernels use the opposite settings;
-    callers should use :func:`create_b12x_moe_tensors` for that configuration.
+    Returns ``(x_quantized, x_sf, x_ref, x_per_token_scale)``: ``x_ref`` is the
+    dequantized input (times its token scale per token), ``x_per_token_scale``
+    is None per tensor.
     """
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.quantization import (
@@ -846,15 +853,8 @@ def create_moe_tensors(
         current_nvfp4_4over6_config,
         make_nvfp4_global_scale,
     )
-    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
-    torch.manual_seed(seed)
-    sf_vec_size = 16
-
-    # Input
-    x_bf16 = (
-        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
-    )
+    device = x_bf16.device
     x_per_token_scale = None
     if use_per_token_activation:
         x_global_scale = make_nvfp4_global_scale(
@@ -896,6 +896,44 @@ def create_moe_tensors(
             is_sf_swizzled_layout=False,
         ).to(device)
         x_ref = x_ref.float()
+    return x_quantized, x_sf, x_ref, x_per_token_scale
+
+
+def create_moe_tensors(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_local_experts: int,
+    top_k: int,
+    device: str = "cuda",
+    seed: int = 42,
+    gated: bool = True,
+    use_per_token_activation: bool = False,
+    interleave_gated_weights: bool = True,
+    use_nontrivial_alphas: bool = True,
+    vary_block_scales: bool = False,
+    swap_ab: bool = False,
+):
+    """Create properly quantized MoE tensors for testing.
+
+    CuTe SM100 kernels consume interleaved gated weights and the tests exercise
+    nontrivial per-expert alpha scales. B12x kernels use the opposite settings;
+    callers should use :func:`create_b12x_moe_tensors` for that configuration.
+    """
+    from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+    torch.manual_seed(seed)
+    sf_vec_size = 16
+
+    # Input
+    x_bf16 = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
+    )
+    x_quantized, x_sf, x_ref, x_per_token_scale = _quantize_moe_input(
+        x_bf16, sf_vec_size, use_per_token_activation
+    )
     x_sf = x_sf.unsqueeze(-1)
 
     # Routing
@@ -1046,6 +1084,7 @@ def create_relu2_moe_tensors(
     device: str = "cuda",
     seed: int = 42,
     vary_block_scales: bool = False,
+    use_per_token_activation: bool = False,
 ):
     """Create MoE tensors for ReLU2 (non-gated: w1_rows = n, not 2*n)."""
     from flashinfer.fp4_quantization import fp4_quantize
@@ -1057,12 +1096,8 @@ def create_relu2_moe_tensors(
     x_bf16 = (
         torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
     )
-    a1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    x_quantized, x_sf = fp4_quantize(
-        x_bf16,
-        global_scale=a1_gs,
-        sf_vec_size=sf_vec_size,
-        is_sf_swizzled_layout=False,
+    x_quantized, x_sf, x_ref, x_per_token_scale = _quantize_moe_input(
+        x_bf16, sf_vec_size, use_per_token_activation
     )
     x_sf = x_sf.unsqueeze(-1)
 
@@ -1138,6 +1173,8 @@ def create_relu2_moe_tensors(
         "x": x_quantized,
         "x_sf": x_sf,
         "x_bf16": x_bf16,
+        "x_ref": x_ref,
+        "x_per_token_scale": x_per_token_scale,
         "token_selected_experts": selected_experts,
         "token_final_scales": routing_weights,
         "w1_weight": w1_q,

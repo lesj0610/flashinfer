@@ -761,7 +761,8 @@ def test_cake_candidates_absent_on_unsupported_arch(monkeypatch, fresh_tuner):
         pytest.skip("covers architectures without the cake GEMMs")
     compute_capability = get_compute_capability(torch.device("cuda"))
     cc = compute_capability[0] * 10 + compute_capability[1]
-    assert not mm_fp4.is_backend_supported("cake", cc)
+    # SM90 runs an explicit cake call on its wgmma GEMM, without the cake candidates
+    assert mm_fp4.is_backend_supported("cake", cc) == (compute_capability[0] == 9)
     assert not bmm_bf16.is_backend_supported("cake", cc)
     _set_switches(monkeypatch, cake_enabled=True, experimental=True)
     _hold_cake_entry(fresh_tuner, CAKE_BMM_RUNNER)
