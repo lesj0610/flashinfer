@@ -561,10 +561,8 @@ _CUTILE_BF16_ARCHS = (89, 90, 120, 121)
 _CUTILE_NVFP4_ARCHS = (120, 121)
 _CUTILE_MXFP4_ARCHS = (120, 121)
 _CUTILE_W4A16_ARCHS = (89, 90, 120, 121)
-# cuda-tile has no FP8 target below SM90; the cuTile FP8-activation runners
-# delegate SM8x to the ``sm8x_fp8_moe`` grouped-GEMM pipeline instead.
-_CUTILE_FP8_ARCHS = (80, 86, 87, 89, 90, 120, 121)
-_CUTILE_MXFP8_ARCHS = (80, 86, 87, 89, 120, 121)
+_CUTILE_FP8_ARCHS = (90, 120, 121)
+_CUTILE_MXFP8_ARCHS = (120, 121)
 _CUTILE_SUPPORTED_ACTIVATIONS = (
     ActivationType.Swiglu,
     ActivationType.SwigluStep,

@@ -2135,13 +2135,9 @@ _CUTILE_FP8_MODES = (
 
 
 def _require_cutile_fp8(config_type):
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not is_cuda_tile_available():
         pytest.skip("requires CUDA and cuTile")
     major, minor = torch.cuda.get_device_capability()
-    # SM8x runs the FP8-activation modes without the cuTile toolchain.
-    a16 = config_type in (CuTileFp8PerTensorBf16Config, CuTileMxfp8Bf16Config)
-    if (major != 8 or a16) and not is_cuda_tile_available():
-        pytest.skip("requires CUDA and cuTile")
     arch = major * 10 + minor
     if not config_type.supported(arch):
         pytest.skip(f"{config_type.__name__} does not support SM{arch}")
