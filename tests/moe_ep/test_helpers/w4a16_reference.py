@@ -22,13 +22,17 @@ Supported production backends and APIs:
 
 Dense split-K, stream-K, SM11x/SM12x kernels, GEMV, CAKE, and other backend
 implementations are outside this exact contract. Split MoE fused TMA-reduce
-finalization is also excluded. With MegaMoE ``in_kernel_fc2_reduce=True``, the
+finalization is also excluded; ``fused_finalize=True`` gives its slot-ordered
+sum (SM90's deterministic one, one of the orders of the atomic BF16 adds). With
+MegaMoE ``in_kernel_fc2_reduce=True``, the
 reference returns BF16 per-route terms, not an exact final atomic sum; tests
 retain their existing tolerance band for the atomic BF16 combine.
 
 All covered GEMMs share BF16 decoded weights, FP32 accumulation and separate
 FP32 alpha scaling. The oracle disables reduced-precision reduction/split-K
 in cuBLASLt; it requires PyTorch's BF16 split-K control and Triton for MoE.
+Split MoE on SM90 accumulates in BF16 wgmma, whose FP32 sums differ from
+cuBLASLt's in the last bits; ``sm90_wgmma=True`` reproduces them exactly.
 """
 
 from __future__ import annotations
@@ -107,9 +111,82 @@ def _w4a16_matmul_precision():
         matmul.allow_tf32 = previous_tf32
 
 
-def _scaled_bf16_matmul(activation, weight, alpha):
+def _float_fields(bits, exponent_bits, mantissa_bits):
+    """Significand, unbiased exponent and sign of finite IEEE bit patterns (int64)."""
+    bias = (1 << (exponent_bits - 1)) - 1
+    biased = (bits >> mantissa_bits) & ((1 << exponent_bits) - 1)
+    mantissa = bits & ((1 << mantissa_bits) - 1)
+    normal = biased != 0
+    significand = torch.where(normal, mantissa | (1 << mantissa_bits), mantissa)
+    exponent = torch.where(normal, biased - bias, 1 - bias)
+    negative = ((bits >> (exponent_bits + mantissa_bits)) & 1) != 0
+    return significand, exponent, negative
+
+
+def _shift_toward_zero(value, shift):
+    """``value * 2**shift`` truncated toward zero, for non-negative int64 ``value``."""
+    left = value << shift.clamp(min=0)
+    right = torch.where(shift <= -63, 0, value >> (-shift).clamp(min=0, max=62))
+    return torch.where(shift >= 0, left, right)
+
+
+def _sm90_wgmma_bf16_matmul(activation, weight):
+    """FP32 ``activation @ weight.T`` as SM90 BF16 wgmma accumulates it from +0.
+
+    The tensor core adds 16 products at a time, in K order, to the previous FP32
+    result: the 17 terms are aligned to the largest exponent, truncated 25 fraction
+    bits below it and summed exactly, and the sum is truncated to FP32. This is
+    MMA-Sim's hardware-validated Hopper wgmma model (T-FDPA with F=25, L=16 and
+    round-toward-zero output), the numerics of the SM90 emulation layer.
+    """
+    fraction, block, zero_exponent = 25, 16, -133  # zero products: MMA-Sim's exponent
+    product_fraction, result_fraction = 14, 23
+    assert activation.shape[1] == weight.shape[1] and activation.shape[1] % block == 0
+    a_sig, a_exp, a_neg = _float_fields(
+        activation.view(torch.int16).long() & 0xFFFF, 8, 7
+    )
+    w_sig, w_exp, w_neg = _float_fields(weight.view(torch.int16).long() & 0xFFFF, 8, 7)
+    result = torch.zeros(  # FP32 bits
+        activation.shape[0],
+        weight.shape[0],
+        dtype=torch.int64,
+        device=activation.device,
+    )
+    for k in range(0, activation.shape[1], block):
+        product = a_sig[:, None, k : k + block] * w_sig[None, :, k : k + block]
+        exponent = a_exp[:, None, k : k + block] + w_exp[None, :, k : k + block]
+        exponent = torch.where(product == 0, zero_exponent, exponent)
+        negative = a_neg[:, None, k : k + block] ^ w_neg[None, :, k : k + block]
+        c_sig, c_exp, c_neg = _float_fields(result, 8, result_fraction)
+        top = torch.maximum(
+            exponent.amax(-1), torch.where(c_sig == 0, zero_exponent, c_exp)
+        )
+        terms = _shift_toward_zero(
+            product, exponent - top[..., None] + fraction - product_fraction
+        )
+        total = torch.where(negative, -terms, terms).sum(-1)
+        c_term = _shift_toward_zero(c_sig, c_exp - top + fraction - result_fraction)
+        total += torch.where(c_neg, -c_term, c_term)
+        # Truncate total * 2**(top - fraction) to an FP32 normal or subnormal.
+        magnitude = total.abs()
+        msb = torch.frexp(magnitude.double().clamp(min=1))[1].long() - 1
+        unit = top - fraction
+        assert (msb + unit < 128).all(), "FP32 overflow"
+        normal = (_shift_toward_zero(magnitude, result_fraction - msb) & 0x7FFFFF) | (
+            (msb + unit + 127) << result_fraction
+        )
+        subnormal = _shift_toward_zero(magnitude, unit + 126 + result_fraction)
+        bits = torch.where(msb + unit >= -126, normal, subnormal)
+        result = torch.where(magnitude == 0, 0, bits | ((total < 0).long() << 31))
+    return (result - ((result >> 31) << 32)).to(torch.int32).view(torch.float32)
+
+
+def _scaled_bf16_matmul(activation, weight, alpha, sm90_wgmma=False):
     """FP32 accumulation and post-GEMM scaling, before any BF16 output rounding."""
-    result = torch.mm(activation, weight.T, out_dtype=torch.float32)
+    if sm90_wgmma:
+        result = _sm90_wgmma_bf16_matmul(activation, weight)
+    else:
+        result = torch.mm(activation, weight.T, out_dtype=torch.float32)
     if alpha is not None:
         result.mul_(alpha)
     return result
@@ -415,12 +492,21 @@ def w4a16_reference(
     apply_routing_weights_before_fc2=False,
     in_kernel_fc2_reduce=False,
     local_expert_offset=None,
+    fused_finalize=False,
+    sm90_wgmma=False,
 ):
     """Compute on expert owners, transfer BF16 route bits, combine on sources.
 
     IKR returns weighted BF16 route terms for a separate atomic-rounding band;
     deterministic mode returns the finite, ordered FP32-combine BF16 result.
+    ``fused_finalize`` scales the FP32 FC2 accumulator by the FP32 product of
+    alpha and the routing weight, rounds the term to BF16 and sums the terms in
+    BF16 in slot order (split MoE's fused finalize, ordered). ``sm90_wgmma``
+    accumulates both GEMMs as SM90's BF16 wgmma does.
     """
+    assert not fused_finalize or not (
+        in_kernel_fc2_reduce or apply_routing_weights_before_fc2
+    )
     if "activation" in problem:
         activation_kind = problem["activation"]
     else:
@@ -477,7 +563,7 @@ def w4a16_reference(
                     rows[start : start + 256],
                     slots[start : start + 256],
                 )
-                fc1 = _scaled_bf16_matmul(x[batch], w13, fc1_alpha[expert])
+                fc1 = _scaled_bf16_matmul(x[batch], w13, fc1_alpha[expert], sm90_wgmma)
                 intermediate = w2.shape[1]
                 activation = torch.empty(
                     (batch.numel(), intermediate), dtype=torch.bfloat16, device=x.device
@@ -502,7 +588,12 @@ def w4a16_reference(
                     problem.get("situ_beta"),
                     problem.get("situ_linear_beta"),
                 )
-                fc2 = _scaled_bf16_matmul(activation, w2, fc2_alpha[expert])
+                fc2_scale = (
+                    fc2_alpha[expert] * scores[batch, route_slots, None]
+                    if fused_finalize
+                    else fc2_alpha[expert]
+                )
+                fc2 = _scaled_bf16_matmul(activation, w2, fc2_scale, sm90_wgmma)
                 term = fc2.bfloat16()
                 if in_kernel_fc2_reduce and not apply_routing_weights_before_fc2:
                     term = (term.float() * scores[batch, route_slots, None]).bfloat16()
@@ -518,6 +609,8 @@ def w4a16_reference(
     source_ids = problem["topk_ids"]
     first_expert = 0 if local_expert_offset is None else local_expert_offset
     local = (source_ids >= first_expert) & (source_ids < first_expert + world * experts)
+    if fused_finalize:
+        return combine_w4a16_fused_terms(terms, local)
     return combine_w4a16_terms(
         terms, problem["topk_weights"], local, apply_routing_weights_before_fc2
     )
@@ -539,6 +632,16 @@ def combine_w4a16_terms(terms, scores, local, routing_weights_applied=False):
             )
         output = torch.where(local[:, slot, None], updated, output)
     return output.bfloat16()
+
+
+def combine_w4a16_fused_terms(terms, local):
+    """Slot-ordered BF16 sum from +0 of the weighted BF16 terms: each add is the
+    FP32 sum rounded to BF16, the BF16 add (FP32 has over 2 x 8 + 2 bits)."""
+    output = torch.zeros_like(terms[:, 0])
+    for slot in range(terms.shape[1]):
+        updated = (output.float() + terms[:, slot].float()).bfloat16()
+        output = torch.where(local[:, slot, None], updated, output)
+    return output
 
 
 def assert_w4a16_bits(actual, expected):
@@ -607,6 +710,8 @@ def split_w4a16_reference_from_tensors(
     token_final_scales=None,
     wrong_formula=False,
     swap_ab=False,
+    fused_finalize=False,
+    sm90_wgmma=False,
 ):
     """Adapt split test tensors to the shared deterministic W4A16 oracle.
 
@@ -667,4 +772,6 @@ def split_w4a16_reference_from_tensors(
         fc1_alpha=tensors["w1_alpha"],
         fc2_alpha=tensors["w2_alpha"],
         local_expert_offset=local_expert_offset,
+        fused_finalize=fused_finalize,
+        sm90_wgmma=sm90_wgmma,
     )

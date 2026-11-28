@@ -18,6 +18,14 @@
 // in FP32 from 0, one FMA per slot; slots without a local row (src_permuted -1) are skipped and
 // a null topk_weights is weight 1. Deterministic: the order depends on neither the routing nor
 // the launch. keep_unrouted: a token without a local row keeps its out row (all-to-all).
+// W4A16 modules (FP4_SM90_W4A16) follow the split-kernel reference's combine instead: the sum
+// starts at +0 and takes physical slot 0's term as mul.rn(term, w) only if slot 0 is local,
+// every later local slot as fma.rn(term, w, sum), explicit non-FTZ roundings (no contraction, no
+// flush: -use_fast_math's fmaf is fma.rn.ftz), so a skipped slot 0 leaves +0 and a -0 term
+// added to it gives +0 as in the reference. Their fused finalize (FinalizeArgs::fused: GEMM2
+// already scaled each row by alpha x its weight and rounded it to BF16) sums the local rows in
+// slot order from +0, each add rounded to BF16 without flushing: one of the orders of the
+// add.noftz.bf16 reduction into a zeroed out of SM100's fused finalize, and deterministic.
 #pragma once
 
 #include <cuda_bf16.h>
@@ -63,6 +71,28 @@ __device__ __forceinline__ void st8(T* p, const float (&f)[8]) {
   *reinterpret_cast<uint4*>(p) = w;
 }
 
+#if defined(FP4_SM90_W4A16)
+__device__ __forceinline__ float mul_rn(float a, float b) {
+  float r;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float fma_rn(float a, float b, float c) {
+  float r;
+  asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
+  return r;
+}
+// BF16 RN of a + b for BF16 a and b, no flush: the FP32 sum's second rounding is innocuous
+// (24 >= 2 x 8 + 2 bits), so this is the BF16 add (add.noftz.bf16) of the fused reduction.
+__device__ __forceinline__ float add_bf16(float a, float b) {
+  float s;
+  asm("add.rn.f32 %0, %1, %2;" : "=f"(s) : "f"(a), "f"(b));
+  uint16_t h;
+  asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(h) : "f"(s));
+  return __uint_as_float(static_cast<uint32_t>(h) << 16);
+}
+#endif
+
 template <class YT, class WT, class OT, int V>
 __global__ void __launch_bounds__(kThreads) finalize_kernel(FinalizeArgs a) {
   const YT* y = static_cast<const YT*>(a.y);
@@ -90,8 +120,18 @@ __global__ void __launch_bounds__(kThreads) finalize_kernel(FinalizeArgs a) {
       } else {
         f[0] = ld1(src);
       }
+#if defined(FP4_SM90_W4A16)
+      if (a.fused) {
+#pragma unroll
+        for (int v = 0; v < V; ++v) acc[v] = add_bf16(acc[v], f[v]);
+        continue;
+      }
+#pragma unroll
+      for (int v = 0; v < V; ++v) acc[v] = k == 0 ? mul_rn(f[v], wk) : fma_rn(f[v], wk, acc[v]);
+#else
 #pragma unroll
       for (int v = 0; v < V; ++v) acc[v] = fmaf(wk, f[v], acc[v]);
+#endif
     }
     if (!routed && a.keep_unrouted) continue;
     OT* dst = out + static_cast<int64_t>(t) * a.out_ld + c0;

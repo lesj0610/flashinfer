@@ -24,6 +24,7 @@
 //  - Per-token scales (tok_scale): T(acc x (alpha x s)) with FTZ products, the bias after the
 //    rounding; Relu2 propagates NaN. GEMM2: T(acc x (alpha x s) + bias).
 //  - Otherwise (W4A16, GEMM2, dense): T(act(acc alpha + bias)), no rounding before the activation.
+//    W4A16's fused-finalize GEMM2 (tok_scale: routing weights): T(acc x (alpha x w)), mul.rn.
 //
 // Accumulators arrive with the dequantization fold already removed (dequant.cuh), unless the Cfg
 // states Cfg::kAccScale.
@@ -73,6 +74,11 @@ constexpr bool kExact = false;
 constexpr int kActFixed = FP4_SM90_ACT;
 #else
 constexpr int kActFixed = -1;
+#endif
+#if defined(FP4_SM90_W4A16)
+constexpr bool kW4a16 = true;
+#else
+constexpr bool kW4a16 = false;
 #endif
 
 // kRecipe* bits -> the quantizer's compile-time recipe (std::false_type: standard NVFP4).
@@ -250,6 +256,130 @@ __device__ __forceinline__ float act_plain(int act_rt, float g, ActQ q, bool pt)
   }
 }
 
+#if defined(FP4_SM90_W4A16)
+// W4A16 (BF16 activations x NVFP4 weights) epilogue arithmetic: the PTX operation order of the
+// split-kernel reference (tests/moe_ep/test_helpers/w4a16_reference.py, _activation_kernel), each
+// operation an explicit-rounding asm so that neither -use_fast_math's FTZ products nor FMA
+// contraction change a bit. The constants not in the reference's PTX text are the host's
+// (EpiArgs::w4a16_c), rounded from double to FP32 there.
+namespace w4 {
+__device__ __forceinline__ float mul(float a, float b) {
+  float r;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float add(float a, float b) {
+  float r;
+  asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float sub(float a, float b) {
+  float r;
+  asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float fma(float a, float b, float c) {
+  float r;
+  asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
+  return r;
+}
+__device__ __forceinline__ float min_nan(float a, float b) {
+  float r;
+  asm("min.NaN.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float max_nan(float a, float b) {
+  float r;
+  asm("max.NaN.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float neg(float a) {
+  float r;
+  asm("neg.f32 %0, %1;" : "=f"(r) : "f"(a));
+  return r;
+}
+__device__ __forceinline__ float ex2(float a) {
+  float r;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
+  return r;
+}
+__device__ __forceinline__ float rcp(float a) {
+  float r;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
+  return r;
+}
+// Bit patterns of the reference's PTX immediates.
+__device__ __forceinline__ float imm(uint32_t bits) { return __uint_as_float(bits); }
+constexpr uint32_t kOne = 0x3F800000u, kTwo = 0x40000000u, kMinusOne = 0xBF800000u,
+                   kNegTwo = 0xC0000000u, kHalf = 0x3F000000u;
+constexpr uint32_t kLog2e = 0x3FB8AA3Bu;      // float(log2 e)
+constexpr uint32_t kNegLog2e = 0xBFB8AA3Bu;   // float(-log2 e)
+constexpr uint32_t kNeg2Log2e = 0xC038AA3Bu;  // float(-2 log2 e)
+constexpr uint32_t kGeluCubic = 0x3D372713u;  // float(0.044715)
+constexpr uint32_t kGeluScale = 0x3F4C422Au;  // float(0.7978845608028654)
+
+// 1 / (1 + 2^e) for e already multiplied by its log2(e) factor: ex2, add, rcp as the reference.
+__device__ __forceinline__ float sigmoid_of(float neg_scaled) {
+  return rcp(add(ex2(neg_scaled), imm(kOne)));
+}
+// SiTU's tanh_asm: beta tanh(v / beta) as 2 / (1 + 2^(-2 log2e v / beta)) - 1.
+__device__ __forceinline__ float situ_tanh(float v, float beta, float inv_beta) {
+  const float x = mul(mul(v, inv_beta), imm(kNeg2Log2e));
+  const float r = sub(mul(sigmoid_of(x), imm(kTwo)), imm(kOne));
+  return mul(beta, r);
+}
+
+// Gated activation of gate g and linear u, ACT the module's activation; c, flags: EpiArgs.
+template <int ACT>
+__device__ __forceinline__ float act_gated(float g, float u, const float (&c)[4], uint8_t flags) {
+  if constexpr (ACT == int(Act::Swiglu)) {
+    if ((flags & kW4a16SwigluParams) != 0) {
+      // c = {-alpha log2e, beta, limit}; the clamp is part of the parameterized SwiGLU only.
+      g = min_nan(g, c[2]);
+      u = max_nan(min_nan(u, c[2]), neg(c[2]));
+      const float sg = sigmoid_of(mul(g, c[0]));
+      return mul(mul(add(u, c[1]), g), sg);
+    }
+    const float sg = sigmoid_of(mul(g, imm(kNegLog2e)));
+    return mul(u, mul(g, sg));
+  } else if constexpr (ACT == int(Act::Situ)) {
+    // c = {beta, 1 / beta, linear beta, 1 / linear beta}; never clamped.
+    const float bounded = situ_tanh(g, c[0], c[1]);
+    if ((flags & kW4a16SituLinear) != 0) u = situ_tanh(u, c[2], c[3]);
+    const float sg = sigmoid_of(mul(g, imm(kNegLog2e)));
+    return mul(u, mul(bounded, sg));
+  } else if constexpr (ACT == int(Act::GegluTanh)) {
+    float cubic = mul(g, imm(kGeluCubic));
+    cubic = mul(cubic, g);
+    float inner = fma(g, cubic, g);
+    inner = mul(inner, imm(kGeluScale));
+    float e = mul(inner, imm(kNegTwo));
+    e = mul(e, imm(kLog2e));
+    const float inverse = rcp(add(ex2(e), imm(kOne)));
+    float bounded = fma(inverse, imm(kTwo), imm(kMinusOne));
+    float half = mul(g, imm(kHalf));
+    bounded = add(bounded, imm(kOne));
+    half = mul(half, bounded);
+    return mul(u, half);
+  } else {  // not a W4A16 gated activation: the module builder and the host reject it
+    return __int_as_float(0x7fffffff);
+  }
+}
+
+// Non-gated activation: ReLU2 (max.f32 keeps no NaN, as the reference); Identity is GEMM2's.
+template <int ACT>
+__device__ __forceinline__ float act_plain(float v) {
+  if constexpr (ACT == int(Act::Relu2)) {
+    float r;
+    asm("max.f32 %0, %1, 0f00000000;" : "=f"(r) : "f"(v));
+    return mul(r, r);
+  } else {  // not a W4A16 plain activation: the module builder and the host reject it
+    return __int_as_float(0x7fffffff);
+  }
+}
+}  // namespace w4
+#endif
+
 template <class T>
 __device__ __forceinline__ tk::PackedVec<T, 16> packed16(uint4 a, uint4 b) {
   tk::PackedVec<T, 16> v;
@@ -410,7 +540,7 @@ struct Epilogue {
                                : epi::act_params(act, ep.act_x, ep.act_y, ep.act_z, expert);
     const void* const bias = ep.bias;
     // gemm1_lora_delta: compiled into the gated GEMM1, per tensor or per token
-    constexpr bool kLora = kGated;
+    constexpr bool kLora = kGated && !epi::kW4a16;
     const __nv_bfloat16* const lora = kLora ? static_cast<const __nv_bfloat16*>(ep.lora) : nullptr;
     const int64_t bias0 = static_cast<int64_t>(expert) * rows;
     const int lr = lane >> 2, lc = (lane & 3) * 2;
@@ -453,14 +583,24 @@ struct Epilogue {
 
     // Value before the activation (rs: alpha x s of the row, per token).
     auto pre = [&](float v, float rs) {
+#if defined(FP4_SM90_W4A16)
+      // (acc x 2^fold) x alpha, two explicit mul.rn: the reference's result.mul_(alpha). The
+      // fused finalize's GEMM2 (tok_scale: routing weights) takes acc x (alpha x weight) (rs).
+      if constexpr (kAccScale != 1.f) v = epi::w4::mul(v, kAccScale);
+      return epi::w4::mul(v, pt ? rs : alpha);
+#else
       if constexpr (kGemm2) {
         return pt ? epi::mul_ftz(v * kAccScale, rs) : v * a;
       } else {
         if (pt) return epi::round_x<T>(epi::mul_ftz(v * kAccScale, rs));
         return kFqNvfp4 ? epi::round_x<T>(v * a) : v * a;
       }
+#endif
     };
-    auto add_bias = [&](float x, float b) { return bias != nullptr ? x + b : x; };
+    auto add_bias = [&](float x, float b) {
+      if constexpr (epi::kW4a16) return x;  // the host rejects a bias
+      return bias != nullptr ? x + b : x;
+    };
     // (n-tile row r, output column c)
     auto gated_value = [&](float gv, float uv, float rs, int mi, int r, int c) {
       float g = add_bias(pre(gv, rs), bb[mi][0]), u = add_bias(pre(uv, rs), bb[mi][1]);
@@ -471,23 +611,36 @@ struct Epilogue {
         u += epi::to_f<__nv_bfloat16>(d[0]);
         g += epi::to_f<__nv_bfloat16>(d[ep.lora_half]);
       }
+#if defined(FP4_SM90_W4A16)
+      return epi::w4::act_gated<epi::kActFixed>(g, u, ep.w4a16_c, ep.w4a16_flags);
+#else
       return epi::act_gated<epi::kActFixed>(act, g, u, q);
+#endif
     };
     auto plain_value = [&](float v, float rs, int mi, int h) {
       const float x = add_bias(pre(v, rs), bb[mi][h]);
       if constexpr (kGemm2) return x;
+#if defined(FP4_SM90_W4A16)
+      return epi::w4::act_plain<epi::kActFixed>(x);
+#else
       return epi::act_plain<epi::kActFixed>(act, x, q, pt);
+#endif
     };
     // One 16-bit output at (column c, n-tile row r), times GEMM1's out_scale of the expert.
     const float os = !kGemm2 && ep.out_scale != nullptr ? __ldg(ep.out_scale + expert) : 1.f;
+    // W4A16: the host rejects out_scale, and y x 1 under -use_fast_math is a flushing mul.ftz
+    auto scaled = [&](float y) {
+      if constexpr (epi::kW4a16) return y;
+      return y * os;
+    };
     auto put = [&](int c, int r, bool ok, float y) {
       if (ep.out_tiled) {
         if (c < kp)
           *reinterpret_cast<T*>(outb + b_tile_byte(tile, k_tiles, c >> 7, (c >> 6) & 1, kN, r,
-                                                   c & 63)) = epi::from_f<T>(ok ? y * os : 0.f);
+                                                   c & 63)) = epi::from_f<T>(ok ? scaled(y) : 0.f);
       } else if (ok) {
         static_cast<T*>(ep.out)[static_cast<int64_t>(n0 + r) * ep.out_ld + c] =
-            epi::from_f<T>(y * os);
+            epi::from_f<T>(scaled(y));
       }
     };
 
@@ -498,7 +651,11 @@ struct Epilogue {
         for (int h = 0; h < 2; ++h) {
           const int r = 8 * j + lc + h;
           const bool pv = n0 + r < p_end;
+#if defined(FP4_SM90_W4A16)
+          const float rs = pt && pv ? epi::w4::mul(alpha, ep.tok_scale[n0 + r]) : 0.f;
+#else
           const float rs = pt && pv ? epi::mul_ftz(alpha, ep.tok_scale[n0 + r]) : 0.f;
+#endif
 #pragma unroll
           for (int mi = 0; mi < kM64; ++mi) {
             if constexpr (kGated) {

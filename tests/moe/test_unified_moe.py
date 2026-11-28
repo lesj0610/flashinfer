@@ -5870,3 +5870,70 @@ class TestSm90Fp4RunnerGuards:
         )
         with pytest.raises(NotImplementedError, match="fused shared experts"):
             self._cute_dsl(config).check_support()
+
+    @staticmethod
+    def _w4a16_config(activation, **kwargs):
+        return MoEConfig(
+            routing=RoutingConfig(num_experts=32, top_k=2),
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4, activation=QuantFormat.BF16, **kwargs
+            ),
+            experts=ExpertConfig(intermediate_size=512),
+            activation=activation,
+        )
+
+    @pytest.mark.parametrize(
+        "activation",
+        [
+            SwiGLU(),
+            SwiGLU(alpha=1.7, beta=1.0, limit=7.0),
+            GeGLUTanh(),
+            ReLU2(),
+            SiTU(),
+            SiTU(linear_scale=None),
+        ],
+        ids=lambda a: repr(a),
+    )
+    def test_cute_dsl_w4a16_accepts(self, activation):
+        """NVFP4 x BF16 with SM100's activations, SwiGLU at any parameters."""
+        runner = self._cute_dsl(self._w4a16_config(activation))
+        assert runner.check_support() is None
+
+    @pytest.mark.parametrize("activation", [SwiGLUStep(), GeGLU()])
+    def test_cute_dsl_w4a16_still_rejects(self, activation):
+        runner = self._cute_dsl(self._w4a16_config(activation))
+        with pytest.raises(NotImplementedError):
+            runner.check_support()
+
+    def test_cute_dsl_w4a16_rejects_per_token_scale(self):
+        runner = self._cute_dsl(self._w4a16_config(SwiGLU(), per_token_scale=True))
+        with pytest.raises(NotImplementedError, match="per-token"):
+            runner.check_support()
+
+    def test_cute_dsl_w4a16_rejects_fused_shared_experts(self):
+        config = MoEConfig(
+            routing=RoutingConfig(
+                num_experts=64,
+                top_k=2,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=8,
+                topk_group=4,
+                routed_scaling_factor=2.5,
+            ),
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+            experts=ExpertConfig(intermediate_size=512, num_fused_shared_experts=1),
+        )
+        with pytest.raises(NotImplementedError, match="fused shared experts"):
+            self._cute_dsl(config).check_support()
+
+    def test_w4a16_swiglu_parameters_are_not_a_module(self):
+        """W4A16's module takes SwiGLU's parameters as run-time constants (one module, one
+        tactic list), W4A4's keys on ``SwigluBias``."""
+        from flashinfer.fused_moe.runners import _sm90_epilogue_activation
+
+        swiglu = SwiGLU(alpha=1.7, beta=1.0, limit=7.0)
+        assert _sm90_epilogue_activation(swiglu) == int(ActivationType.SwigluBias)
+        assert _sm90_epilogue_activation(swiglu, w4a16=True) == int(
+            ActivationType.Swiglu
+        )
+        assert _sm90_epilogue_activation(SiTU(), w4a16=True) == int(ActivationType.Situ)

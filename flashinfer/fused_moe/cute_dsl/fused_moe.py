@@ -1612,6 +1612,7 @@ class CuteDslMoEWrapper:
                 swiglu_limit=self.swiglu_limit, situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta, quant_mode=self.quant_mode,
                 per_token_scale=per_token_scale, tactic=tactic, nvfp4_4over6=nvfp4_4over6,
+                use_fused_finalize=self.use_fused_finalize,
                 clamped_relu2_limit=self.clamped_relu2_limit,
                 routing_weights_before_fc2=self.routing_weights_before_fc2,
                 swap_ab=self.swap_ab,
@@ -2156,14 +2157,19 @@ def cute_dsl_fused_moe(
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         w4a4, pt = quant_mode == "w4a4", per_token_scale is not None
         w4a8 = quant_mode == "w4a8"  # MXFP8 x, GEMM2's input MXFP8 as on SM100
+        sm90 = torch.cuda.get_device_capability(x.device)[0] == 9
+        if sm90:  # SM90's W4A16 has SM100's ClampedRelu2 rejection, at SM100's place
+            _check_clamped_relu2_supported(activation, quant_mode, x.device)
         validate_pre_fc2_routing(
             routing_weights_before_fc2, quant_mode, activation, output_dtype, swap_ab,
             per_token_scale=pt, localized_weights=localized_weights is not None,
         )  # fmt: skip
-        if torch.cuda.get_device_capability(x.device)[0] == 9:
+        if sm90:
             # SM90 runs the SM100 tuples on the native weights (sm90.driver).
             from ..sm90.driver import cute_dsl_fp4_sm90_moe
 
+            if quant_mode == "w4a16":  # its checks, in SM100's order, are the driver's
+                return cute_dsl_fp4_sm90_moe(locals(), activation, swap_ab)
             shape = (x.shape[0], w2_weight.shape[1])
             if moe_output is None:
                 moe_output = x.new_empty(shape, dtype=output_dtype)

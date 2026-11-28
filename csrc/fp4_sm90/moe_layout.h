@@ -85,8 +85,15 @@ inline Layout make_layout(int64_t tokens_, int64_t top_k_, int64_t num_local_exp
   l.tile_expert = take(size_t(max_tiles) * 4);
   l.tile_n0 = take(size_t(max_tiles) * 4);
   l.num_tiles = take(4);
+#if defined(FP4_SM90_W4A16)
+  // W4A16 (BF16 activations, no token scales): no tok1 region; tok2 holds the routing weight
+  // of each GEMM2 row under kW4a16FusedFinalize
+  l.tok1 = at;
+  l.tok2 = take(per_token ? rows * 4 : 0);
+#else
   l.tok1 = take(per_token ? rows * 4 : 0);
   l.tok2 = take(per_token ? rows * 4 : 0);
+#endif
   l.x_tiles = take(b_tiles_bytes(max_tiles, k, n));
   // per token: BF16 GEMM1 rows for row_quant; per tensor: GEMM2 B tiles written by GEMM1
   l.act = take(per_token ? rows * size_t(inter) * 2 : b_tiles_bytes(max_tiles2, inter, n2));

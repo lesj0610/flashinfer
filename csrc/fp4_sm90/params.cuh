@@ -122,6 +122,13 @@ constexpr uint8_t kRecipe4over6 = 1u << 0;      // 0: standard NVFP4 quantizatio
 constexpr uint8_t kRecipeE4m3Max256 = 1u << 1;  // E4M3_MAX 256 (else 448)
 constexpr uint8_t kRecipeErrMse = 1u << 2;      // NVFP44Over6ErrMode::MSE (else MAE)
 constexpr uint8_t kRecipeFastMath = 1u << 3;    // ERR_USE_FAST_MATH
+#if defined(FP4_SM90_W4A16)
+// EpiArgs::w4a16_flags (the host's w4a16_flags).
+constexpr uint8_t kW4a16SwigluParams = 1u << 0;  // SwiGLU with alpha / beta / limit
+constexpr uint8_t kW4a16SituLinear = 1u << 1;    // SiTU with a linear beta
+// use_fused_finalize: GEMM2 rows scaled by alpha x their routing weight, summed in BF16
+constexpr uint8_t kW4a16FusedFinalize = 1u << 2;
+#endif
 
 __host__ __device__ constexpr int epi_code(Fq fq, uint8_t recipe, bool gated, bool gemm2) {
   return int(fq) | (int(recipe & 0xF) << 2) | (gated ? 1 << 6 : 0) | (gemm2 ? 1 << 7 : 0);
@@ -192,6 +199,13 @@ struct EpiArgs {
   uint8_t bias_f16;       // 1: FP16 bias, 0: BF16 bias
   uint8_t bias_trtllm;    // 1: TRT-LLM's FP32 bias on the weight's rows, accumulator units
   uint8_t fq_per_expert;  // 1: fq_global is [E_local] (TRT-LLM's per-expert scalars)
+#if defined(FP4_SM90_W4A16)
+  // W4A16 modules: the activation constants of the host's w4a16_consts, by value (SwiGLU:
+  // -alpha log2(e), beta, limit; SiTU: beta, 1 / beta, linear beta, 1 / linear beta), and
+  // w4a16_flags (kW4a16SwigluParams, kW4a16SituLinear, kW4a16FusedFinalize).
+  float w4a16_c[4];
+  uint8_t w4a16_flags;
+#endif
 };
 
 // Persistent schedule written by prep. Expanded rows p are sorted by local expert; expert e owns
@@ -333,6 +347,9 @@ struct FinalizeArgs {
   int top_k;
   int hidden;
   uint8_t keep_unrouted;  // 1: tokens without a local row keep their out row
+#if defined(FP4_SM90_W4A16)
+  uint8_t fused;  // kW4a16FusedFinalize: y rows carry their weights, summed in BF16
+#endif
 };
 
 // ---------------------------------------------------------------------------------------------

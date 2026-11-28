@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from flashinfer.fused_moe import core
+from flashinfer.fused_moe.cute_dsl.fused_moe import _check_clamped_relu2_supported
 from flashinfer.fused_moe.sm90 import driver
 from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_ALPHA,
@@ -229,3 +230,235 @@ class TestCuteDslW4A4Checks:
     def test_unsupported_params_are_not_implemented(self, name):
         with pytest.raises(NotImplementedError, match="SM90 FP4 MoE"):
             self._call(**{name: 1.0})
+
+
+_INTER, _EXPERTS = 256, 8
+_LOG2E = 1.4426950408889634
+
+
+def _w4a16_args(**overrides):
+    """``cute_dsl_fp4_sm90_moe``'s arguments for ``quant_mode="w4a16"`` (CPU tensors): BF16 ``x``
+    and no activation scales, up to the checks the CPU reaches (before the weight views)."""
+    args = _cute_dsl_args(
+        x=torch.zeros(_TOKENS, _HIDDEN, dtype=torch.bfloat16),
+        x_sf=None,
+        fc2_input_scale=None,
+        quant_mode="w4a16",
+        situ_linear_beta=None,
+        token_selected_experts=torch.zeros(_TOKENS, _TOP_K, dtype=torch.int32),
+        token_final_scales=torch.ones(_TOKENS, _TOP_K, dtype=torch.float32),
+        w1_weight=torch.zeros(_EXPERTS, 2 * _INTER, _HIDDEN // 2, dtype=torch.uint8),
+        w2_weight=torch.zeros(_EXPERTS, _HIDDEN, _INTER // 2, dtype=torch.uint8),
+        moe_output=None,
+        num_experts=_EXPERTS,
+        num_local_experts=None,
+        local_expert_offset=0,
+        tactic=None,
+        use_fused_finalize=True,
+    )
+    args.update(overrides)
+    return args
+
+
+class TestCuteDslW4A16Checks:
+    """W4A16 inputs, checked in SM100's order and wording (``cute_dsl_fused_moe``'s)."""
+
+    def _call(self, activation=ActivationType.Swiglu, **overrides):
+        return driver.cute_dsl_fp4_sm90_moe(_w4a16_args(**overrides), activation, False)
+
+    def test_localized_weights(self):
+        with pytest.raises(
+            NotImplementedError,
+            match="locality-domain localization is implemented for the W4A4 path only",
+        ):
+            self._call(localized_weights=object())
+
+    @pytest.mark.parametrize(
+        "name,value",
+        [
+            ("x_sf", torch.zeros(_TOKENS, dtype=torch.uint8)),
+            ("fc2_input_scale", torch.ones(1, dtype=torch.float32)),
+            ("per_token_scale", torch.ones(_TOKENS, dtype=torch.float32)),
+        ],
+    )
+    def test_activation_scales(self, name, value):
+        with pytest.raises(
+            ValueError,
+            match="x_sf, fc2_input_scale, and per_token_scale must be None "
+            "when quant_mode='w4a16'",
+        ):
+            self._call(**{name: value})
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+    def test_output_dtype(self, dtype):
+        with pytest.raises(ValueError, match="W4A16 only supports BF16 output"):
+            self._call(output_dtype=dtype)
+
+    def test_fp16_input(self):
+        with pytest.raises(TypeError, match="W4A16 requires x.dtype=torch.bfloat16"):
+            self._call(x=torch.zeros(_TOKENS, _HIDDEN, dtype=torch.float16))
+
+    def test_packed_input(self):
+        with pytest.raises(TypeError, match="W4A16 requires x.dtype=torch.bfloat16"):
+            self._call(x=torch.zeros(_TOKENS, _HIDDEN // 2, dtype=torch.uint8))
+
+    def test_token_final_scales_dtype(self):
+        with pytest.raises(
+            TypeError, match="W4A16 requires token_final_scales.dtype=torch.float32"
+        ):
+            self._call(
+                token_final_scales=torch.ones(_TOKENS, _TOP_K, dtype=torch.bfloat16)
+            )
+
+    def test_input_shape(self):
+        with pytest.raises(ValueError, match="x must have shape"):
+            self._call(x=torch.zeros(_TOKENS, _HIDDEN // 2, dtype=torch.bfloat16))
+
+    def test_output_shape(self):
+        with pytest.raises(ValueError, match="moe_output must have shape"):
+            self._call(
+                moe_output=torch.zeros(_TOKENS, _HIDDEN // 2, dtype=torch.bfloat16)
+            )
+
+    @pytest.mark.parametrize(
+        "activation,rows",
+        [
+            (ActivationType.Swiglu, _INTER),
+            (ActivationType.GegluTanh, _INTER),
+            (ActivationType.Relu2, 2 * _INTER),
+        ],
+    )
+    def test_gemm1_rows(self, activation, rows):
+        """The last check the CPU reaches: GEMM1's rows follow the activation's gating."""
+        w1 = torch.zeros(_EXPERTS, rows, _HIDDEN // 2, dtype=torch.uint8)
+        with pytest.raises(ValueError, match="w1_weight dim 1 must be"):
+            self._call(activation, w1_weight=w1)
+
+    def test_order(self):
+        """localization, scales, output dtype, ``x`` dtype, then the routing weights' dtype."""
+        bad = dict(
+            localized_weights=object(),
+            x_sf=torch.zeros(1, dtype=torch.uint8),
+            output_dtype=torch.float16,
+            x=torch.zeros(_TOKENS, _HIDDEN, dtype=torch.float16),
+            token_final_scales=torch.ones(_TOKENS, _TOP_K, dtype=torch.bfloat16),
+        )
+        for name, error in [
+            ("localized_weights", NotImplementedError),
+            ("x_sf", ValueError),
+            ("output_dtype", ValueError),
+            ("x", TypeError),
+            ("token_final_scales", TypeError),
+        ]:
+            with pytest.raises(error):
+                self._call(**bad)
+            del bad[name]
+
+    def test_clamped_relu2(self):
+        """The hook's rejection, ahead of every check above (SM100's place and wording)."""
+        with pytest.raises(
+            ValueError,
+            match="ActivationType.ClampedRelu2 is not supported when quant_mode='w4a16'",
+        ):
+            _check_clamped_relu2_supported(
+                ActivationType.ClampedRelu2, "w4a16", torch.device("cpu")
+            )
+
+    def test_clamped_relu2_is_not_a_w4a16_activation(self):
+        assert not driver.sm90_fp4_moe_supports(
+            "cute_dsl",
+            per_token=False,
+            activation_type=int(ActivationType.ClampedRelu2),
+            w4a16=True,
+        )
+
+
+class TestW4A16Constants:
+    """``Sm90W4A16``: SM100's FP32 activation constants (host double) and flags."""
+
+    def _epilogue(self, activation=ActivationType.Swiglu, **overrides):
+        args = _w4a16_args(**overrides)
+        return driver._w4a16_epilogue(activation, args)
+
+    def test_swiglu_default(self):
+        """The plain SwiGLU reads no constants."""
+        act, w4a16 = self._epilogue()
+        assert act == ActivationType.Swiglu and w4a16 == driver.Sm90W4A16(None, 0)
+
+    @pytest.mark.parametrize(
+        "name,value",
+        [("swiglu_alpha", 1.702), ("swiglu_beta", 1.0), ("swiglu_limit", 7.0)],
+    )
+    def test_swiglu_parameters(self, name, value):
+        act, w4a16 = self._epilogue(**{name: value})
+        assert act == ActivationType.Swiglu
+        assert w4a16.flags == driver.W4A16_FLAG_SWIGLU_PARAMS
+        alpha = value if name == "swiglu_alpha" else DEFAULT_SWIGLU_ALPHA
+        assert w4a16.consts[0] == -alpha * _LOG2E
+
+    @pytest.mark.parametrize(
+        "activation", [ActivationType.GegluTanh, ActivationType.Relu2]
+    )
+    def test_no_constants(self, activation):
+        act, w4a16 = self._epilogue(activation, swiglu_alpha=1.702)
+        assert act == activation
+        assert w4a16 == driver.Sm90W4A16(None, 0)
+
+    def test_situ(self):
+        act, w4a16 = self._epilogue(situ_beta=4.0, swiglu_alpha=1.702)
+        assert (
+            act == ActivationType.Situ
+        )  # SiTU is Swiglu with situ_beta; swiglu_* unread
+        assert w4a16 == driver.Sm90W4A16((4.0, 1.0 / 4.0, 0.0, 0.0), 0)
+
+    def test_situ_linear_beta(self):
+        act, w4a16 = self._epilogue(situ_beta=4.0, situ_linear_beta=25.0)
+        assert act == ActivationType.Situ
+        assert w4a16 == driver.Sm90W4A16(
+            (4.0, 1.0 / 4.0, 25.0, 1.0 / 25.0), driver.W4A16_FLAG_SITU_LINEAR_BETA
+        )
+
+    @pytest.mark.parametrize("use_fused_finalize", [False, True])
+    def test_fused_finalize_flag(self, monkeypatch, use_fused_finalize):
+        """``use_fused_finalize`` (SM100's default) sets flag bit 2 beside the activation's."""
+        seen = {}
+        monkeypatch.setattr(driver, "sm90_weight_view", lambda *_, **__: None)
+        monkeypatch.setattr(driver, "sm90_fp4_moe", lambda *_, **kw: seen.update(kw))
+        args = _w4a16_args(
+            use_fused_finalize=use_fused_finalize,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+            w1_weight_sf=None,
+            w2_weight_sf=None,
+            w1_alpha=None,
+            w2_alpha=None,
+        )
+        driver._cute_dsl_w4a16_sm90_moe(args, ActivationType.Swiglu, False)
+        fused = driver.W4A16_FLAG_FUSED_FINALIZE if use_fused_finalize else 0
+        assert seen["w4a16"] == driver.Sm90W4A16(
+            (4.0, 1.0 / 4.0, 25.0, 1.0 / 25.0),
+            driver.W4A16_FLAG_SITU_LINEAR_BETA | fused,
+        )
+
+    def test_constants_tensor(self):
+        t = driver._w4a16_consts_tensor((-_LOG2E, 0.0, 7.0, 0.0))
+        assert t.device.type == "cpu" and t.dtype == torch.float32
+        assert t.shape == (4,) and t.is_contiguous()
+        assert t[0].item() == torch.tensor(-_LOG2E, dtype=torch.float32).item()
+
+    @pytest.mark.parametrize(
+        "activation,expected",
+        [
+            (ActivationType.Swiglu, True),
+            (ActivationType.Situ, True),
+            (ActivationType.GegluTanh, True),
+            (ActivationType.Relu2, True),
+            (ActivationType.ClampedRelu2, False),
+            (ActivationType.Geglu, False),
+        ],
+    )
+    def test_supports(self, activation, expected):
+        for entry in ("trtllm", "cutlass", "cute_dsl"):
+            assert driver.sm90_fp4_moe_supports(
+                entry, per_token=False, activation_type=int(activation), w4a16=True
+            ) is (expected and entry == "cute_dsl")

@@ -317,14 +317,21 @@ def fp4_sm90_recipe_bits(recipe) -> int:
 
 
 def gen_fp4_moe_sm90_module(
-    recipe=None, exact: bool = False, act: Optional[int] = None, f16: bool = False
+    recipe=None,
+    exact: bool = False,
+    act: Optional[int] = None,
+    f16: bool = False,
+    w4a16: bool = False,
 ) -> JitSpec:
     """SM90 (wgmma) FP4 MoE: prep, the two GEMMs, row quantization and finalize
     (``csrc/fp4_moe_sm90.cu``), sm_90a only. A module per NVFP4 ``recipe`` (an
     ``NVFP44Over6Config`` or None), ``exact`` (FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH),
-    ``act`` (an ``ActivationType``) and ``f16`` (FP16 wgmma B operand instead of BF16). The
-    FP4 quantizers run in software (FLASHINFER_FP4_SW_CVT). Numeric flags as the SM100 MoE
-    modules and the "90" quantization module: ``-use_fast_math`` (``gen_jit_spec``'s
+    ``act`` (an ``ActivationType``) and ``f16`` (FP16 wgmma B operand instead of BF16).
+    ``w4a16`` builds the BF16-activation x NVFP4-weight module (``fp4_moe_sm90_run_w4a16``
+    instead of ``fp4_moe_sm90_run``; SwiGLU, SiTU, GeGLU-tanh and ReLU2, no recipe, exact or
+    f16 variant, not ahead of time). The FP4 quantizers run in software
+    (FLASHINFER_FP4_SW_CVT). Numeric flags as the SM100 MoE modules and the "90" quantization
+    module: ``-use_fast_math`` (``gen_jit_spec``'s
     default) and the comparison-based E2M1 conversion, so the in-kernel quantizations give
     their bits."""
     from ..quantization.nvfp4_quantization_utils import nvfp4_4over6_cache_key
@@ -333,8 +340,23 @@ def gen_fp4_moe_sm90_module(
     if act is None:
         raise ValueError("gen_fp4_moe_sm90_module needs the activation type")
     act_type = ActivationType(act)
-    name = f"fp4_moe_sm90_{nvfp4_4over6_cache_key(recipe)}_act{int(act_type)}"
-    name += ("_exact" if exact else "") + ("_f16" if f16 else "")
+    if w4a16:
+        w4a16_acts = (
+            ActivationType.Swiglu,
+            ActivationType.Situ,
+            ActivationType.GegluTanh,
+            ActivationType.Relu2,
+        )
+        if recipe is not None or exact or f16 or act_type not in w4a16_acts:
+            raise ValueError(
+                "the SM90 W4A16 module takes no recipe, exact or f16 variant and one of "
+                f"Swiglu, Situ, GegluTanh or Relu2, got recipe={recipe}, exact={exact}, "
+                f"f16={f16}, act={act_type.name}"
+            )
+        name = f"fp4_moe_sm90_w4a16_act{int(act_type)}"
+    else:
+        name = f"fp4_moe_sm90_{nvfp4_4over6_cache_key(recipe)}_act{int(act_type)}"
+        name += ("_exact" if exact else "") + ("_f16" if f16 else "")
     defines = [
         "ENABLE_BF16",
         "ENABLE_FP8",
@@ -347,6 +369,8 @@ def gen_fp4_moe_sm90_module(
         f"FP4_SM90_F16={int(f16)}",
         f"FLASHINFER_FP4_SM90_EXACT={int(exact)}",
     ]
+    if w4a16:
+        defines.append("FP4_SM90_W4A16=1")
     # Each part instantiates one (GEMM variant, APath) of the kernel table.
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / name
     parts = []

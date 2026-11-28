@@ -31,6 +31,7 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
 
 #include "epilogue.cuh"
 #include "flashinfer/exception.h"
@@ -282,6 +283,183 @@ inline void launch_fp4_sm90_row_quant(const RowQuantArgs& a, cudaStream_t stream
   const cudaError_t err = cudaGetLastError();
   FLASHINFER_CHECK(err == cudaSuccess, "row_quant launch: ", cudaGetErrorString(err));
 }
+
+#if defined(FP4_SM90_W4A16)
+// ---------------------------------------------------------------------------------------------
+// W4A16: GEMM2's B tiles from GEMM1's BF16 rows, a copy (no quantization, no scales). The same
+// row -> (tile, row, count) mapping and padding as row_quant: the schedule is GEMM2's (n2 rows per
+// tile), rows of the tile past the expert's count and K past cols are 0.
+namespace rq {
+
+// Local expert row p -> (tile, row in the tile, rows of the tile); cnt 0: p is no local row.
+__device__ __forceinline__ void locate_row(const RowQuantArgs& a, int p, int& t, int& r, int& cnt) {
+  const int n = a.n;
+  t = 0, r = 0, cnt = 0;
+  if (a.expert_offset == nullptr) {
+    t = p / n;
+    r = p % n;
+    cnt = min(n, a.rows - t * n);
+    return;
+  }
+  const int nt = *a.num_tiles;
+  for (int e = 0;; ++e) {
+    const int base = a.expert_tile_base[e];
+    if (base >= nt) break;  // past the local experts
+    const int o0 = a.expert_offset[e], o1 = a.expert_offset[e + 1];
+    if (p < o1) {
+      const int off = p - o0;
+      t = base + off / n;
+      r = off % n;
+      cnt = min(n, o1 - (o0 + off / n * n));
+      return;
+    }
+  }
+}
+
+template <class T>  // BF16 (a template: this header is in every part of the module)
+__global__ void __launch_bounds__(kThreads) row_copy_kernel(RowQuantArgs a) {
+  const int p = blockIdx.x, tid = threadIdx.x;
+  const int n = a.n, kp = (a.cols + 127) / 128 * 128, k_tiles = kp / 128;
+  int t, r, cnt;
+  locate_row(a, p, t, r, cnt);
+  if (cnt == 0) return;
+  const uint4* row = reinterpret_cast<const uint4*>(static_cast<const T*>(a.in) +
+                                                    static_cast<int64_t>(p) * a.in_ld);
+  char* const tiles = static_cast<char*>(a.out_tiles);
+  for (int b = tid; b < kp / 8; b += kThreads) {  // 8 values (16 bytes) per chunk
+    const int c = 8 * b;
+    const uint4 o = c < a.cols ? row[b] : make_uint4(0, 0, 0, 0);
+    *reinterpret_cast<uint4*>(tiles + b_tile_byte(t, k_tiles, c >> 7, (c >> 6) & 1, n, r, c & 63)) =
+        o;
+  }
+  // The tile's last row zeroes the rows past the expert's count (whole 128-byte rows).
+  if (r == cnt - 1 && cnt < n) {
+    const int per_half = (n - cnt) * 8;
+    for (int i = tid; i < (kp / 64) * per_half; i += kThreads) {
+      const int hf = i / per_half, j = i % per_half;
+      *reinterpret_cast<uint4*>(tiles + b_tile_byte(t, k_tiles, hf >> 1, hf & 1, n, cnt + j / 8,
+                                                    8 * (j % 8))) = make_uint4(0, 0, 0, 0);
+    }
+  }
+}
+
+}  // namespace rq
+
+// GEMM2 B tiles (params.cuh layout) from GEMM1's BF16 rows (RowQuantArgs: in, in_ld, rows, cols,
+// n, the routing and out_tiles; in_f16 must be 0, the scale and fq fields are not used).
+inline void launch_fp4_sm90_row_copy(const RowQuantArgs& a, cudaStream_t stream) {
+  if (a.rows == 0) return;
+  FLASHINFER_CHECK(a.rows > 0 && a.cols > 0 && a.cols % 8 == 0,
+                   "row_copy: cols must be a positive multiple of 8, got ", a.cols);
+  FLASHINFER_CHECK(a.n >= 8 && a.n <= 256 && (a.n & (a.n - 1)) == 0,
+                   "row_copy: n must be a power of two in [8, 256], got ", a.n);
+  FLASHINFER_CHECK(a.in_f16 == 0 && a.out_f16 == 0, "row_copy: BF16 rows only");
+  FLASHINFER_CHECK(a.in != nullptr && a.out_tiles != nullptr,
+                   "row_copy: in and out_tiles are required");
+  FLASHINFER_CHECK(a.in_ld >= a.cols && a.in_ld % 8 == 0 &&
+                       reinterpret_cast<uintptr_t>(a.in) % 16 == 0 &&
+                       reinterpret_cast<uintptr_t>(a.out_tiles) % 16 == 0,
+                   "row_copy: in and out_tiles must be 16-byte aligned with in_ld % 8 == 0");
+  FLASHINFER_CHECK((a.expert_offset == nullptr) == (a.expert_tile_base == nullptr) &&
+                       (a.expert_offset == nullptr) == (a.num_tiles == nullptr),
+                   "row_copy: expert_offset, expert_tile_base and num_tiles go together");
+  rq::row_copy_kernel<__nv_bfloat16><<<a.rows, rq::kThreads, 0, stream>>>(a);
+  const cudaError_t err = cudaGetLastError();
+  FLASHINFER_CHECK(err == cudaSuccess, "row_copy launch: ", cudaGetErrorString(err));
+}
+
+#if defined(FP4_SM90_W4A16_POISON_CHECK)
+// Debug only (-DFP4_SM90_W4A16_POISON_CHECK): the row copy's check. The caller fills GEMM1's rows
+// (`in`) and the whole B-tile buffer with the BF16 NaN pattern 0xFFFF (launch_fp4_sm90_poison_fill)
+// before GEMM1 / the copy, then calls launch_fp4_sm90_row_copy_check after the copy. Every
+// (tile, row, K position) of the tile buffer is one of: the source value (a used row, K < cols);
+// 0 (a row past the expert's count, K >= cols); untouched poison (a tile past num_tiles).
+// Anything else is a violation, and so is a source row of the used rows that still holds poison
+// (GEMM1 did not write it). Counts and the first position (tile, row, K) are printed and fail.
+namespace rq {
+
+__global__ void __launch_bounds__(kThreads)
+    row_copy_check_kernel(RowQuantArgs a, int max_tiles, unsigned long long* cnt) {
+  const int n = a.n, kp = (a.cols + 127) / 128 * 128, k_tiles = kp / 128;
+  const int t = blockIdx.x / n, r = blockIdx.x % n;
+  if (t >= max_tiles) return;
+  const int nt = a.num_tiles != nullptr ? *a.num_tiles : (a.rows + n - 1) / n;
+  int p = -1;  // the expanded row of (t, r); -1: padding row
+  if (t < nt) {
+    if (a.expert_offset == nullptr) {
+      p = t * n + r < a.rows ? t * n + r : -1;
+    } else {
+      for (int e = 0;; ++e) {
+        const int base = a.expert_tile_base[e];
+        if (base >= nt) break;
+        if (t < a.expert_tile_base[e + 1]) {
+          const int q = a.expert_offset[e] + (t - base) * n + r;
+          p = q < a.expert_offset[e + 1] ? q : -1;
+          break;
+        }
+      }
+    }
+  }
+  const char* const tiles = static_cast<const char*>(a.out_tiles);
+  for (int b = threadIdx.x; b < kp / 8; b += kThreads) {
+    const int c = 8 * b;
+    const uint4 got = *reinterpret_cast<const uint4*>(
+        tiles + b_tile_byte(t, k_tiles, c >> 7, (c >> 6) & 1, n, r, c & 63));
+    uint4 want = make_uint4(0, 0, 0, 0);
+    bool bad = false;
+    if (t >= nt) {
+      want = make_uint4(~0u, ~0u, ~0u, ~0u);
+    } else if (p >= 0 && c < a.cols) {
+      want = reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(a.in) +
+                                            static_cast<int64_t>(p) * a.in_ld)[b];
+      // a poison value in the source: GEMM1 did not write this used row
+      for (int i = 0; i < 4; ++i)
+        if (((&want.x)[i] & 0xFFFFu) == 0xFFFFu || ((&want.x)[i] >> 16) == 0xFFFFu) {
+          atomicAdd(&cnt[1], 1ull);
+          bad = true;
+        }
+    }
+    if (got.x != want.x || got.y != want.y || got.z != want.z || got.w != want.w) {
+      atomicAdd(&cnt[t >= nt ? 2 : 0], 1ull);
+      bad = true;
+    }
+    if (bad)
+      atomicMin(&cnt[3], static_cast<unsigned long long>(t) * n * kp +
+                             static_cast<unsigned long long>(r) * kp + c);
+  }
+}
+
+}  // namespace rq
+
+inline void launch_fp4_sm90_poison_fill(void* ptr, size_t bytes, cudaStream_t stream) {
+  const cudaError_t err = cudaMemsetAsync(ptr, 0xFF, bytes, stream);
+  FLASHINFER_CHECK(err == cudaSuccess, "poison fill: ", cudaGetErrorString(err));
+}
+
+inline void launch_fp4_sm90_row_copy_check(const RowQuantArgs& a, int max_tiles,
+                                           cudaStream_t stream) {
+  unsigned long long h[4] = {0, 0, 0, ~0ull}, *d = nullptr;
+  FLASHINFER_CHECK(cudaMalloc(&d, sizeof(h)) == cudaSuccess, "row_copy check: cudaMalloc");
+  FLASHINFER_CHECK(cudaMemcpyAsync(d, h, sizeof(h), cudaMemcpyHostToDevice, stream) == cudaSuccess,
+                   "row_copy check: init");
+  rq::row_copy_check_kernel<<<max_tiles * a.n, rq::kThreads, 0, stream>>>(a, max_tiles, d);
+  FLASHINFER_CHECK(cudaMemcpyAsync(h, d, sizeof(h), cudaMemcpyDeviceToHost, stream) == cudaSuccess,
+                   "row_copy check: read back");
+  const cudaError_t err = cudaStreamSynchronize(stream);
+  cudaFree(d);
+  FLASHINFER_CHECK(err == cudaSuccess, "row_copy check: ", cudaGetErrorString(err));
+  const int kp = (a.cols + 127) / 128 * 128;
+  const unsigned long long f = h[3];
+  fprintf(stderr,
+          "FP4_SM90_W4A16 POISON row_copy: rows %d cols %d n %d tiles %d  mismatch %llu  "
+          "source-poison %llu  outside-written %llu  first (tile %llu, row %llu, K %llu)\n",
+          a.rows, a.cols, a.n, max_tiles, h[0], h[1], h[2], h[3] == ~0ull ? 0ull : f / kp / a.n,
+          h[3] == ~0ull ? 0ull : f / kp % a.n, h[3] == ~0ull ? 0ull : f % kp);
+  FLASHINFER_CHECK(h[0] + h[1] + h[2] == 0, "row_copy check: ", h[0], " mismatches, ", h[1],
+                   " source poison, ", h[2], " outside-tile writes");
+}
+#endif
+#endif
 
 }  // namespace fp4_sm90
 }  // namespace flashinfer

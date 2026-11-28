@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -34,6 +35,10 @@
     !defined(FP4_SM90_F16)
 #error "fp4_moe_sm90.cu is built by gen_fp4_moe_sm90_module (module defines missing)"
 #endif
+#if defined(FP4_SM90_W4A16) && \
+    (FP4_SM90_RECIPE != 0 || FP4_SM90_F16 != 0 || FLASHINFER_FP4_SM90_EXACT != 0)
+#error "a W4A16 module is the plain BF16 module (no recipe, FP16 or exact variant)"
+#endif
 
 namespace flashinfer {
 namespace fp4_sm90 {
@@ -43,6 +48,11 @@ constexpr uint8_t kModuleRecipe = FP4_SM90_RECIPE;
 constexpr int kModuleAct = FP4_SM90_ACT;
 constexpr bool kModuleGated = FP4_SM90_GATED != 0;
 constexpr bool kModuleF16 = FP4_SM90_F16 != 0;
+#if defined(FP4_SM90_W4A16)
+constexpr bool kModuleW4a16 = true;  // BF16 activations x NVFP4 weights (fp4_moe_sm90_run_w4a16)
+#else
+constexpr bool kModuleW4a16 = false;
+#endif
 constexpr int kActIdentity = 9;  // ActivationType.Identity
 constexpr int kMaxStages = 32;
 
@@ -433,7 +443,11 @@ Array<int64_t> fp4_moe_sm90_tactics(bool per_token, int64_t w1_fmt, int64_t w2_f
   return Array<int64_t>(out);
 }
 
+#if defined(FP4_SM90_W4A16)
+void fp4_moe_sm90_run_w4a16(
+#else
 void fp4_moe_sm90_run(
+#endif
     // activations: BF16/FP16 [T, H] or NVFP4 codes [T, H / 2] with block scales
     TensorView x, Optional<TensorView> x_sf, int64_t x_fmt, Optional<TensorView> x_global,
     int64_t quantize, Optional<TensorView> token_scale,
@@ -469,7 +483,14 @@ void fp4_moe_sm90_run(
     Array<Tensor> loc_weights, Array<int64_t> loc_geom, Array<int64_t> loc_streams,
     int64_t loc_sm_count,
     // all-to-all: tokens without a local expert keep their out row
-    bool keep_unrouted) {
+    bool keep_unrouted
+#if defined(FP4_SM90_W4A16)
+    ,
+    // W4A16 only: the activation constants (CPU FP32 [4], copied by value; null for GeGLU-tanh
+    // and ReLU2) and their flags (kW4a16SwigluParams, kW4a16SituLinear, kW4a16FusedFinalize)
+    Optional<TensorView> w4a16_consts, int64_t w4a16_flags
+#endif
+) {
   CHECK_CUDA(x);
   CHECK_CONTIGUOUS(x);
   CHECK_INPUT_AND_TYPE(topk_ids, dl_int32);
@@ -494,6 +515,56 @@ void fp4_moe_sm90_run(
   TVM_FFI_ICHECK((cta_m1 == 128 || cta_m1 == 256) && (cta_m2 == 128 || cta_m2 == 256))
       << "cta_m1 and cta_m2 must be 128 or 256";
   TVM_FFI_ICHECK(a_path == 0 || a_path == 1) << "a_path must be 0 (n1) or 1 (n2)";
+#if defined(FP4_SM90_W4A16)
+  // W4A16: BF16 activations (no quantization, no token scales, no scale chain) x NVFP4 weights.
+  // GEMM1's BF16 rows are copied (row_copy) into GEMM2's B tiles; the epilogue arithmetic is the
+  // split-kernel reference's, with its constants in w4a16_c.
+  TVM_FFI_ICHECK(per_token) << "W4A16 is token-wise (per_token must be true)";
+  TVM_FFI_ICHECK_EQ(quantize, 0) << "W4A16 takes BF16 activations as they are (quantize must be 0)";
+  TVM_FFI_ICHECK(x_fmt == int64_t(XFmt::kBf16) && x.dtype() == dl_bfloat16)
+      << "W4A16 takes a BF16 x (x_fmt BF16)";
+  TVM_FFI_ICHECK(y.dtype() == dl_bfloat16) << "W4A16 y must be BF16";
+  TVM_FFI_ICHECK(!x_sf.has_value() && !x_global.has_value() && !token_scale.has_value())
+      << "W4A16 takes no x_sf, x_global or token_scale";
+  TVM_FFI_ICHECK(!out_scale1.has_value() && !fq_global.has_value())
+      << "W4A16 takes no out_scale1 or fq_global";
+  TVM_FFI_ICHECK(!fc2_codes.has_value() && !fc2_sf.has_value() && !fc2_tok.has_value())
+      << "W4A16 takes no fc2_input_out";
+  TVM_FFI_ICHECK(!bias1.has_value() && !bias2.has_value()) << "W4A16 takes no biases";
+  TVM_FFI_ICHECK(!act_x.has_value() && !act_y.has_value() && !act_z.has_value())
+      << "W4A16 takes its activation constants in w4a16_consts, not act_x / act_y / act_z";
+  TVM_FFI_ICHECK(!lora.has_value() && !act_out.has_value())
+      << "W4A16 takes no gemm1_lora_delta / activation output";
+  TVM_FFI_ICHECK(loc_sm_count == 0) << "W4A16 takes no localized launch";
+  float w4a16_c[4] = {0.f, 0.f, 0.f, 0.f};
+  uint8_t w4a16_f = 0;
+  {
+    constexpr bool kSwiglu = kModuleAct == int(epi::Act::Swiglu),
+                   kSitu = kModuleAct == int(epi::Act::Situ);
+    TVM_FFI_ICHECK(kSwiglu || kSitu || kModuleAct == int(epi::Act::GegluTanh) ||
+                   kModuleAct == int(epi::Act::Relu2))
+        << "W4A16 activation " << kModuleAct << " is not supported";
+    const uint64_t known = (kSwiglu ? kW4a16SwigluParams
+                            : kSitu ? kW4a16SituLinear
+                                    : 0) |
+                           kW4a16FusedFinalize;
+    TVM_FFI_ICHECK(w4a16_flags >= 0 && (static_cast<uint64_t>(w4a16_flags) & ~known) == 0)
+        << "w4a16_flags " << w4a16_flags << " has bits this activation does not define";
+    w4a16_f = static_cast<uint8_t>(w4a16_flags);
+    // The epilogue reads the constants for SiTU and the parameterized SwiGLU only.
+    TVM_FFI_ICHECK_EQ(w4a16_consts.has_value(),
+                      kSitu || (kSwiglu && (w4a16_f & kW4a16SwigluParams) != 0))
+        << "w4a16_consts is required for SiTU and the parameterized SwiGLU only";
+    if (w4a16_consts.has_value()) {
+      const TensorView c = w4a16_consts.value();
+      CHECK_CPU(c);
+      CHECK_CONTIGUOUS(c);
+      TVM_FFI_ICHECK(c.dtype() == dl_float32 && c.numel() == 4)
+          << "w4a16_consts must be a CPU FP32 tensor of 4 values";
+      std::memcpy(w4a16_c, c.data_ptr(), sizeof(w4a16_c));
+    }
+  }
+#endif
 
   const int tokens = static_cast<int>(topk_ids.size(0));
   const int top_k = static_cast<int>(topk_ids.size(1));
@@ -501,6 +572,23 @@ void fp4_moe_sm90_run(
   const ASrc a1 = weight_of(w1_codes, w1_sf, w1_geom, "w1");
   const ASrc a2 = weight_of(w2_codes, w2_sf, w2_geom, "w2");
   const int hidden = a1.k, inter = a2.k;
+#if defined(FP4_SM90_W4A16)
+  // row_copy moves GEMM1's BF16 rows into GEMM2's B tiles 8 columns at a time
+  TVM_FFI_ICHECK_EQ(inter % 8, 0) << "W4A16 needs an intermediate size that is a multiple of 8";
+  // use_fused_finalize: GEMM2 scales each row by alpha x its FP32 routing weight (tok2) and the
+  // finalize sums the BF16 rows in BF16 without weights
+  const bool w4a16_fused = (w4a16_f & kW4a16FusedFinalize) != 0;
+  if (w4a16_fused) {
+    TVM_FFI_ICHECK(topk_weights.has_value() && out.has_value())
+        << "the W4A16 fused finalize needs topk_weights and out";
+    CHECK_INPUT_AND_TYPE(topk_weights.value(), dl_float32);
+    CHECK_DEVICE(topk_weights.value(), x);
+    TVM_FFI_ICHECK_EQ(topk_weights.value().numel(), rows)
+        << "topk_weights must be [num_tokens, top_k]";
+    TVM_FFI_ICHECK(out.value().dtype() == dl_bfloat16)
+        << "the W4A16 fused finalize writes a BF16 out";
+  }
+#endif
   TVM_FFI_ICHECK_EQ(a2.rows, hidden) << "w2 rows must equal the hidden size";
   TVM_FFI_ICHECK_EQ(a1.rows, kModuleGated ? 2 * inter : inter)
       << "w1 rows must be " << (kModuleGated ? "2 * " : "") << "the intermediate size";
@@ -514,7 +602,7 @@ void fp4_moe_sm90_run(
   TVM_FFI_ICHECK_EQ(src_permuted.numel(), rows) << "src_permuted must be [num_tokens * top_k]";
   TVM_FFI_ICHECK(y.size(0) >= rows && y.size(1) == hidden)
       << "y must be [>= num_tokens * top_k, hidden]";
-  if (per_token) {
+  if (per_token && !kModuleW4a16) {
     TVM_FFI_ICHECK(token_scale.has_value()) << "per-token NVFP4 needs the token scales";
     CHECK_INPUT_AND_TYPE(token_scale.value(), dl_float32);
     CHECK_DEVICE(token_scale.value(), x);
@@ -763,8 +851,29 @@ void fp4_moe_sm90_run(
     prep.act_tiles = per_token ? nullptr : at(l.act);
     prep.act_k = inter;
   }
+#if defined(FP4_SM90_W4A16_POISON_CHECK)
+  // debug: GEMM1's rows and GEMM2's B tiles start as the BF16 NaN pattern (see row_quant.cuh)
+  {
+    const int mt2 = moe_layout::max_tiles_of(rows, n2, num_local_experts);
+    launch_fp4_sm90_poison_fill(at(l.act), size_t(rows) * size_t(inter) * 2, stream);
+    launch_fp4_sm90_poison_fill(at(l.x2_tiles), moe_layout::b_tiles_bytes(mt2, inter, n2), stream);
+  }
+#endif
   launch_fp4_sm90_prep(prep, stream);
 
+#if defined(FP4_SM90_W4A16)
+  // W4A16: no token scales; under the fused finalize tok2 holds each GEMM2 row's routing weight
+  // (permuted_src is the flat (token, slot) index: the gather of token scales with top_k 1)
+  float* tok1 = nullptr;
+  float* tok2 = w4a16_fused ? reinterpret_cast<float*>(at(l.tok2)) : nullptr;
+  if (w4a16_fused && rows > 0) {
+    constexpr int kThreads = 256;
+    gather_token_scale<<<(rows + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        static_cast<const float*>(topk_weights.value().data_ptr()), prep.permuted_src,
+        prep.expert_offset + num_local_experts, 1, rows, tok2);
+    TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess) << "gather_token_scale launch";
+  }
+#else
   float* tok1 = per_token ? reinterpret_cast<float*>(at(l.tok1)) : nullptr;
   float* tok2 = per_token ? reinterpret_cast<float*>(at(l.tok2)) : nullptr;
   if (per_token && rows > 0) {
@@ -774,6 +883,7 @@ void fp4_moe_sm90_run(
         prep.expert_offset + num_local_experts, top_k, rows, tok1);
     TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess) << "gather_token_scale launch";
   }
+#endif
 
   Sched sched{};
   sched.tile_expert = prep.tile_expert;
@@ -831,6 +941,10 @@ void fp4_moe_sm90_run(
   g1.epi.fq_global = per_token ? nullptr : fq_g;
   g1.epi.fq_per_expert = fq_global.has_value() && fq_global.value().numel() > 1;
   g1.epi.act = static_cast<uint8_t>(act);
+#if defined(FP4_SM90_W4A16)
+  for (int i = 0; i < 4; ++i) g1.epi.w4a16_c[i] = w4a16_c[i];
+  g1.epi.w4a16_flags = w4a16_f;
+#endif
   g1.epi.fq = static_cast<uint8_t>(per_token ? Fq::kNone : Fq::kNvfp4);
   g1.epi.recipe = per_token ? 0 : kModuleRecipe;
   g1.epi.out_f16 = per_token ? 0 : kModuleF16;
@@ -869,7 +983,14 @@ void fp4_moe_sm90_run(
     rq.fq_src = fc2 ? prep.permuted_src : nullptr;
     rq.fq_dst = fc2 ? prep.src_permuted : nullptr;
     rq.fq_cols = fq_cols;
+#if defined(FP4_SM90_W4A16)
+    launch_fp4_sm90_row_copy(rq, stream);
+#if defined(FP4_SM90_W4A16_POISON_CHECK)
+    launch_fp4_sm90_row_copy_check(rq, sched2.max_tiles, stream);
+#endif
+#else
     launch_fp4_sm90_row_quant(rq, stream);
+#endif
   }
 
   // GEMM2: per (token, slot) rows, summed by finalize (D6)
@@ -931,11 +1052,23 @@ void fp4_moe_sm90_run(
     fin.top_k = top_k;
     fin.hidden = static_cast<int>(o.size(1));  // the first out columns of y
     fin.keep_unrouted = keep_unrouted;
+#if defined(FP4_SM90_W4A16)
+    // the fused rows already carry their weights (GEMM2's tok2)
+    fin.fused = w4a16_fused;
+    if (w4a16_fused) {
+      fin.topk_weights = nullptr;
+      fin.w_dtype = 0;
+    }
+#endif
     launch_fp4_sm90_finalize(fin, stream);
   }
 }
 
+#if defined(FP4_SM90_W4A16)
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_moe_sm90_run_w4a16, fp4_moe_sm90_run_w4a16);
+#else
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_moe_sm90_run, fp4_moe_sm90_run);
+#endif
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_moe_sm90_workspace_bytes, fp4_moe_sm90_workspace_bytes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_moe_sm90_scratch, fp4_moe_sm90_scratch);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_moe_sm90_tactics, fp4_moe_sm90_tactics);
